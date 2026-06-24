@@ -1,0 +1,40 @@
+[package]
+name = "kaspa-addresses"
+description = "Kaspa address"
+categories = ["no-std"]
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["std", "wasm32-sdk"]
+std = ["borsh/std", "serde/std", "thiserror/std"]
+wasm32-sdk = ["std", "dep:js-sys", "dep:wasm-bindgen", "dep:workflow-log", "dep:workflow-wasm"]
+
+[dependencies]
+smallvec.workspace = true
+borsh.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+# only relvant in wasm32-sdk context
+js-sys = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+workflow-wasm = { workspace = true, optional = true }
+workflow-log = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+wasm-bindgen-test.workspace = true
+web-sys.workspace = true
+
+[[bench]]
+name = "bench"
+harness = false
+
+[lints]
+workspace = true

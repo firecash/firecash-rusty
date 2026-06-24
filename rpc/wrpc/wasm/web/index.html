@@ -1,0 +1,12 @@
+<html>
+    <head>
+        <script type="module">
+            import * as kaspa from './kaspa-rpc/kaspa-rpc.js';
+            (async () => {
+                await kaspa.default('./kaspa-rpc/kaspa-rpc_bg.wasm');
+                console.log(kaspa.version());
+            })();
+        </script>
+    </head>
+    <body></body>
+</html>

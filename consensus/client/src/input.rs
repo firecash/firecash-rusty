@@ -1,0 +1,277 @@
+//!
+//! Implementation of the client-side [`TransactionInput`] struct used by the client-side [`Transaction`] struct.
+//!
+
+#![allow(non_snake_case)]
+
+use crate::TransactionOutpoint;
+use crate::UtxoEntryReference;
+use crate::imports::*;
+use crate::result::Result;
+use kaspa_utils::hex::*;
+
+#[wasm_bindgen(typescript_custom_section)]
+const TS_TRANSACTION: &'static str = r#"
+/**
+ * Interface defines the structure of a transaction input.
+ * 
+ * @category Consensus
+ */
+export interface ITransactionInput {
+    previousOutpoint: ITransactionOutpoint;
+    signatureScript?: HexString;
+    sequence: bigint;
+    sigOpCount: number;
+    computeBudget?: number;
+    utxo?: UtxoEntryReference;
+
+    /** Optional verbose data provided by RPC */
+    verboseData?: ITransactionInputVerboseData;
+}
+
+/**
+ * Option transaction input verbose data.
+ * 
+ * @category Node RPC
+ */
+export interface ITransactionInputVerboseData { }
+
+"#;
+
+#[wasm_bindgen]
+extern "C" {
+    /// WASM (TypeScript) type representing `ITransactionInput | TransactionInput`
+    /// @category Consensus
+    #[wasm_bindgen(typescript_type = "ITransactionInput | TransactionInput")]
+    pub type TransactionInputT;
+    /// WASM (TypeScript) type representing `ITransactionInput[] | TransactionInput[]`
+    /// @category Consensus
+    #[wasm_bindgen(typescript_type = "(ITransactionInput | TransactionInput)[]")]
+    pub type TransactionInputArrayAsArgT;
+    /// WASM (TypeScript) type representing `TransactionInput[]`
+    /// @category Consensus
+    #[wasm_bindgen(typescript_type = "TransactionInput[]")]
+    pub type TransactionInputArrayAsResultT;
+}
+
+/// Inner type used by [`TransactionInput`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionInputInner {
+    pub previous_outpoint: TransactionOutpoint,
+    pub signature_script: Option<Vec<u8>>,
+    pub sequence: u64,
+    pub sig_op_count: u8,
+    #[serde(default)]
+    pub compute_budget: u16,
+    pub utxo: Option<UtxoEntryReference>,
+}
+
+impl TransactionInputInner {
+    pub fn new(
+        previous_outpoint: TransactionOutpoint,
+        signature_script: Option<Vec<u8>>,
+        sequence: u64,
+        sig_op_count: u8,
+        compute_budget: u16,
+        utxo: Option<UtxoEntryReference>,
+    ) -> Self {
+        Self { previous_outpoint, signature_script, sequence, sig_op_count, compute_budget, utxo }
+    }
+}
+
+/// Represents a Kaspa transaction input
+/// @category Consensus
+#[derive(Clone, Debug, Serialize, Deserialize, CastFromJs)]
+#[wasm_bindgen(inspectable)]
+pub struct TransactionInput {
+    inner: Arc<Mutex<TransactionInputInner>>,
+}
+
+impl TransactionInput {
+    pub fn new(
+        previous_outpoint: TransactionOutpoint,
+        signature_script: Option<Vec<u8>>,
+        sequence: u64,
+        sig_op_count: u8,
+        compute_budget: u16,
+        utxo: Option<UtxoEntryReference>,
+    ) -> Self {
+        let inner = TransactionInputInner::new(previous_outpoint, signature_script, sequence, sig_op_count, compute_budget, utxo);
+        Self { inner: Arc::new(Mutex::new(inner)) }
+    }
+
+    pub fn new_with_inner(inner: TransactionInputInner) -> Self {
+        Self { inner: Arc::new(Mutex::new(inner)) }
+    }
+
+    pub fn inner(&self) -> MutexGuard<'_, TransactionInputInner> {
+        self.inner.lock().unwrap()
+    }
+
+    pub fn sig_op_count(&self) -> u8 {
+        self.inner().sig_op_count
+    }
+
+    pub fn signature_script_length(&self) -> usize {
+        self.inner().signature_script.as_ref().map(|signature_script| signature_script.len()).unwrap_or_default()
+    }
+
+    pub fn utxo(&self) -> Option<UtxoEntryReference> {
+        self.inner().utxo.clone()
+    }
+}
+
+#[wasm_bindgen]
+impl TransactionInput {
+    #[wasm_bindgen(constructor)]
+    pub fn constructor(value: &TransactionInputT) -> Result<TransactionInput> {
+        Self::try_owned_from(value)
+    }
+
+    #[wasm_bindgen(getter = previousOutpoint)]
+    pub fn get_previous_outpoint(&self) -> TransactionOutpoint {
+        self.inner().previous_outpoint.clone()
+    }
+
+    #[wasm_bindgen(setter = previousOutpoint)]
+    pub fn set_previous_outpoint(&mut self, js_value: &JsValue) -> Result<()> {
+        match js_value.try_into() {
+            Ok(outpoint) => {
+                self.inner().previous_outpoint = outpoint;
+                Ok(())
+            }
+            Err(_) => Err(Error::custom("invalid outpoint script".to_string())),
+        }
+    }
+
+    #[wasm_bindgen(getter = signatureScript)]
+    pub fn get_signature_script_as_hex(&self) -> Option<String> {
+        self.inner().signature_script.as_ref().map(|script| script.to_hex())
+    }
+
+    #[wasm_bindgen(setter = signatureScript)]
+    pub fn set_signature_script_from_js_value(&mut self, js_value: JsValue) -> Result<()> {
+        match js_value.try_as_vec_u8() {
+            Ok(signature) => {
+                self.set_signature_script(signature);
+                Ok(())
+            }
+            Err(_) => Err(Error::custom("invalid signature script".to_string())),
+        }
+    }
+
+    #[wasm_bindgen(getter = sequence)]
+    pub fn get_sequence(&self) -> u64 {
+        self.inner().sequence
+    }
+
+    #[wasm_bindgen(setter = sequence)]
+    pub fn set_sequence(&mut self, sequence: u64) {
+        self.inner().sequence = sequence;
+    }
+
+    #[wasm_bindgen(getter = sigOpCount)]
+    pub fn get_sig_op_count(&self) -> u8 {
+        self.inner().sig_op_count
+    }
+
+    #[wasm_bindgen(setter = sigOpCount)]
+    pub fn set_sig_op_count(&mut self, sig_op_count: u8) {
+        self.inner().sig_op_count = sig_op_count;
+    }
+
+    #[wasm_bindgen(getter = computeBudget)]
+    pub fn get_compute_budget(&self) -> u16 {
+        self.inner().compute_budget
+    }
+
+    #[wasm_bindgen(setter = computeBudget)]
+    pub fn set_compute_budget(&mut self, compute_budget: u16) {
+        self.inner().compute_budget = compute_budget;
+    }
+
+    #[wasm_bindgen(getter = utxo)]
+    pub fn get_utxo(&self) -> Option<UtxoEntryReference> {
+        self.inner().utxo.clone()
+    }
+}
+
+impl TransactionInput {
+    pub fn set_signature_script(&self, signature_script: Vec<u8>) {
+        self.inner().signature_script.replace(signature_script);
+    }
+
+    pub fn script_public_key(&self) -> Option<ScriptPublicKey> {
+        self.utxo().map(|utxo_ref| utxo_ref.utxo.script_public_key.clone())
+    }
+}
+
+impl AsRef<TransactionInput> for TransactionInput {
+    fn as_ref(&self) -> &TransactionInput {
+        self
+    }
+}
+
+impl TryCastFromJs for TransactionInput {
+    type Error = Error;
+    fn try_cast_from<'a, R>(value: &'a R) -> std::result::Result<Cast<'a, Self>, Self::Error>
+    where
+        R: AsRef<JsValue> + 'a,
+    {
+        Self::resolve_cast(value, || {
+            if let Some(object) = Object::try_from(value.as_ref()) {
+                let previous_outpoint: TransactionOutpoint = object.get_value("previousOutpoint")?.as_ref().try_into()?;
+                let signature_script = object.get_vec_u8("signatureScript").ok();
+                let sequence = object.get_u64("sequence")?;
+                let sig_op_count = object.get_u8("sigOpCount")?;
+                let compute_budget = object.get_u16("computeBudget").unwrap_or_default();
+                let utxo = object.try_cast_into::<UtxoEntryReference>("utxo")?;
+                Ok(TransactionInput::new(previous_outpoint, signature_script, sequence, sig_op_count, compute_budget, utxo).into())
+            } else {
+                Err("TransactionInput must be an object".into())
+            }
+        })
+    }
+}
+
+impl From<cctx::TransactionInput> for TransactionInput {
+    fn from(tx_input: cctx::TransactionInput) -> Self {
+        let inner = TransactionInputInner {
+            previous_outpoint: tx_input.previous_outpoint.into(),
+            signature_script: Some(tx_input.signature_script),
+            sequence: tx_input.sequence,
+            sig_op_count: tx_input.compute_commit.sig_op_count().unwrap_or(0),
+            compute_budget: tx_input.compute_commit.compute_budget().unwrap_or(0),
+            utxo: None,
+        };
+        TransactionInput::new_with_inner(inner)
+    }
+}
+
+pub(crate) struct TransactionInputWithVersion<'a> {
+    version: u16,
+    tx_input: &'a TransactionInput,
+}
+
+impl TransactionInput {
+    pub(crate) fn with_version(&self, version: u16) -> TransactionInputWithVersion<'_> {
+        TransactionInputWithVersion { version, tx_input: self }
+    }
+}
+
+impl From<TransactionInputWithVersion<'_>> for cctx::TransactionInput {
+    fn from(value: TransactionInputWithVersion<'_>) -> Self {
+        let inner = value.tx_input.inner();
+        cctx::TransactionInput {
+            previous_outpoint: inner.previous_outpoint.clone().into(),
+            signature_script: inner.signature_script.clone().unwrap_or_default(), // TODO - discuss: should this unwrap_or_default or return an error?
+            sequence: inner.sequence,
+            compute_commit: if cctx::ComputeCommit::version_expects_compute_budget_field(value.version) {
+                cctx::ComputeCommit::ComputeBudget(inner.compute_budget.into())
+            } else {
+                cctx::ComputeCommit::SigopCount(inner.sig_op_count.into())
+            },
+        }
+    }
+}

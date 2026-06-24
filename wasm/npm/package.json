@@ -1,0 +1,28 @@
+{
+  "name": "kaspa",
+  "version": "0.13.5",
+  "description": "Kaspa SDK",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kaspanet/rusty-kaspa.git"
+  },
+  "keywords": [
+    "kaspa",
+    "wasm",
+    "sdk"
+  ],
+  "author": "Kaspa developers",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/kaspanet/rusty-kaspa/issues"
+  },
+  "homepage": "https://github.com/kaspanet/rusty-kaspa#readme",
+  "dependencies": {
+    "websocket": "1.0.34",
+    "kaspa-wasm": "0.13.5"
+  }
+}

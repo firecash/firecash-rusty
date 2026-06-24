@@ -1,0 +1,77 @@
+[package]
+name = "kaspa-consensus"
+description = "Kaspa consensus library"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+async-channel.workspace = true
+bincode.workspace = true
+crossbeam-channel.workspace = true
+faster-hex.workspace = true
+futures-util.workspace = true
+indexmap.workspace = true
+itertools.workspace = true
+kaspa-addresses.workspace = true
+kaspa-consensus-core.workspace = true
+kaspa-consensus-notify.workspace = true
+kaspa-consensusmanager.workspace = true
+kaspa-core.workspace = true
+kaspa-database.workspace = true
+kaspa-hashes.workspace = true
+kaspa-math.workspace = true
+kaspa-merkle.workspace = true
+kaspa-muhash.workspace = true
+kaspa-notify.workspace = true
+kaspa-pow.workspace = true
+kaspa-seq-commit.workspace = true
+kaspa-smt.workspace = true
+kaspa-smt-store.workspace = true
+kaspa-txscript.workspace = true
+kaspa-txscript-errors.workspace = true
+kaspa-utils = { workspace = true, features = ["sim"] }
+log.workspace = true
+once_cell.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+rocksdb.workspace = true
+secp256k1.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+rand = { workspace = true, features = ["small_rng"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[dev-dependencies]
+criterion.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+rand_distr.workspace = true
+kaspa-txscript-errors.workspace = true
+kaspa-addresses.workspace = true
+
+[[bench]]
+name = "parallel_muhash"
+harness = false
+
+[[bench]]
+name = "check_scripts"
+harness = false
+
+[features]
+html_reports = []
+devnet-prealloc = ["kaspa-consensus-core/devnet-prealloc"]
+test-smt-pruning-diagnostics = ["kaspa-smt-store/test-smt-pruning-diagnostics"]
+
+[lints]
+workspace = true

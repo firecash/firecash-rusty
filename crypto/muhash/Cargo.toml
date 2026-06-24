@@ -1,0 +1,34 @@
+[package]
+name = "kaspa-muhash"
+description = "Kaspa Muhash library"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kaspa-hashes.workspace = true
+kaspa-math.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+
+# For the exhuative tests, should only be enabled with release
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+rand.workspace = true
+
+[[bench]]
+name = "bench"
+harness = false
+
+[lints]
+rust = { unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] } }
+
+[lints.clippy]
+empty_docs = "allow"
+uninlined_format_args = "allow"

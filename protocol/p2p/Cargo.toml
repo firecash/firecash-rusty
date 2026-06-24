@@ -1,0 +1,57 @@
+[package]
+name = "kaspa-p2p-lib"
+description = "Kaspa p2p library"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "./src/lib.rs"
+
+[[bin]]
+name = "kaspa_p2p_client"
+path = "./src/bin/client.rs"
+
+[[bin]]
+name = "kaspa_p2p_server"
+path = "./src/bin/server.rs"
+
+[dependencies]
+kaspa-core.workspace = true
+kaspa-consensus-core.workspace = true
+kaspa-mining-errors.workspace = true
+kaspa-hashes.workspace = true
+kaspa-math.workspace = true
+kaspa-utils = { workspace = true, features = ["peer-id"] }
+kaspa-utils-tower.workspace = true
+
+borsh.workspace = true
+ctrlc.workspace = true
+futures = { workspace = true, features = ["alloc"] }
+h2.workspace = true
+itertools.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+prost.workspace = true
+rand.workspace = true
+seqlock.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [ "rt-multi-thread", "macros", "signal" ] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true, features = ["gzip"] }
+tonic-prost.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+hex.workspace = true
+
+[lints]
+workspace = true

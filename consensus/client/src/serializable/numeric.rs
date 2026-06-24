@@ -1,0 +1,430 @@
+//!
+//! This module implements transaction-related primitives for JSON serialization
+//! where all large integer values (`u64`) are serialized to JSON using `serde` and
+//! can exceed the largest integer value representable by the JavaScript `number` type.
+//! (i.e. transactions serialized using this module can not be deserialized in JavaScript
+//! but may be deserialized in other JSON-capable environments that support large integers)
+//!
+
+use super::invalid_input_mass_variant;
+use crate::error::Error;
+use crate::imports::*;
+use crate::result::Result;
+use crate::{
+    CovenantBinding, Transaction, TransactionInput, TransactionInputInner, TransactionOutpoint, TransactionOutpointInner,
+    TransactionOutput, UtxoEntry, UtxoEntryId, UtxoEntryReference,
+};
+use ahash::AHashMap;
+use cctx::VerifiableTransaction;
+use kaspa_addresses::Address;
+use kaspa_consensus_core::subnets::SubnetworkId;
+use kaspa_hashes::Hash;
+use workflow_wasm::serde::{from_value, to_value};
+
+pub type SignedTransactionIndexType = u32;
+
+pub struct Options {
+    pub include_utxo: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializableUtxoEntry {
+    pub address: Option<Address>,
+    pub amount: u64,
+    pub script_public_key: ScriptPublicKey,
+    pub block_daa_score: u64,
+    pub is_coinbase: bool,
+    pub covenant_id: Option<Hash>,
+}
+
+impl AsRef<SerializableUtxoEntry> for SerializableUtxoEntry {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
+impl From<&UtxoEntryReference> for SerializableUtxoEntry {
+    fn from(utxo: &UtxoEntryReference) -> Self {
+        let utxo = utxo.utxo.as_ref();
+        Self {
+            address: utxo.address.clone(),
+            amount: utxo.amount,
+            script_public_key: utxo.script_public_key.clone(),
+            block_daa_score: utxo.block_daa_score,
+            is_coinbase: utxo.is_coinbase,
+            covenant_id: utxo.covenant_id,
+        }
+    }
+}
+
+impl From<&cctx::UtxoEntry> for SerializableUtxoEntry {
+    fn from(utxo: &cctx::UtxoEntry) -> Self {
+        Self {
+            address: None,
+            amount: utxo.amount,
+            script_public_key: utxo.script_public_key.clone(),
+            block_daa_score: utxo.block_daa_score,
+            is_coinbase: utxo.is_coinbase,
+            covenant_id: utxo.covenant_id,
+        }
+    }
+}
+
+impl TryFrom<&SerializableUtxoEntry> for cctx::UtxoEntry {
+    type Error = crate::error::Error;
+    fn try_from(utxo: &SerializableUtxoEntry) -> Result<Self> {
+        Ok(Self {
+            amount: utxo.amount,
+            script_public_key: utxo.script_public_key.clone(),
+            block_daa_score: utxo.block_daa_score,
+            is_coinbase: utxo.is_coinbase,
+            covenant_id: utxo.covenant_id,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializableTransactionInput {
+    pub transaction_id: TransactionId,
+    pub index: SignedTransactionIndexType,
+    pub sequence: u64,
+    pub sig_op_count: u8,
+    #[serde(default)]
+    pub compute_budget: u16,
+    #[serde(with = "hex::serde")]
+    // TODO - convert to Option<Vec<u8>> and use hex serialization over Option
+    pub signature_script: Vec<u8>,
+    pub utxo: SerializableUtxoEntry,
+}
+
+impl SerializableTransactionInput {
+    pub fn new(input: &cctx::TransactionInput, utxo: &cctx::UtxoEntry) -> Self {
+        let utxo = SerializableUtxoEntry::from(utxo);
+
+        Self {
+            transaction_id: input.previous_outpoint.transaction_id,
+            index: input.previous_outpoint.index,
+            // TODO - convert signature_script to Option<Vec<u8>>
+            // signature_script: (!input.signature_script.is_empty()).then_some(input.signature_script.clone()),
+            signature_script: input.signature_script.clone(),
+            sequence: input.sequence,
+            sig_op_count: input.compute_commit.sig_op_count().unwrap_or(0),
+            compute_budget: input.compute_commit.compute_budget().unwrap_or(0),
+            utxo: utxo.clone(),
+        }
+    }
+}
+
+impl TryFrom<&SerializableTransactionInput> for UtxoEntryReference {
+    type Error = Error;
+    fn try_from(input: &SerializableTransactionInput) -> Result<Self> {
+        let outpoint = TransactionOutpoint::new(input.transaction_id, input.index);
+
+        let utxo = UtxoEntry {
+            outpoint,
+            address: input.utxo.address.clone(),
+            amount: input.utxo.amount,
+            script_public_key: input.utxo.script_public_key.clone(),
+            block_daa_score: input.utxo.block_daa_score,
+            is_coinbase: input.utxo.is_coinbase,
+            covenant_id: input.utxo.covenant_id,
+        };
+
+        Ok(Self { utxo: Arc::new(utxo) })
+    }
+}
+
+struct SerializableInputWithVersion {
+    version: u16,
+    input: SerializableTransactionInput,
+}
+
+impl TryFrom<SerializableInputWithVersion> for cctx::TransactionInput {
+    type Error = Error;
+
+    fn try_from(value: SerializableInputWithVersion) -> Result<Self> {
+        let input = value.input;
+        Ok(Self {
+            previous_outpoint: cctx::TransactionOutpoint { transaction_id: input.transaction_id, index: input.index },
+            signature_script: input.signature_script,
+            sequence: input.sequence,
+            compute_commit: if cctx::ComputeCommit::version_expects_compute_budget_field(value.version) {
+                if input.sig_op_count != 0 {
+                    return Err(invalid_input_mass_variant("sig_op_count", value.version));
+                }
+                cctx::ComputeCommit::ComputeBudget(input.compute_budget.into())
+            } else {
+                if input.compute_budget != 0 {
+                    return Err(invalid_input_mass_variant("compute_budget", value.version));
+                }
+                cctx::ComputeCommit::SigopCount(input.sig_op_count.into())
+            },
+        })
+    }
+}
+
+impl TryFrom<&SerializableTransactionInput> for TransactionInput {
+    type Error = Error;
+    fn try_from(serializable_input: &SerializableTransactionInput) -> Result<Self> {
+        let utxo = UtxoEntryReference::try_from(serializable_input)?;
+
+        let previous_outpoint = TransactionOutpoint::new(serializable_input.transaction_id, serializable_input.index);
+        let inner = TransactionInputInner {
+            previous_outpoint,
+            // TODO - convert to Option<Vec<u8>> and use hex serialization over Option
+            signature_script: (!serializable_input.signature_script.is_empty()).then_some(serializable_input.signature_script.clone()),
+            sequence: serializable_input.sequence,
+            sig_op_count: serializable_input.sig_op_count,
+            compute_budget: serializable_input.compute_budget,
+            utxo: Some(utxo),
+        };
+
+        Ok(TransactionInput::new_with_inner(inner))
+    }
+}
+
+impl TryFrom<&TransactionInput> for SerializableTransactionInput {
+    type Error = Error;
+    fn try_from(input: &TransactionInput) -> Result<Self> {
+        let inner = input.inner();
+        let utxo = inner.utxo.as_ref().ok_or(Error::MissingUtxoEntry)?;
+        let utxo = SerializableUtxoEntry::from(utxo);
+        Ok(Self {
+            transaction_id: inner.previous_outpoint.transaction_id(),
+            index: inner.previous_outpoint.index(),
+            // TODO - convert to Option<Vec<u8>> and use hex serialization over Option
+            signature_script: inner.signature_script.clone().unwrap_or_default(),
+            sequence: inner.sequence,
+            sig_op_count: inner.sig_op_count,
+            compute_budget: inner.compute_budget,
+            utxo,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializableCovenantBinding {
+    authorizing_input: u16,
+    covenant_id: Hash,
+}
+
+impl From<cctx::CovenantBinding> for SerializableCovenantBinding {
+    fn from(covenant: cctx::CovenantBinding) -> Self {
+        Self { authorizing_input: covenant.authorizing_input, covenant_id: covenant.covenant_id }
+    }
+}
+
+impl From<CovenantBinding> for SerializableCovenantBinding {
+    fn from(covenant: CovenantBinding) -> Self {
+        Self { authorizing_input: covenant.get_authorizing_input(), covenant_id: covenant.get_covenant_id() }
+    }
+}
+
+impl TryFrom<SerializableCovenantBinding> for cctx::CovenantBinding {
+    type Error = Error;
+    fn try_from(covenant: SerializableCovenantBinding) -> Result<Self> {
+        Ok(Self { authorizing_input: covenant.authorizing_input, covenant_id: covenant.covenant_id })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializableTransactionOutput {
+    pub value: u64,
+    pub script_public_key: ScriptPublicKey,
+    pub covenant: Option<SerializableCovenantBinding>,
+}
+
+impl From<cctx::TransactionOutput> for SerializableTransactionOutput {
+    fn from(output: cctx::TransactionOutput) -> Self {
+        let covenant = output.covenant.map(SerializableCovenantBinding::from);
+        Self { value: output.value, script_public_key: output.script_public_key, covenant }
+    }
+}
+
+impl From<&cctx::TransactionOutput> for SerializableTransactionOutput {
+    fn from(output: &cctx::TransactionOutput) -> Self {
+        let covenant = output.covenant.map(SerializableCovenantBinding::from);
+        Self { value: output.value, script_public_key: output.script_public_key.clone(), covenant }
+    }
+}
+
+impl TryFrom<SerializableTransactionOutput> for cctx::TransactionOutput {
+    type Error = Error;
+    fn try_from(output: SerializableTransactionOutput) -> Result<Self> {
+        let covenant = match output.covenant {
+            Some(covenant) => Some(cctx::CovenantBinding::try_from(covenant)?),
+            None => None,
+        };
+
+        Ok(Self { value: output.value, script_public_key: output.script_public_key, covenant })
+    }
+}
+
+impl TryFrom<&SerializableTransactionOutput> for TransactionOutput {
+    type Error = Error;
+    fn try_from(output: &SerializableTransactionOutput) -> Result<Self> {
+        let covenant = output.covenant.as_ref().map(|covenant| CovenantBinding::new(covenant.authorizing_input, covenant.covenant_id));
+
+        Ok(TransactionOutput::new(output.value, output.script_public_key.clone(), covenant))
+    }
+}
+
+impl TryFrom<&TransactionOutput> for SerializableTransactionOutput {
+    type Error = Error;
+    fn try_from(output: &TransactionOutput) -> Result<Self> {
+        let inner = output.inner();
+        let covenant = inner.covenant.clone().map(SerializableCovenantBinding::from);
+        Ok(Self { value: inner.value, script_public_key: inner.script_public_key.clone(), covenant })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializableTransaction {
+    // pub version: u32,
+    pub id: TransactionId,
+    pub version: u16,
+    pub inputs: Vec<SerializableTransactionInput>,
+    pub outputs: Vec<SerializableTransactionOutput>,
+    pub lock_time: u64,
+    pub gas: u64,
+    #[serde(default, alias = "mass")]
+    pub storage_mass: u64,
+    pub subnetwork_id: SubnetworkId,
+    #[serde(with = "hex::serde")]
+    pub payload: Vec<u8>,
+}
+
+impl SerializableTransaction {
+    pub fn serialize_to_object(&self) -> Result<JsValue> {
+        Ok(to_value(self)?)
+    }
+
+    pub fn deserialize_from_object(object: JsValue) -> Result<Self> {
+        Ok(from_value(object)?)
+    }
+
+    pub fn serialize_to_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    pub fn deserialize_from_json(json: &str) -> Result<Self> {
+        Ok(serde_json::from_str(json)?)
+    }
+
+    pub fn from_signable_transaction(tx: &cctx::SignableTransaction) -> Result<Self> {
+        let verifiable_tx = tx.as_verifiable();
+        let mut inputs = vec![];
+        let transaction = tx.as_ref();
+        for index in 0..transaction.inputs.len() {
+            let (input, utxo) = verifiable_tx.populated_input(index);
+            let input = SerializableTransactionInput::new(input, utxo);
+            inputs.push(input);
+        }
+
+        let outputs = transaction.outputs.clone();
+
+        Ok(Self {
+            // version: 2,
+            inputs,
+            outputs: outputs.into_iter().map(Into::into).collect(),
+            version: transaction.version,
+            lock_time: transaction.lock_time,
+            subnetwork_id: transaction.subnetwork_id,
+            gas: transaction.gas,
+            storage_mass: transaction.storage_mass(),
+            payload: transaction.payload.clone(),
+            id: transaction.id(),
+        })
+    }
+
+    pub fn from_client_transaction(transaction: &Transaction) -> Result<Self> {
+        let inner = transaction.inner();
+
+        let inputs = inner.inputs.iter().map(TryFrom::try_from).collect::<Result<Vec<SerializableTransactionInput>>>()?;
+        let outputs = inner.outputs.iter().map(TryFrom::try_from).collect::<Result<Vec<SerializableTransactionOutput>>>()?;
+
+        Ok(Self {
+            inputs,
+            outputs,
+            version: inner.version,
+            lock_time: inner.lock_time,
+            subnetwork_id: inner.subnetwork_id,
+            gas: inner.gas,
+            payload: inner.payload.clone(),
+            storage_mass: inner.storage_mass,
+            id: inner.id,
+        })
+    }
+
+    pub fn from_cctx_transaction(transaction: &cctx::Transaction, utxos: &AHashMap<UtxoEntryId, UtxoEntryReference>) -> Result<Self> {
+        let inputs = transaction
+            .inputs
+            .iter()
+            .map(|input| {
+                let id = TransactionOutpointInner::new(input.previous_outpoint.transaction_id, input.previous_outpoint.index);
+                let utxo = utxos.get(&id).ok_or(Error::MissingUtxoEntry)?;
+                let utxo = cctx::UtxoEntry::from(utxo);
+                let input = SerializableTransactionInput::new(input, &utxo);
+                Ok(input)
+            })
+            .collect::<Result<Vec<SerializableTransactionInput>>>()?;
+
+        let outputs = transaction.outputs.iter().map(Into::into).collect::<Vec<SerializableTransactionOutput>>();
+
+        Ok(Self {
+            id: transaction.id(),
+            version: transaction.version,
+            inputs,
+            outputs,
+            lock_time: transaction.lock_time,
+            subnetwork_id: transaction.subnetwork_id,
+            gas: transaction.gas,
+            storage_mass: transaction.storage_mass(),
+            payload: transaction.payload.clone(),
+        })
+    }
+}
+
+impl TryFrom<SerializableTransaction> for cctx::SignableTransaction {
+    type Error = Error;
+    fn try_from(serializable: SerializableTransaction) -> Result<Self> {
+        let version = serializable.version;
+        let mut entries = vec![];
+        let mut inputs = vec![];
+        for input in serializable.inputs {
+            entries.push(input.utxo.as_ref().try_into()?);
+            inputs.push(SerializableInputWithVersion { version, input }.try_into()?);
+        }
+
+        let outputs = serializable.outputs.into_iter().map(TryInto::try_into).collect::<Result<Vec<_>>>()?;
+
+        let tx = cctx::Transaction::new(
+            version,
+            inputs,
+            outputs,
+            serializable.lock_time,
+            serializable.subnetwork_id,
+            serializable.gas,
+            serializable.payload,
+        )
+        .with_storage_mass(serializable.storage_mass);
+
+        Ok(Self::with_entries(tx, entries))
+    }
+}
+
+impl TryFrom<SerializableTransaction> for Transaction {
+    type Error = Error;
+    fn try_from(tx: SerializableTransaction) -> Result<Self> {
+        let id = tx.id;
+        let inputs: Vec<TransactionInput> = tx.inputs.iter().map(TryInto::try_into).collect::<Result<Vec<_>>>()?;
+        let outputs: Vec<TransactionOutput> = tx.outputs.iter().map(TryInto::try_into).collect::<Result<Vec<_>>>()?;
+
+        Transaction::new(Some(id), tx.version, inputs, outputs, tx.lock_time, tx.subnetwork_id, tx.gas, tx.payload, tx.storage_mass)
+    }
+}
