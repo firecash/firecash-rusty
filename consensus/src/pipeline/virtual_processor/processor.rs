@@ -181,6 +181,12 @@ pub struct VirtualStateProcessor {
     pub(super) smt_stores: Arc<kaspa_smt_store::processor::SmtStores>,
     pub(super) smt_metadata_store: Arc<crate::model::stores::smt_metadata::DbSmtMetadataStore>,
 
+    // Shielded pool: reorg-safe driver over the shielded state stores (PLAN §2.4).
+    // Advances the note-commitment tree / nullifier set / turnstile in GHOSTDAG
+    // accepted order. Currently constructed and queryable; the accepted-order
+    // commit hook is wired separately.
+    pub(super) shielded_state_manager: crate::processes::shielded::ShieldedStateManager,
+
     // Mining Rule
     _mining_rules: Arc<MiningRules>,
 }
@@ -201,6 +207,14 @@ impl VirtualStateProcessor {
         counters: Arc<ProcessingCounters>,
         mining_rules: Arc<MiningRules>,
     ) -> Self {
+        // Reorg-safe driver over the shielded state stores. Anchor depth (the
+        // finalized-anchor window, PLAN §2.5) is tied to finality: spends prove
+        // against anchors at least a finality window deep.
+        let shielded_state_manager = crate::processes::shielded::ShieldedStateManager::new(
+            Arc::clone(&db),
+            kaspa_database::prelude::CachePolicy::Count(10_000),
+            params.finality_depth() as u32,
+        );
         Self {
             receiver,
             pruning_sender,
@@ -253,9 +267,17 @@ impl VirtualStateProcessor {
             toccata_logger: ForkLogger::new("virtual state processing rules", true),
             smt_stores: storage.smt_stores.clone(),
             smt_metadata_store: storage.smt_metadata_store.clone(),
+            shielded_state_manager,
             _mining_rules: mining_rules,
             finality_depth: params.finality_depth(),
         }
+    }
+
+    /// The shielded note-commitment tree anchor as of a given chain block
+    /// (PLAN §2.4). Returns the empty-tree anchor for blocks with no shielded
+    /// state. Used by RPC / wallet anchor queries.
+    pub fn shielded_anchor_at(&self, block: kaspa_hashes::Hash) -> Result<[u8; 32], kaspa_database::prelude::StoreError> {
+        self.shielded_state_manager.anchor_at(block)
     }
 
     pub fn worker(self: &Arc<Self>) {

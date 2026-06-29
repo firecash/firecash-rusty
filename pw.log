@@ -1,0 +1,19 @@
+   Compiling kaspa-database v2.0.1 (/root/work/rusty-kaspa/database)
+   Compiling kaspa-shielded-core v2.0.1 (/root/work/rusty-kaspa/shielded-core)
+   Compiling kaspa-smt-store v2.0.1 (/root/work/rusty-kaspa/consensus/smt-store)
+   Compiling kaspa-consensus v2.0.1 (/root/work/rusty-kaspa/consensus)
+warning: field `anchors_store` is never read
+  --> consensus/src/processes/shielded.rs:86:5
+   |
+81 | pub struct ShieldedStateManager {
+   |            -------------------- field in this struct
+...
+86 |     anchors_store: DbShieldedAnchorsStore,
+   |     ^^^^^^^^^^^^^
+   |
+   = note: `ShieldedStateManager` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `kaspa-consensus` (lib) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 39.61s
+=== PW_DONE_EXIT=0 ===
