@@ -26,13 +26,10 @@ use rocksdb::WriteBatch;
 
 use crate::model::stores::shielded::{
     DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorsStore, DbShieldedSupplyStore, DbShieldedTreeStore,
-    NullifierDiffStoreReader, NullifierSetStore, NullifierSetStoreReader, ShieldedSupplyStoreReader, ShieldedTreeStoreReader,
-    SupplyTotals,
+    NullifierDiffStoreReader, NullifierSetStore, NullifierSetStoreReader, ShieldedAnchorsStoreReader, ShieldedSupplyStoreReader,
+    ShieldedTreeStoreReader, SupplyTotals,
 };
 
-/// One accepted chain block's shielded input: its hash, its selected parent's
-/// hash (whose snapshot we extend), its optional coinbase mint, and its shielded
-/// transactions in accepted order.
 /// A computed (not-yet-persisted) shielded transition for one chain block.
 ///
 /// Produced by [`ShieldedStateManager::compute`] in the validation phase and
@@ -120,6 +117,27 @@ impl ShieldedStateManager {
     /// The anchor (global tree root) as of a given chain block.
     pub fn anchor_at(&self, block: Hash) -> StoreResult<[u8; 32]> {
         Ok(self.load_tree(block)?.anchor().to_bytes())
+    }
+
+    /// Publish the finalized anchor — the anchor as of a reorg-safe,
+    /// finality-deep chain block — into the ring buffer that spends prove
+    /// against (PLAN §2.4 step 5, §2.5). Idempotent: only writes when the
+    /// finalized anchor actually advances.
+    pub fn publish_finalized_anchor(&mut self, finalized_block: Hash) -> StoreResult<()> {
+        let anchor = self.anchor_at(finalized_block)?;
+        let mut ring = self.anchors_store.get()?;
+        if ring.latest() != Some(&anchor) {
+            ring.push(anchor);
+            self.anchors_store.set(&ring)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `anchor` is within the current finalized-anchor window, i.e. a
+    /// spend proving against it is acceptable (PLAN §2.5). Used by bundle
+    /// validation (task #8).
+    pub fn is_finalized_anchor(&self, anchor: &[u8; 32]) -> StoreResult<bool> {
+        Ok(self.anchors_store.get()?.contains(anchor))
     }
 
     fn load_tree(&self, block: Hash) -> StoreResult<GlobalTree> {

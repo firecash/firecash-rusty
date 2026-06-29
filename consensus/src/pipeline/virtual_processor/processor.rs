@@ -362,6 +362,13 @@ impl VirtualStateProcessor {
             )
             .expect("all possible rule errors are unexpected here");
 
+        // Shielded (PLAN §2.4 step 5, §2.5): publish the finalized anchor — the
+        // shielded tree root as of the finality point, which is reorg-safe — into
+        // the ring buffer that spends prove against. The manager's stores share
+        // the same DB, so a clone writes through; the publish is idempotent and
+        // a no-op while the shielded tree is empty.
+        self.shielded_state_manager.clone().publish_finalized_anchor(finality_point).unwrap();
+
         let compact_sink_ghostdag_data = if let Some(sink_ghostdag_data) = Lazy::get(&sink_ghostdag_data) {
             // If we had to retrieve the full data, we convert it to compact
             sink_ghostdag_data.to_compact()
