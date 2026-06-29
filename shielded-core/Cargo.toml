@@ -1,0 +1,20 @@
+[package]
+name = "kaspa-shielded-core"
+description = "kasprivate shielded pool core: Orchard note-commitment tree, nullifier set, turnstile invariant"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Orchard primitives (Halo 2 / Pasta). `circuit` (halo2_proofs) is intentionally
+# OFF for now — the tree / nullifier / value-commitment types we need here do not
+# require it. It will be enabled when proof verification is wired in (PLAN Phase 2).
+orchard = { version = "0.14", default-features = false, features = ["std"] }
+# Must match the incrementalmerkletree version Orchard links, so that
+# `MerkleHashOrchard: incrementalmerkletree::Hashable` is the same trait.
+incrementalmerkletree = "0.8.1"

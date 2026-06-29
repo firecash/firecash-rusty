@@ -1,22 +1,53 @@
-=== build started Mon Jun 29 07:56:26 AM UTC 2026 ===
+=== build started Mon Jun 29 08:27:17 AM UTC 2026 ===
+   Compiling kaspa-addresses v2.0.1 (/root/work/rusty-kaspa/crypto/addresses)
    Compiling librocksdb-sys v0.17.3+10.4.2
+   Compiling kaspa-p2p-lib v2.0.1 (/root/work/rusty-kaspa/protocol/p2p)
+   Compiling attohttpc v0.30.1
+   Compiling sha1 v0.10.6
    Compiling rocksdb v0.24.0
+   Compiling kaspa-consensus-core v2.0.1 (/root/work/rusty-kaspa/consensus/core)
+   Compiling tungstenite v0.23.0
    Compiling kaspa-database v2.0.1 (/root/work/rusty-kaspa/database)
+   Compiling kaspa-txscript v2.0.1 (/root/work/rusty-kaspa/crypto/txscript)
+   Compiling kaspa-mining-errors v2.0.1 (/root/work/rusty-kaspa/mining/errors)
+   Compiling igd-next v0.17.0
+   Compiling workflow-perf-monitor v0.0.3 (https://github.com/kaspanet/workflow-perf-monitor-rs.git?tag=v0.0.3#d63b1dd1)
+   Compiling kaspa-notify v2.0.1 (/root/work/rusty-kaspa/notify)
+   Compiling kaspa-consensus-client v2.0.1 (/root/work/rusty-kaspa/consensus/client)
+   Compiling kaspa-consensus-notify v2.0.1 (/root/work/rusty-kaspa/consensus/notify)
+   Compiling kaspa-consensusmanager v2.0.1 (/root/work/rusty-kaspa/components/consensusmanager)
+   Compiling kaspa-index-core v2.0.1 (/root/work/rusty-kaspa/indexes/core)
+   Compiling kaspa-consensus-wasm v2.0.1 (/root/work/rusty-kaspa/consensus/wasm)
+   Compiling kaspa-seq-commit v2.0.1 (/root/work/rusty-kaspa/consensus/seq-commit)
+   Compiling workflow-task-macros v0.18.0
+   Compiling kaspa-rpc-macros v2.0.1 (/root/work/rusty-kaspa/rpc/macros)
+   Compiling workflow-task v0.18.0
+   Compiling tokio-tungstenite v0.23.1
    Compiling kaspa-addressmanager v2.0.1 (/root/work/rusty-kaspa/components/addressmanager)
-   Compiling kaspa-utxoindex v2.0.1 (/root/work/rusty-kaspa/indexes/utxoindex)
-   Compiling kaspa-smt-store v2.0.1 (/root/work/rusty-kaspa/consensus/smt-store)
-   Compiling kaspa-index-processor v2.0.1 (/root/work/rusty-kaspa/indexes/processor)
+   Compiling kaspa-grpc-core v2.0.1 (/root/work/rusty-kaspa/rpc/grpc/core)
+   Compiling kaspa-rpc-core v2.0.1 (/root/work/rusty-kaspa/rpc/core)
+   Compiling kaspa-mining v2.0.1 (/root/work/rusty-kaspa/mining)
+   Compiling workflow-websocket v0.18.0
    Compiling kaspa-connectionmanager v2.0.1 (/root/work/rusty-kaspa/components/connectionmanager)
-   Compiling kaspa-consensus v2.0.1 (/root/work/rusty-kaspa/consensus)
+   Compiling kaspa-p2p-mining v2.0.1 (/root/work/rusty-kaspa/protocol/mining)
+   Compiling kaspa-utxoindex v2.0.1 (/root/work/rusty-kaspa/indexes/utxoindex)
+   Compiling workflow-rpc v0.18.0
+   Compiling kaspa-system-info v2.0.1 (/root/work/rusty-kaspa/system-info)
    Compiling kaspa-p2p-flows v2.0.1 (/root/work/rusty-kaspa/protocol/flows)
+   Compiling kaspa-perf-monitor v2.0.1 (/root/work/rusty-kaspa/metrics/perf_monitor)
+   Compiling num-rational v0.4.2
+   Compiling num-iter v0.1.45
+   Compiling num-complex v0.4.6
+   Compiling kaspa-smt-store v2.0.1 (/root/work/rusty-kaspa/consensus/smt-store)
+   Compiling num v0.4.3
+   Compiling kaspa-pow v2.0.1 (/root/work/rusty-kaspa/consensus/pow)
+   Compiling kaspa-build-info v2.0.1 (/root/work/rusty-kaspa/build-info)
+   Compiling kaspa-consensus v2.0.1 (/root/work/rusty-kaspa/consensus)
+   Compiling kaspa-index-processor v2.0.1 (/root/work/rusty-kaspa/indexes/processor)
+   Compiling kaspa-grpc-client v2.0.1 (/root/work/rusty-kaspa/rpc/grpc/client)
    Compiling kaspa-rpc-service v2.0.1 (/root/work/rusty-kaspa/rpc/service)
    Compiling kaspa-grpc-server v2.0.1 (/root/work/rusty-kaspa/rpc/grpc/server)
    Compiling kaspa-wrpc-server v2.0.1 (/root/work/rusty-kaspa/rpc/wrpc/server)
-   Compiling kaspa-wrpc-proxy v2.0.1 (/root/work/rusty-kaspa/rpc/wrpc/proxy)
    Compiling kaspad v2.0.1 (/root/work/rusty-kaspa/kaspad)
-   Compiling kaspa-testing-integration v2.0.1 (/root/work/rusty-kaspa/testing/integration)
-   Compiling kaspa-stratum-bridge v2.0.1 (/root/work/rusty-kaspa/bridge)
-   Compiling kaspa-rocknroll v2.0.1 (/root/work/rusty-kaspa/database/rocknroll)
-   Compiling simpa v2.0.1 (/root/work/rusty-kaspa/simpa)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10m 11s
-=== BUILD_DONE_EXIT=0 Mon Jun 29 08:06:38 AM UTC 2026 ===
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 46s
+=== BUILD_DONE_EXIT=0 Mon Jun 29 08:29:04 AM UTC 2026 ===
