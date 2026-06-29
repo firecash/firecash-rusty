@@ -91,6 +91,8 @@ pub enum DatabaseStorePrefixes {
     ShieldedAnchors = 82,
     /// Cumulative coinbase/fee totals for the turnstile invariant (PLAN §2.6).
     ShieldedSupply = 83,
+    /// Per-chain-block record of nullifiers added, for reorg revert (D10).
+    ShieldedNullifierDiffs = 84,
 
     // ---- Separator ----
     /// Reserved as a separator

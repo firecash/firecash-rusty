@@ -1,20 +1,23 @@
-//! Consensus driver for the shielded state transition (PLAN §2.4).
+//! Consensus driver for the shielded state transition (PLAN §2.4), reorg-safe.
 //!
-//! Binds the rocksdb-backed shielded stores ([`crate::model::stores::shielded`])
+//! Binds the per-chain-block shielded stores ([`crate::model::stores::shielded`])
 //! to the store-agnostic state transition in `kaspa-shielded-core`. The virtual
-//! processor uses [`ShieldedStateManager::apply_blocks`] to advance the shielded
-//! state over a run of accepted chain blocks, in GHOSTDAG accepted order, and to
-//! persist the result (frontier, nullifiers, supply totals, finalized anchor)
-//! atomically in a single write batch.
+//! processor advances the shielded state along the selected chain by applying a
+//! run of accepted chain blocks ([`ShieldedStateManager::apply_chain`]) and, on
+//! reorg, reverting the abandoned branch ([`ShieldedStateManager::revert_chain`]).
 //!
-//! The unbounded, append-only nullifier set is never loaded into memory: the
-//! finalized membership check goes straight to rocksdb, layered with the
-//! nullifiers accepted earlier in the same run (so a double-spend across two
-//! blocks in one virtual update is still caught).
+//! Reorg safety (decision D10): the note-commitment tree frontier and the
+//! turnstile totals are snapshotted per chain block, so extending a block loads
+//! its selected parent's snapshot. The global nullifier set is append-only for
+//! the selected chain; each block records the nullifiers it added so a reorg can
+//! remove them. The unbounded nullifier set is never loaded into memory — the
+//! finalized membership check goes straight to rocksdb, layered with nullifiers
+//! accepted earlier in the same run.
 
 use std::sync::Arc;
 
 use kaspa_database::prelude::{CachePolicy, StoreError, StoreResult, DB};
+use kaspa_hashes::Hash;
 use kaspa_shielded_core::nullifier::{MemNullifierSet, NullifierBytes, NullifierSet};
 use kaspa_shielded_core::state::{apply_chain_block_to, BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx};
 use kaspa_shielded_core::tree::{GlobalTree, NoteCommitmentTree};
@@ -22,21 +25,27 @@ use kaspa_shielded_core::turnstile::SupplyLedger;
 use rocksdb::WriteBatch;
 
 use crate::model::stores::shielded::{
-    DbNullifierSetStore, DbShieldedAnchorsStore, DbShieldedSupplyStore, DbShieldedTreeStore, NullifierSetStore,
-    NullifierSetStoreReader, ShieldedAnchorsStoreReader, ShieldedSupplyStoreReader, ShieldedTreeStoreReader, SupplyTotals,
+    DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorsStore, DbShieldedSupplyStore, DbShieldedTreeStore,
+    NullifierDiffStoreReader, NullifierSetStore, NullifierSetStoreReader, ShieldedSupplyStoreReader, ShieldedTreeStoreReader,
+    SupplyTotals,
 };
 
-/// A run of accepted chain blocks to apply: each is its optional coinbase mint
-/// and its shielded transactions in accepted order.
-pub type ShieldedBlock = (Option<CoinbaseMint>, Vec<ShieldedTx>);
+/// One accepted chain block's shielded input: its hash, its selected parent's
+/// hash (whose snapshot we extend), its optional coinbase mint, and its shielded
+/// transactions in accepted order.
+pub struct ChainBlockInput {
+    pub block: Hash,
+    pub selected_parent: Hash,
+    pub coinbase: Option<CoinbaseMint>,
+    pub txs: Vec<ShieldedTx>,
+}
 
 /// Error advancing the shielded state.
 #[derive(Debug)]
 pub enum ShieldedManagerError {
-    /// The block produced an invalid shielded state (turnstile / full tree).
-    /// The block must be rejected.
+    /// Invalid shielded state (turnstile / full tree) — the block must be rejected.
     State(ShieldedStateError),
-    /// A storage error (treated as fatal by the caller, as elsewhere in consensus).
+    /// A storage error (fatal, as elsewhere in consensus).
     Store(StoreError),
 }
 
@@ -51,9 +60,9 @@ impl From<StoreError> for ShieldedManagerError {
     }
 }
 
-/// A finalized nullifier set layered over the persisted store plus the
-/// nullifiers accepted earlier in the current run (PLAN §2.4: cross-block
-/// double-spends within one virtual update must be caught).
+/// A finalized nullifier set layered over the persisted global set plus the
+/// nullifiers accepted earlier in the current run (so cross-block double-spends
+/// within one virtual update are caught).
 struct LayeredNullifierSet<'a> {
     store: &'a DbNullifierSetStore,
     pending: &'a MemNullifierSet,
@@ -67,10 +76,11 @@ impl NullifierSet for LayeredNullifierSet<'_> {
     }
 }
 
-/// Drives and persists the shielded state transition.
+/// Drives and persists the shielded state transition, reorg-safely.
 #[derive(Clone)]
 pub struct ShieldedStateManager {
     nullifiers: DbNullifierSetStore,
+    nullifier_diffs: DbNullifierDiffStore,
     tree_store: DbShieldedTreeStore,
     supply_store: DbShieldedSupplyStore,
     anchors_store: DbShieldedAnchorsStore,
@@ -82,8 +92,9 @@ impl ShieldedStateManager {
     pub fn new(db: Arc<DB>, cache_policy: CachePolicy, anchor_depth: u32) -> Self {
         Self {
             nullifiers: DbNullifierSetStore::new(Arc::clone(&db), cache_policy),
-            tree_store: DbShieldedTreeStore::new(Arc::clone(&db)),
-            supply_store: DbShieldedSupplyStore::new(Arc::clone(&db)),
+            nullifier_diffs: DbNullifierDiffStore::new(Arc::clone(&db), cache_policy),
+            tree_store: DbShieldedTreeStore::new(Arc::clone(&db), cache_policy),
+            supply_store: DbShieldedSupplyStore::new(Arc::clone(&db), cache_policy),
             anchors_store: DbShieldedAnchorsStore::new(db, anchor_depth),
         }
     }
@@ -93,65 +104,91 @@ impl ShieldedStateManager {
         &self.nullifiers
     }
 
-    /// The current persisted anchor (root of the global note-commitment tree).
-    pub fn current_anchor(&self) -> StoreResult<[u8; 32]> {
-        let tree = self.load_tree()?;
-        Ok(tree.anchor().to_bytes())
+    /// The anchor (global tree root) as of a given chain block.
+    pub fn anchor_at(&self, block: Hash) -> StoreResult<[u8; 32]> {
+        Ok(self.load_tree(block)?.anchor().to_bytes())
     }
 
-    fn load_tree(&self) -> StoreResult<GlobalTree> {
-        let state = self.tree_store.get()?;
-        // A non-canonical persisted frontier means database corruption.
+    fn load_tree(&self, block: Hash) -> StoreResult<GlobalTree> {
+        let state = self.tree_store.get(block)?;
         Ok(GlobalTree::from_state(&state).expect("persisted shielded frontier is corrupt"))
     }
 
-    fn load_supply(&self) -> StoreResult<SupplyLedger> {
-        let t = self.supply_store.get()?;
+    fn load_supply(&self, block: Hash) -> StoreResult<SupplyLedger> {
+        let t = self.supply_store.get(block)?;
         Ok(SupplyLedger::from_totals(t.cumulative_coinbase, t.cumulative_fees))
     }
 
-    /// Apply a run of accepted chain blocks (in GHOSTDAG order) and stage the
-    /// resulting state into `batch`. Returns the per-block outcomes (notably which
-    /// transactions survived conflict resolution). On a [`ShieldedManagerError::State`]
-    /// the batch is left without shielded writes and the caller must reject the block.
-    pub fn apply_blocks(
-        &mut self,
+    /// Apply a run of accepted chain blocks (in GHOSTDAG order, each extending
+    /// its selected parent) and stage the resulting state into `batch`. The run
+    /// must be contiguous: block `i`'s selected parent is either already
+    /// committed or block `i-1` in this run.
+    ///
+    /// Returns per-block outcomes (notably which transactions survived conflict
+    /// resolution). On a [`ShieldedManagerError::State`] the caller rejects the
+    /// offending block; earlier blocks' staged writes remain in `batch` and the
+    /// caller decides whether to apply or drop the batch.
+    pub fn apply_chain(
+        &self,
         batch: &mut WriteBatch,
-        blocks: &[ShieldedBlock],
+        blocks: &[ChainBlockInput],
     ) -> Result<Vec<BlockShieldedOutcome>, ShieldedManagerError> {
-        let mut tree = self.load_tree()?;
-        let mut supply = self.load_supply()?;
-        let mut anchors = self.anchors_store.get()?;
-
+        // In-run snapshots so block i+1 sees block i's effects without needing the
+        // batch to be committed first.
+        let mut tree_by_block: std::collections::HashMap<Hash, GlobalTree> = std::collections::HashMap::new();
+        let mut supply_by_block: std::collections::HashMap<Hash, SupplyLedger> = std::collections::HashMap::new();
         let mut pending = MemNullifierSet::new();
-        let mut all_new: Vec<NullifierBytes> = Vec::new();
         let mut outcomes = Vec::with_capacity(blocks.len());
 
-        for (coinbase, txs) in blocks {
+        for input in blocks {
+            // Load the selected parent's state (from this run, else from the store).
+            let mut tree = match tree_by_block.get(&input.selected_parent) {
+                Some(t) => t.clone(),
+                None => self.load_tree(input.selected_parent)?,
+            };
+            let mut supply = match supply_by_block.get(&input.selected_parent) {
+                Some(s) => s.clone(),
+                None => self.load_supply(input.selected_parent)?,
+            };
+
             let outcome = {
                 let finalized = LayeredNullifierSet { store: &self.nullifiers, pending: &pending };
-                apply_chain_block_to(&finalized, &mut tree, &mut supply, coinbase.as_ref(), txs)?
+                apply_chain_block_to(&finalized, &mut tree, &mut supply, input.coinbase.as_ref(), &input.txs)?
             };
+
+            // Stage persistence for this block.
+            self.tree_store.set_batch(batch, input.block, tree.to_state())?;
+            self.supply_store.set_batch(
+                batch,
+                input.block,
+                SupplyTotals { cumulative_coinbase: supply.cumulative_coinbase(), cumulative_fees: supply.cumulative_fees() },
+            )?;
+            self.nullifier_diffs.set_batch(batch, input.block, outcome.new_nullifiers.clone())?;
             for nf in &outcome.new_nullifiers {
                 pending.insert(*nf);
-                all_new.push(*nf);
+                self.nullifiers.insert_batch(batch, *nf)?;
             }
-            anchors.push(outcome.anchor.to_bytes());
+
+            tree_by_block.insert(input.block, tree);
+            supply_by_block.insert(input.block, supply);
             outcomes.push(outcome);
         }
 
-        // Persist the advanced state atomically into the caller's batch.
-        self.tree_store.set_batch(batch, &tree.to_state())?;
-        self.supply_store.set_batch(
-            batch,
-            &SupplyTotals { cumulative_coinbase: supply.cumulative_coinbase(), cumulative_fees: supply.cumulative_fees() },
-        )?;
-        for nf in all_new {
-            self.nullifiers.insert_batch(batch, nf)?;
-        }
-        self.anchors_store.set_batch(batch, &anchors)?;
-
         Ok(outcomes)
+    }
+
+    /// Revert a set of chain blocks abandoned by a reorg: remove the nullifiers
+    /// they added from the global set, and drop their per-block snapshots.
+    pub fn revert_chain(&self, batch: &mut WriteBatch, blocks: &[Hash]) -> StoreResult<()> {
+        for &block in blocks {
+            for nf in self.nullifier_diffs.get(block)? {
+                self.nullifiers.delete_batch(batch, nf)?;
+            }
+            self.nullifier_diffs.delete_batch(batch, block)?;
+            self.tree_store.delete_batch(batch, block)?;
+            self.supply_store.delete_batch(batch, block)?;
+        }
+        Ok(())
     }
 }
 
@@ -182,22 +219,28 @@ mod tests {
         CoinbaseMint { subsidy, commitment: cmx(c) }
     }
 
-    /// End-to-end through rocksdb: a parallel double-spend across two accepted
-    /// blocks resolves to one survivor, the state persists, and a fresh manager
-    /// loaded from the same database sees the identical anchor and still rejects
-    /// a later reuse of the spent nullifier.
-    #[test]
-    fn persists_and_resolves_double_spend_across_sessions() {
-        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let mut mgr = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64), 100);
+    fn h(n: u8) -> Hash {
+        Hash::from_bytes([n; 32])
+    }
 
+    /// A contiguous chain of two blocks with a parallel double-spend resolves to
+    /// one survivor, persists per-block, and a fresh manager sees the identical
+    /// anchor at the tip and rejects later reuse across sessions.
+    #[test]
+    fn apply_chain_persists_and_resolves_double_spend() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64), 100);
+
+        let genesis = h(0);
+        let b1 = h(1);
+        let b2 = h(2);
         let mut batch = WriteBatch::default();
         let outcomes = mgr
-            .apply_blocks(
+            .apply_chain(
                 &mut batch,
                 &[
-                    (Some(coinbase(50, 10)), vec![stx(&[1], &[100], 5)]),
-                    (Some(coinbase(50, 20)), vec![stx(&[1], &[200], 5)]), // reuses nf(1)
+                    ChainBlockInput { block: b1, selected_parent: genesis, coinbase: Some(coinbase(50, 10)), txs: vec![stx(&[1], &[100], 5)] },
+                    ChainBlockInput { block: b2, selected_parent: b1, coinbase: Some(coinbase(50, 20)), txs: vec![stx(&[1], &[200], 5)] },
                 ],
             )
             .unwrap();
@@ -205,27 +248,62 @@ mod tests {
 
         assert_eq!(outcomes[0].accepted, vec![0], "first spend of nf(1) wins");
         assert!(outcomes[1].accepted.is_empty(), "second spend of nf(1) dropped");
-        let anchor_after = outcomes[1].anchor.to_bytes();
+        let tip_anchor = outcomes[1].anchor.to_bytes();
 
-        // Fresh manager loaded from the same DB: identical persisted anchor.
-        let mut mgr2 = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64), 100);
-        assert_eq!(mgr2.current_anchor().unwrap(), anchor_after);
-        assert!(mgr2.nullifiers().contains(&nf(1)).unwrap(), "spent nullifier persisted");
+        // Fresh manager from the same DB: identical persisted anchor at the tip.
+        let mgr2 = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64), 100);
+        assert_eq!(mgr2.anchor_at(b2).unwrap(), tip_anchor);
+        assert!(mgr2.nullifiers().contains(&nf(1)).unwrap());
 
         // A later block reusing nf(1) is still caught against the persisted set.
-        let mut batch2 = WriteBatch::default();
-        let later = mgr2.apply_blocks(&mut batch2, &[(None, vec![stx(&[1], &[300], 0)])]).unwrap();
+        let mut b3 = WriteBatch::default();
+        let later = mgr2
+            .apply_chain(&mut b3, &[ChainBlockInput { block: h(3), selected_parent: b2, coinbase: None, txs: vec![stx(&[1], &[300], 0)] }])
+            .unwrap();
         assert!(later[0].accepted.is_empty(), "double-spend caught across sessions");
     }
 
-    /// Spending more than was ever minted is rejected (turnstile) and surfaced as
-    /// a state error so the caller rejects the block.
+    /// Reverting a block removes the nullifiers it added, so the same nullifier
+    /// can be spent again on the new branch (reorg correctness).
+    #[test]
+    fn revert_removes_block_nullifiers() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64), 100);
+        let b1 = h(1);
+
+        let mut batch = WriteBatch::default();
+        mgr.apply_chain(
+            &mut batch,
+            &[ChainBlockInput { block: b1, selected_parent: h(0), coinbase: Some(coinbase(10, 1)), txs: vec![stx(&[1], &[100], 0)] }],
+        )
+        .unwrap();
+        db.write(batch).unwrap();
+        assert!(mgr.nullifiers().contains(&nf(1)).unwrap());
+
+        // Reorg abandons b1.
+        let mut rb = WriteBatch::default();
+        mgr.revert_chain(&mut rb, &[b1]).unwrap();
+        db.write(rb).unwrap();
+        assert!(!mgr.nullifiers().contains(&nf(1)).unwrap(), "reverted nullifier removed");
+
+        // The new branch can now spend nf(1).
+        let mut nb = WriteBatch::default();
+        let out = mgr
+            .apply_chain(&mut nb, &[ChainBlockInput { block: h(9), selected_parent: h(0), coinbase: Some(coinbase(10, 2)), txs: vec![stx(&[1], &[101], 0)] }])
+            .unwrap();
+        assert_eq!(out[0].accepted, vec![0], "spend of reverted nullifier accepted on new branch");
+    }
+
+    /// Spending more than was ever minted is rejected (turnstile).
     #[test]
     fn rejects_overspend() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let mut mgr = ShieldedStateManager::new(db, CachePolicy::Count(64), 100);
+        let mgr = ShieldedStateManager::new(db, CachePolicy::Count(64), 100);
         let mut batch = WriteBatch::default();
-        let res = mgr.apply_blocks(&mut batch, &[(Some(coinbase(10, 1)), vec![stx(&[7], &[2], 11)])]);
+        let res = mgr.apply_chain(
+            &mut batch,
+            &[ChainBlockInput { block: h(1), selected_parent: h(0), coinbase: Some(coinbase(10, 1)), txs: vec![stx(&[7], &[2], 11)] }],
+        );
         assert!(matches!(res, Err(ShieldedManagerError::State(ShieldedStateError::Turnstile(_)))));
     }
 }
