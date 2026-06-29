@@ -19,6 +19,7 @@
 
 pub mod bundle;
 pub mod nullifier;
+pub mod state;
 pub mod tree;
 pub mod turnstile;
 
