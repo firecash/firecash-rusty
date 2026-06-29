@@ -3392,6 +3392,7 @@ dependencies = [
  "kaspa-notify",
  "kaspa-pow",
  "kaspa-seq-commit",
+ "kaspa-shielded-core",
  "kaspa-smt",
  "kaspa-smt-store",
  "kaspa-txscript",
@@ -4151,6 +4152,7 @@ version = "2.0.1"
 dependencies = [
  "incrementalmerkletree",
  "orchard",
+ "serde",
 ]
 
 [[package]]

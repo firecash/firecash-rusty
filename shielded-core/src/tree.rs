@@ -27,11 +27,13 @@
 use core::fmt;
 
 use incrementalmerkletree::frontier::Frontier;
+use incrementalmerkletree::Position;
 use orchard::{
     note::ExtractedNoteCommitment,
     tree::{Anchor, MerkleHashOrchard},
     NOTE_COMMITMENT_TREE_DEPTH,
 };
+use serde::{Deserialize, Serialize};
 
 /// Depth of the Orchard note-commitment tree (32).
 pub const TREE_DEPTH: u8 = NOTE_COMMITMENT_TREE_DEPTH as u8;
@@ -161,6 +163,60 @@ impl NoteCommitmentTree for GlobalTree {
     }
 }
 
+/// A serializable snapshot of a [`GlobalTree`], sufficient to persist and resume
+/// appending. Holds only the frontier (~32 nodes), per PLAN §2.9. This is the
+/// representation the consensus store persists, since `incrementalmerkletree`'s
+/// `Frontier` is not itself serde-serializable (decision D9).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontierState {
+    /// Number of leaves appended so far (0 == empty tree).
+    pub size: u64,
+    /// The most recently appended leaf, if the tree is non-empty.
+    pub leaf: Option<[u8; 32]>,
+    /// The frontier ommers (the left siblings needed to extend and root the tree).
+    pub ommers: Vec<[u8; 32]>,
+}
+
+/// Error rebuilding a [`GlobalTree`] from a persisted [`FrontierState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeStateError {
+    /// A stored node was not a canonical Pallas base-field encoding.
+    NonCanonicalNode,
+    /// The stored frontier parts were internally inconsistent.
+    Inconsistent,
+}
+
+impl GlobalTree {
+    /// Export a persistable snapshot of the current frontier.
+    pub fn to_state(&self) -> FrontierState {
+        match self.frontier.value() {
+            None => FrontierState { size: 0, leaf: None, ommers: Vec::new() },
+            Some(nef) => FrontierState {
+                size: self.size,
+                leaf: Some(nef.leaf().to_bytes()),
+                ommers: nef.ommers().iter().map(|h| h.to_bytes()).collect(),
+            },
+        }
+    }
+
+    /// Rebuild a tree from a persisted snapshot (e.g. on node restart).
+    pub fn from_state(state: &FrontierState) -> Result<Self, TreeStateError> {
+        if state.size == 0 {
+            return Ok(Self::new());
+        }
+        let leaf = node_from_bytes(state.leaf.as_ref().ok_or(TreeStateError::Inconsistent)?)?;
+        let ommers = state.ommers.iter().map(node_from_bytes).collect::<Result<Vec<_>, _>>()?;
+        // The frontier position is the index of the last appended leaf.
+        let position = Position::from(state.size - 1);
+        let frontier = Frontier::from_parts(position, leaf, ommers).map_err(|_| TreeStateError::Inconsistent)?;
+        Ok(Self { frontier, size: state.size })
+    }
+}
+
+fn node_from_bytes(b: &[u8; 32]) -> Result<MerkleHashOrchard, TreeStateError> {
+    Option::from(MerkleHashOrchard::from_bytes(b)).ok_or(TreeStateError::NonCanonicalNode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +281,32 @@ mod tests {
             t2.append(cmx(n)).unwrap();
         }
         assert_ne!(t1.anchor().to_bytes(), t2.anchor().to_bytes());
+    }
+
+    #[test]
+    fn frontier_state_round_trip_preserves_anchor_and_resumes() {
+        let mut t = GlobalTree::new();
+        for n in [1, 2, 3, 4, 5, 6, 7] {
+            t.append(cmx(n)).unwrap();
+        }
+        let rebuilt = GlobalTree::from_state(&t.to_state()).unwrap();
+        assert_eq!(rebuilt.size(), t.size());
+        assert_eq!(rebuilt.anchor().to_bytes(), t.anchor().to_bytes());
+
+        // Appending continues identically after a persist/restore cycle.
+        let mut a = t.clone();
+        let mut b = rebuilt;
+        a.append(cmx(8)).unwrap();
+        b.append(cmx(8)).unwrap();
+        assert_eq!(a.anchor().to_bytes(), b.anchor().to_bytes());
+    }
+
+    #[test]
+    fn empty_frontier_state_round_trip() {
+        let t = GlobalTree::new();
+        let rebuilt = GlobalTree::from_state(&t.to_state()).unwrap();
+        assert_eq!(rebuilt.anchor().to_bytes(), Anchor::empty_tree().to_bytes());
+        assert_eq!(rebuilt.size(), 0);
     }
 
     /// The anchor advances as leaves are added.

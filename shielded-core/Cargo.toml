@@ -18,3 +18,6 @@ orchard = { version = "0.14", default-features = false, features = ["std"] }
 # Must match the incrementalmerkletree version Orchard links, so that
 # `MerkleHashOrchard: incrementalmerkletree::Hashable` is the same trait.
 incrementalmerkletree = "0.8.1"
+# For the persisted frontier snapshot (FrontierState). incrementalmerkletree's
+# Frontier is not serde-serializable, so we persist a representation we control.
+serde = { workspace = true, features = ["derive"] }

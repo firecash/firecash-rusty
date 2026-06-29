@@ -82,6 +82,16 @@ pub enum DatabaseStorePrefixes {
     SmtSyncFlag = 75,
     SmtSeqCommitMeta = 76,
 
+    // ---- Shielded pool (kasprivate) ----
+    /// Append-only set of spent nullifiers (PLAN §2.2).
+    ShieldedNullifiers = 80,
+    /// Persisted frontier of the global note-commitment tree (PLAN §2.9).
+    ShieldedTreeFrontier = 81,
+    /// Ring buffer of recent finalized anchors that spends reference (PLAN §2.5).
+    ShieldedAnchors = 82,
+    /// Cumulative coinbase/fee totals for the turnstile invariant (PLAN §2.6).
+    ShieldedSupply = 83,
+
     // ---- Separator ----
     /// Reserved as a separator
     Separator = SEPARATOR,
