@@ -3,8 +3,8 @@ use crate::{
     errors::{
         BlockProcessResult,
         RuleError::{
-            BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment, InvalidTransactionsInUtxoContext,
-            WrongHeaderPruningPoint, WrongSelectedParentOrder,
+            BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment, InvalidShieldedState,
+            InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint, WrongSelectedParentOrder,
         },
     },
     model::stores::{
@@ -38,6 +38,10 @@ use kaspa_consensus_core::{
 use kaspa_core::{info, trace};
 use kaspa_hashes::Hash;
 use kaspa_muhash::MuHash;
+use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+use kaspa_shielded_core::bundle::ShieldedBundle;
+use kaspa_shielded_core::state::ShieldedTx;
+use crate::processes::shielded::ComputedBlockShielded;
 use kaspa_utils::refs::Refs;
 
 use crate::model::services::seq_commit_accessor::SeqCommitAccessor;
@@ -83,6 +87,16 @@ pub(super) struct UtxoProcessingContext<'a> {
     pub mergeset_acceptance_data: Vec<MergesetBlockAcceptanceData>,
     pub mergeset_rewards: BlockHashMap<BlockRewardData>,
     pub pruning_sample_from_pov: Option<Hash>,
+    /// Shielded transactions accepted by this block, in GHOSTDAG accepted order
+    /// (PLAN §2.4). Collected during UTXO processing; consumed by the shielded
+    /// state transition in verification/commit.
+    pub shielded_txs: Vec<ShieldedTx>,
+    /// Set if any accepted shielded transaction carried a malformed bundle; the
+    /// block is rejected during verification.
+    pub shielded_invalid: bool,
+    /// The validated shielded transition for this block, computed during
+    /// verification and persisted at commit.
+    pub shielded_computed: Option<ComputedBlockShielded>,
 }
 
 impl<'a> UtxoProcessingContext<'a> {
@@ -98,6 +112,9 @@ impl<'a> UtxoProcessingContext<'a> {
             mergeset_rewards: BlockHashMap::with_capacity(mergeset_size),
             mergeset_acceptance_data: Vec::with_capacity(mergeset_size),
             pruning_sample_from_pov: Default::default(),
+            shielded_txs: Vec::new(),
+            shielded_invalid: false,
+            shielded_computed: None,
         }
     }
 
@@ -163,6 +180,18 @@ impl VirtualStateProcessor {
                 ctx.accepted_tx_ids.push(validated_tx.id());
                 ctx.accepted_tx_versions.push(validated_tx.version());
                 block_fee += validated_tx.calculated_fee;
+
+                // Collect shielded bundles in accepted order (PLAN §2.4). The cheap
+                // version gate means transparent transactions cost nothing here.
+                if validated_tx.version() == TX_VERSION_SHIELDED {
+                    match ShieldedBundle::from_bytes(&validated_tx.tx().payload)
+                        .ok()
+                        .and_then(|b| ShieldedTx::from_bundle(&b).ok())
+                    {
+                        Some(stx) => ctx.shielded_txs.push(stx),
+                        None => ctx.shielded_invalid = true,
+                    }
+                }
             }
 
             ctx.mergeset_acceptance_data.push(MergesetBlockAcceptanceData {
@@ -272,6 +301,24 @@ impl VirtualStateProcessor {
         if validated_transactions.len() < txs.len() - 1 {
             // Some non-coinbase transactions are invalid
             return Err(InvalidTransactionsInUtxoContext(txs.len() - 1 - validated_transactions.len(), txs.len() - 1));
+        }
+
+        // Shielded state transition (PLAN §2.4): validate nullifier conflicts and
+        // the turnstile against the selected parent's persisted shielded state, and
+        // compute the new state for commit. Coinbase-note minting is not yet active
+        // (PLAN §2.7), so no value enters the pool here. This is a no-op for blocks
+        // with no shielded transactions.
+        if ctx.shielded_invalid {
+            return Err(InvalidShieldedState(header.hash, "malformed shielded bundle".to_string()));
+        }
+        match self.shielded_state_manager.compute(ctx.selected_parent(), None, &ctx.shielded_txs) {
+            Ok(computed) => ctx.shielded_computed = Some(computed),
+            Err(crate::processes::shielded::ShieldedManagerError::State(e)) => {
+                return Err(InvalidShieldedState(header.hash, format!("{e:?}")));
+            }
+            Err(crate::processes::shielded::ShieldedManagerError::Store(e)) => {
+                panic!("shielded store read failed during verification: {e}");
+            }
         }
 
         Ok(smt_build)

@@ -154,6 +154,9 @@ pub enum RuleError {
     #[error("{0} non-coinbase transactions (out of {1}) are invalid in UTXO context")]
     InvalidTransactionsInUtxoContext(usize, usize),
 
+    #[error("block {0} has an invalid shielded state transition: {1}")]
+    InvalidShieldedState(Hash, String),
+
     #[error("invalid transactions in new block template")]
     InvalidTransactionsInNewBlock(HashMap<TransactionId, TxRuleError>),
 

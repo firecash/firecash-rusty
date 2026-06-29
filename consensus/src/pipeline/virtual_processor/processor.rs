@@ -439,6 +439,14 @@ impl VirtualStateProcessor {
             let mergeset_diff = self.utxo_diffs_store.get(current).unwrap();
             // Apply the diff in reverse
             diff.with_diff_in_place(&mergeset_diff.as_reversed()).unwrap();
+
+            // Shielded (PLAN §2.4): this chain block is leaving the selected chain,
+            // so remove the nullifiers it added from the global set (its per-block
+            // frontier/supply snapshots are intrinsic and retained for a rejoin).
+            // No-op for blocks with no shielded nullifiers.
+            let mut shielded_batch = WriteBatch::default();
+            self.shielded_state_manager.revert_nullifiers_from_store(&mut shielded_batch, current).unwrap();
+            self.db.write(shielded_batch).unwrap();
         }
 
         let split_point = split_point.expect("chain iterator was expected to reach the reorg split point");
@@ -467,6 +475,13 @@ impl VirtualStateProcessor {
                 Ok(mergeset_diff) => {
                     diff.with_diff_in_place(mergeset_diff.deref()).unwrap();
                     diff_point = current;
+
+                    // Shielded (PLAN §2.4): this already-validated chain block is
+                    // (re)joining the selected chain, so re-add the nullifiers it
+                    // added from its stored per-block diff. No-op when it has none.
+                    let mut shielded_batch = WriteBatch::default();
+                    self.shielded_state_manager.apply_nullifiers_from_store(&mut shielded_batch, current).unwrap();
+                    self.db.write(shielded_batch).unwrap();
                 }
                 Err(StoreError::KeyNotFound(_)) => {
                     if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
@@ -503,7 +518,8 @@ impl VirtualStateProcessor {
                             if let Some(ref build) = smt_build {
                                 lane_update_counter += build.lane_update_count() as u64;
                             }
-                            // Commit UTXO + SMT data for current chain block
+                            // Commit UTXO + SMT + shielded data for current chain block
+                            let shielded_computed = ctx.shielded_computed.take();
                             self.commit_utxo_state(
                                 current,
                                 ctx.mergeset_diff,
@@ -512,6 +528,7 @@ impl VirtualStateProcessor {
                                 ctx.pruning_sample_from_pov.expect("verified"),
                                 smt_build,
                                 header.blue_score,
+                                shielded_computed,
                             );
                             // Count the number of UTXO-processed chain blocks
                             chain_block_counter += 1;
@@ -540,6 +557,7 @@ impl VirtualStateProcessor {
         pruning_sample_from_pov: Hash,
         smt_build: Option<kaspa_smt_store::processor::SmtBuild>,
         blue_score: u64,
+        shielded_computed: Option<crate::processes::shielded::ComputedBlockShielded>,
     ) {
         let mut batch = WriteBatch::default();
         self.utxo_diffs_store.insert_batch(&mut batch, current, Arc::new(mergeset_diff)).unwrap();
@@ -555,6 +573,13 @@ impl VirtualStateProcessor {
             build.flush(&self.smt_stores, &mut batch, blue_score, current).unwrap();
             use crate::model::stores::smt_metadata::SmtBlockMetadata;
             self.smt_metadata_store.insert_batch(&mut batch, current, SmtBlockMetadata::new(pd, shortcut_block, alc)).unwrap();
+        }
+        // Shielded state transition (PLAN §2.4): persist this block's frontier /
+        // supply / nullifier-diff and add its nullifiers to the global set, in the
+        // same atomic batch. Only non-trivial state is written, so blocks with no
+        // shielded activity add nothing.
+        if let Some(computed) = shielded_computed {
+            self.shielded_state_manager.persist(&mut batch, current, &computed).unwrap();
         }
         let write_guard = self.statuses_store.set_batch(&mut batch, current, StatusUTXOValid).unwrap();
         self.db.write(batch).unwrap();
@@ -1553,7 +1578,7 @@ impl VirtualStateProcessor {
     /// Note that pruning point-related stores are initialized by `init`
     pub fn process_genesis(self: &Arc<Self>) {
         // Write the UTXO state of genesis
-        self.commit_utxo_state(self.genesis.hash, UtxoDiff::default(), MuHash::new(), AcceptanceData::default(), ZERO_HASH, None, 0);
+        self.commit_utxo_state(self.genesis.hash, UtxoDiff::default(), MuHash::new(), AcceptanceData::default(), ZERO_HASH, None, 0, None);
 
         // Init the virtual selected chain store
         let mut batch = WriteBatch::default();
