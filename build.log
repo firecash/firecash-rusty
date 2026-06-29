@@ -1,0 +1,22 @@
+=== build started Mon Jun 29 07:56:26 AM UTC 2026 ===
+   Compiling librocksdb-sys v0.17.3+10.4.2
+   Compiling rocksdb v0.24.0
+   Compiling kaspa-database v2.0.1 (/root/work/rusty-kaspa/database)
+   Compiling kaspa-addressmanager v2.0.1 (/root/work/rusty-kaspa/components/addressmanager)
+   Compiling kaspa-utxoindex v2.0.1 (/root/work/rusty-kaspa/indexes/utxoindex)
+   Compiling kaspa-smt-store v2.0.1 (/root/work/rusty-kaspa/consensus/smt-store)
+   Compiling kaspa-index-processor v2.0.1 (/root/work/rusty-kaspa/indexes/processor)
+   Compiling kaspa-connectionmanager v2.0.1 (/root/work/rusty-kaspa/components/connectionmanager)
+   Compiling kaspa-consensus v2.0.1 (/root/work/rusty-kaspa/consensus)
+   Compiling kaspa-p2p-flows v2.0.1 (/root/work/rusty-kaspa/protocol/flows)
+   Compiling kaspa-rpc-service v2.0.1 (/root/work/rusty-kaspa/rpc/service)
+   Compiling kaspa-grpc-server v2.0.1 (/root/work/rusty-kaspa/rpc/grpc/server)
+   Compiling kaspa-wrpc-server v2.0.1 (/root/work/rusty-kaspa/rpc/wrpc/server)
+   Compiling kaspa-wrpc-proxy v2.0.1 (/root/work/rusty-kaspa/rpc/wrpc/proxy)
+   Compiling kaspad v2.0.1 (/root/work/rusty-kaspa/kaspad)
+   Compiling kaspa-testing-integration v2.0.1 (/root/work/rusty-kaspa/testing/integration)
+   Compiling kaspa-stratum-bridge v2.0.1 (/root/work/rusty-kaspa/bridge)
+   Compiling kaspa-rocknroll v2.0.1 (/root/work/rusty-kaspa/database/rocknroll)
+   Compiling simpa v2.0.1 (/root/work/rusty-kaspa/simpa)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10m 11s
+=== BUILD_DONE_EXIT=0 Mon Jun 29 08:06:38 AM UTC 2026 ===
