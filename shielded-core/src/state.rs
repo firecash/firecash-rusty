@@ -23,6 +23,7 @@
 use orchard::note::ExtractedNoteCommitment;
 use orchard::tree::Anchor;
 
+use crate::bundle::ShieldedBundle;
 use crate::nullifier::{MemNullifierSet, NullifierBytes, NullifierConflictResolver, NullifierSet};
 use crate::tree::{ChainBlockSubtree, GlobalTree, NoteCommitmentTree, TreeFull};
 use crate::turnstile::{SupplyLedger, TurnstileViolation};
@@ -38,6 +39,40 @@ pub struct ShieldedTx {
     /// Public fee paid by the transaction: value leaving the shielded pool to the
     /// miner. (Orchard `value_balance` for a pure shielded payment.)
     pub fee: u64,
+}
+
+/// Error extracting a [`ShieldedTx`] from an on-wire [`ShieldedBundle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleExtractError {
+    /// A note commitment was not a canonical Pallas base-field encoding.
+    NonCanonicalCommitment,
+    /// A non-coinbase bundle declared a negative value balance, i.e. it claims to
+    /// mint value into the pool — only the coinbase may do that (PLAN §2.7).
+    MintingValueBalance,
+}
+
+impl ShieldedTx {
+    /// Extract the consensus-relevant shielded effects from a parsed bundle.
+    ///
+    /// This is the bridge from the on-wire [`ShieldedBundle`] (carried in the tx
+    /// payload) to the input of the state transition. It does **not** verify the
+    /// proof or signatures (that is the validation layer's job, PLAN §3); it only
+    /// decodes the fields the state transition consumes — nullifiers, note
+    /// commitments, and the public fee.
+    pub fn from_bundle(bundle: &ShieldedBundle) -> Result<Self, BundleExtractError> {
+        let mut commitments = Vec::with_capacity(bundle.actions.len());
+        for a in &bundle.actions {
+            let cmx = Option::from(ExtractedNoteCommitment::from_bytes(&a.cmx))
+                .ok_or(BundleExtractError::NonCanonicalCommitment)?;
+            commitments.push(cmx);
+        }
+        let nullifiers = bundle.actions.iter().map(|a| a.nullifier).collect();
+        // A normal shielded transaction's value balance is its (non-negative) fee.
+        if bundle.value_balance < 0 {
+            return Err(BundleExtractError::MintingValueBalance);
+        }
+        Ok(ShieldedTx { nullifiers, commitments, fee: bundle.value_balance as u64 })
+    }
 }
 
 /// A coinbase note minted into the pool — the one transparent seam (PLAN §2.7).
@@ -301,6 +336,66 @@ mod tests {
 
         assert_eq!(with_conflict.anchor().to_bytes(), without.anchor().to_bytes());
         assert_eq!(with_conflict.tree.size(), without.tree.size());
+    }
+
+    fn action(nf_seed: u8, cmx_n: u32) -> crate::bundle::ActionWire {
+        use crate::bundle::sizes;
+        let mut cmxb = [0u8; 32];
+        cmxb[0..4].copy_from_slice(&cmx_n.to_le_bytes());
+        crate::bundle::ActionWire {
+            nullifier: nf(nf_seed),
+            rk: [0; 32],
+            cmx: cmxb,
+            cv_net: [0; 32],
+            ephemeral_key: [0; 32],
+            enc_ciphertext: [0; sizes::ENC_CIPHERTEXT],
+            out_ciphertext: [0; sizes::OUT_CIPHERTEXT],
+            spend_auth_sig: [0; sizes::SIG],
+        }
+    }
+
+    #[test]
+    fn extract_shielded_tx_from_bundle() {
+        let bundle = ShieldedBundle {
+            actions: vec![action(1, 100), action(2, 101)],
+            flags: 0b11,
+            value_balance: 7,
+            anchor: [0; 32],
+            proof: vec![],
+            binding_sig: [0; 64],
+        };
+        let stx = ShieldedTx::from_bundle(&bundle).unwrap();
+        assert_eq!(stx.nullifiers, vec![nf(1), nf(2)]);
+        assert_eq!(stx.commitments.len(), 2);
+        assert_eq!(stx.fee, 7);
+    }
+
+    #[test]
+    fn extract_rejects_minting_value_balance() {
+        let bundle = ShieldedBundle {
+            actions: vec![],
+            flags: 0,
+            value_balance: -1,
+            anchor: [0; 32],
+            proof: vec![],
+            binding_sig: [0; 64],
+        };
+        assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::MintingValueBalance)));
+    }
+
+    #[test]
+    fn extract_rejects_non_canonical_commitment() {
+        let mut bad = action(1, 0);
+        bad.cmx = [0xff; 32]; // not a canonical Pallas base-field element
+        let bundle = ShieldedBundle {
+            actions: vec![bad],
+            flags: 0,
+            value_balance: 0,
+            anchor: [0; 32],
+            proof: vec![],
+            binding_sig: [0; 64],
+        };
+        assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::NonCanonicalCommitment)));
     }
 
     /// Spending more than has been minted is rejected (turnstile), and the state
