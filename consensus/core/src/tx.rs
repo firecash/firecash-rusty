@@ -249,6 +249,11 @@ impl BorshSerialize for TransactionMass {
     }
 }
 
+/// Transaction version that carries an Orchard shielded bundle in its `payload`
+/// (PLAN §2.1, decision D7). Canonical here as a consensus parameter; the wire
+/// format for the payload lives in `kaspa-shielded-core`.
+pub const TX_VERSION_SHIELDED: u16 = 2;
+
 /// Represents a Kaspa transaction
 #[derive(Debug, Clone, PartialEq, Eq, Default, BorshSerialize, BorshDeserialize)]
 pub struct Transaction {
@@ -393,6 +398,15 @@ impl Transaction {
     /// miner in future blocks.
     pub fn is_coinbase(&self) -> bool {
         self.subnetwork_id == subnets::SUBNETWORK_ID_COINBASE
+    }
+
+    /// Determines whether this transaction carries an Orchard shielded bundle
+    /// (PLAN §2.1). Shielded transactions are identified by their version; the
+    /// bundle itself is carried in `payload` (decision D7) and is parsed and
+    /// verified by the consensus validation layer, not here. A shielded
+    /// transaction is never a coinbase — coinbase is the one transparent seam.
+    pub fn is_shielded(&self) -> bool {
+        self.version == TX_VERSION_SHIELDED && !self.is_coinbase()
     }
 
     /// Recompute and finalize the tx id based on updated tx fields

@@ -23,10 +23,9 @@
 
 use crate::nullifier::NullifierBytes;
 
-/// Transaction version that carries an Orchard shielded bundle in its payload.
-///
-/// Distinct from the transparent versions (v0 sig-op-count, v1 compute-budget).
-pub const TX_VERSION_SHIELDED: u16 = 2;
+// The transaction *version* that selects this wire format is a consensus
+// parameter and lives in `kaspa_consensus_core::tx::TX_VERSION_SHIELDED`; this
+// crate only owns the byte format of the bundle carried in the payload.
 
 /// Fixed sizes of the cryptographic components, per the Orchard encoding
 /// (Zcash protocol spec §7.5). Kept as named constants so the reader/writer and
