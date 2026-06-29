@@ -1,0 +1,12 @@
+   Compiling kaspa-consensus v2.0.1 (/root/work/rusty-kaspa/consensus)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 43.57s
+     Running unittests src/lib.rs (target/debug/deps/kaspa_consensus-6a8cc604660c1baa)
+
+running 3 tests
+test model::stores::shielded::tests::anchor_ring_evicts_oldest ... ok
+test processes::shielded::tests::rejects_overspend ... ok
+test processes::shielded::tests::persists_and_resolves_double_spend_across_sessions ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 0.31s
+
+=== SCT_DONE_EXIT=0 ===

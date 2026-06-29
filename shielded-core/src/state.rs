@@ -162,67 +162,81 @@ impl ShieldedState {
         coinbase: Option<&CoinbaseMint>,
         txs: &[ShieldedTx],
     ) -> Result<BlockShieldedOutcome, ShieldedStateError> {
-        // ---- Phase 1: resolve conflicts & gather effects (immutable borrow) ----
-        // Scope the resolver so its borrow of `self.nullifiers` ends before we mutate.
-        let (accepted, new_nullifiers, subtree, total_fees, total_mint) = {
-            let mut resolver = NullifierConflictResolver::new(&self.nullifiers);
-            let mut subtree = ChainBlockSubtree::new();
-            let mut accepted = Vec::new();
-            let mut total_fees: u128 = 0;
-            let mut total_mint: u128 = 0;
-
-            // Coinbase is processed first: it has no nullifiers, mints subsidy, and
-            // contributes its note commitment as the first leaf of the subtree.
-            if let Some(cb) = coinbase {
-                total_mint += cb.subsidy as u128;
-                subtree.push(cb.commitment);
-            }
-
-            for (i, tx) in txs.iter().enumerate() {
-                match resolver.try_accept(tx.nullifiers.iter().copied()) {
-                    Ok(()) => {
-                        for &cmx in &tx.commitments {
-                            subtree.push(cmx);
-                        }
-                        total_fees += tx.fee as u128;
-                        accepted.push(i);
-                    }
-                    // Conflicting transaction: dropped (double-spend), records nothing.
-                    Err(_) => {}
-                }
-            }
-
-            (accepted, resolver.into_accepted(), subtree, total_fees, total_mint)
-        };
-
-        // ---- Phase 2: commit effects to a working copy, then swap in on success ----
-        // Work on clones so a turnstile/full-tree failure leaves `self` untouched.
-        let mut tree = self.tree.clone();
-        let mut supply = self.supply.clone();
-
-        // Turnstile accounting (saturating into checked ops inside the ledger).
-        if total_mint > 0 {
-            // total_mint fits u64 in practice (single block subsidy); guard anyway.
-            supply.mint_coinbase(u64::try_from(total_mint).map_err(|_| TurnstileViolation::Overflow)?)?;
-        }
-        if total_fees > 0 {
-            supply.collect_fees(u64::try_from(total_fees).map_err(|_| TurnstileViolation::Overflow)?)?;
-        }
-
-        // Step 3: append this block's subtree to the global tree, producing the anchor.
-        tree.append_subtree(&subtree)?;
-        let anchor = tree.anchor();
-
-        // Step 4: the turnstile invariant must hold after the update.
-        supply.check()?;
-
-        // All checks passed: commit.
-        self.tree = tree;
-        self.supply = supply;
-        self.nullifiers.extend(new_nullifiers.iter().copied());
-
-        Ok(BlockShieldedOutcome { accepted, new_nullifiers, subtree, anchor })
+        // Disjoint borrows of the three fields are permitted by direct field access.
+        let outcome = apply_chain_block_to(&self.nullifiers, &mut self.tree, &mut self.supply, coinbase, txs)?;
+        self.nullifiers.extend(outcome.new_nullifiers.iter().copied());
+        Ok(outcome)
     }
+}
+
+/// Apply one accepted chain block against an arbitrary finalized nullifier set.
+///
+/// This is the store-agnostic core of the state transition. The finalized
+/// nullifier set is read through the [`NullifierSet`] trait, so the live
+/// consensus path can back it directly by rocksdb without ever loading the whole
+/// (unbounded, append-only) set into memory. `tree` and `supply` are advanced
+/// **only on success**; on rejection they are left untouched, and the caller is
+/// responsible for inserting [`BlockShieldedOutcome::new_nullifiers`] into the
+/// finalized set.
+pub fn apply_chain_block_to<S: NullifierSet + ?Sized>(
+    finalized: &S,
+    tree: &mut GlobalTree,
+    supply: &mut SupplyLedger,
+    coinbase: Option<&CoinbaseMint>,
+    txs: &[ShieldedTx],
+) -> Result<BlockShieldedOutcome, ShieldedStateError> {
+    // ---- Phase 1: resolve conflicts & gather effects ----
+    let mut resolver = NullifierConflictResolver::new(finalized);
+    let mut subtree = ChainBlockSubtree::new();
+    let mut accepted = Vec::new();
+    let mut total_fees: u128 = 0;
+    let mut total_mint: u128 = 0;
+
+    // Coinbase is processed first: it has no nullifiers, mints subsidy, and
+    // contributes its note commitment as the first leaf of the subtree.
+    if let Some(cb) = coinbase {
+        total_mint += cb.subsidy as u128;
+        subtree.push(cb.commitment);
+    }
+
+    for (i, tx) in txs.iter().enumerate() {
+        match resolver.try_accept(tx.nullifiers.iter().copied()) {
+            Ok(()) => {
+                for &cmx in &tx.commitments {
+                    subtree.push(cmx);
+                }
+                total_fees += tx.fee as u128;
+                accepted.push(i);
+            }
+            // Conflicting transaction: dropped (double-spend), records nothing.
+            Err(_) => {}
+        }
+    }
+    let new_nullifiers = resolver.into_accepted();
+
+    // ---- Phase 2: commit effects to working copies, swap in on success ----
+    let mut new_tree = tree.clone();
+    let mut new_supply = supply.clone();
+
+    if total_mint > 0 {
+        new_supply.mint_coinbase(u64::try_from(total_mint).map_err(|_| TurnstileViolation::Overflow)?)?;
+    }
+    if total_fees > 0 {
+        new_supply.collect_fees(u64::try_from(total_fees).map_err(|_| TurnstileViolation::Overflow)?)?;
+    }
+
+    // Step 3: append this block's subtree to the global tree, producing the anchor.
+    new_tree.append_subtree(&subtree)?;
+    let anchor = new_tree.anchor();
+
+    // Step 4: the turnstile invariant must hold after the update.
+    new_supply.check()?;
+
+    // All checks passed: commit to the caller's tree/supply.
+    *tree = new_tree;
+    *supply = new_supply;
+
+    Ok(BlockShieldedOutcome { accepted, new_nullifiers, subtree, anchor })
 }
 
 impl Default for ShieldedState {
