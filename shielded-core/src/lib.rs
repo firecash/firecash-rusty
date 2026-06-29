@@ -17,6 +17,7 @@
 //! `incrementalmerkletree` and will pin them to audited commits before launch
 //! (PLAN §5, non-negotiable #4).
 
+pub mod nullifier;
 pub mod tree;
 
 // Re-export the Orchard primitives the consensus layer builds on, so there is a
