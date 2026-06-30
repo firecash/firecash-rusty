@@ -22,6 +22,7 @@ pub mod nullifier;
 pub mod state;
 pub mod tree;
 pub mod turnstile;
+pub mod verify;
 
 // Re-export the Orchard primitives the consensus layer builds on, so there is a
 // single canonical source for these types across the workspace.

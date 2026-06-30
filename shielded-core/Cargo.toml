@@ -10,10 +10,15 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Enables Halo 2 proof verification (the `verify` module's circuit path). Pulls
+# halo2_proofs via orchard; kept opt-in so non-verifying consumers stay light.
+circuit = ["orchard/circuit"]
+
 [dependencies]
-# Orchard primitives (Halo 2 / Pasta). `circuit` (halo2_proofs) is intentionally
-# OFF for now — the tree / nullifier / value-commitment types we need here do not
-# require it. It will be enabled when proof verification is wired in (PLAN Phase 2).
+# Orchard primitives (Halo 2 / Pasta). `circuit` (halo2_proofs) is enabled via
+# this crate's `circuit` feature, which the consensus verifier turns on.
 orchard = { version = "0.14", default-features = false, features = ["std"] }
 # Must match the incrementalmerkletree version Orchard links, so that
 # `MerkleHashOrchard: incrementalmerkletree::Hashable` is the same trait.
@@ -21,3 +26,9 @@ incrementalmerkletree = "0.8.1"
 # For the persisted frontier snapshot (FrontierState). incrementalmerkletree's
 # Frontier is not serde-serializable, so we persist a representation we control.
 serde = { workspace = true, features = ["derive"] }
+# Curve point handling for the encoding consensus rules (non-identity epk).
+# Versions are pinned to match what Orchard 0.14 links.
+group = "0.13"
+pasta_curves = "0.5"
+# Shielded-transaction sighash.
+blake2b_simd = { workspace = true }
