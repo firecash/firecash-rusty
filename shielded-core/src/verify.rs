@@ -110,15 +110,18 @@ pub fn sighash(bundle: &ShieldedBundle, tx_context: &[u8]) -> [u8; 32] {
 mod circuit_verify {
     use super::*;
     use group::{Group, GroupEncoding};
+    use nonempty::NonEmpty;
     use orchard::{
+        bundle::{Authorized, BatchValidator, Flags, ProofSizeEnforcement},
         circuit::{Instance, VerifyingKey},
-        note::{ExtractedNoteCommitment, Nullifier},
+        note::{ExtractedNoteCommitment, Nullifier, TransmittedNoteCiphertext},
         primitives::redpallas::{Binding, Signature, SpendAuth, VerificationKey},
         tree::Anchor,
         value::ValueCommitment,
-        Proof,
+        Action, ActionFromPartsError, Bundle, Proof,
     };
     use pasta_curves::pallas;
+    use rand::{CryptoRng, RngCore};
     use std::sync::OnceLock;
 
     /// The Orchard action-circuit verifying key. Building it is expensive (it
@@ -218,10 +221,71 @@ mod circuit_verify {
 
         Ok(())
     }
+
+    /// Reconstruct an `orchard::Bundle<Authorized, i64>` from our wire format,
+    /// enforcing the encoding consensus rules via Orchard's own audited
+    /// constructors: `Action::from_parts` rejects identity `rk`/`epk`, and
+    /// `try_from_parts` (Strict) rejects non-canonical proof lengths.
+    fn to_orchard_bundle(wire: &ShieldedBundle) -> Result<Bundle<Authorized, i64>, BundleVerifyError> {
+        let anchor: Anchor = Option::from(Anchor::from_bytes(wire.anchor)).ok_or(BundleVerifyError::NonCanonicalField("anchor"))?;
+        let flags = Flags::from_byte(wire.flags).ok_or(BundleVerifyError::NonCanonicalFlags)?;
+
+        let mut actions = Vec::with_capacity(wire.actions.len());
+        for a in &wire.actions {
+            let nf: Nullifier =
+                Option::from(Nullifier::from_bytes(&a.nullifier)).ok_or(BundleVerifyError::NonCanonicalField("nullifier"))?;
+            let rk = VerificationKey::<SpendAuth>::try_from(a.rk).map_err(|_| BundleVerifyError::NonCanonicalField("rk"))?;
+            let cmx: ExtractedNoteCommitment =
+                Option::from(ExtractedNoteCommitment::from_bytes(&a.cmx)).ok_or(BundleVerifyError::NonCanonicalField("cmx"))?;
+            let cv_net: ValueCommitment =
+                Option::from(ValueCommitment::from_bytes(&a.cv_net)).ok_or(BundleVerifyError::NonCanonicalField("cv_net"))?;
+            let ct = TransmittedNoteCiphertext {
+                epk_bytes: a.ephemeral_key,
+                enc_ciphertext: a.enc_ciphertext,
+                out_ciphertext: a.out_ciphertext,
+            };
+            let sig = Signature::<SpendAuth>::from(a.spend_auth_sig);
+            let action = Action::from_parts(nf, rk, cmx, ct, cv_net, sig).map_err(|e| match e {
+                ActionFromPartsError::IdentityRk => BundleVerifyError::IdentityRk,
+                _ => BundleVerifyError::IdentityEpk,
+            })?;
+            actions.push(action);
+        }
+        let actions = NonEmpty::from_vec(actions).ok_or(BundleVerifyError::NoActions)?;
+
+        let auth = Authorized::from_parts(Proof::new(wire.proof.clone()), Signature::<Binding>::from(wire.binding_sig));
+        Bundle::try_from_parts(actions, flags, wire.value_balance, anchor, auth, ProofSizeEnforcement::Strict).map_err(|_| {
+            BundleVerifyError::BadProofLength { expected: Proof::expected_proof_size(wire.actions.len()), got: wire.proof.len() }
+        })
+    }
+
+    /// Batch-verify the proofs **and** RedPallas signatures of many bundles at
+    /// once (PLAN §2.8 — "the real unlock" for verification throughput). Halo 2
+    /// IPA openings and RedPallas signatures both batch, so a block's worth of
+    /// bundles costs far less than verifying each independently.
+    ///
+    /// All-or-nothing: returns `Ok(())` iff *every* bundle's proof and signatures
+    /// are valid. On failure the caller should fall back to per-bundle
+    /// [`verify_bundle`] to identify the offending transaction.
+    pub fn verify_bundles_batched(
+        items: &[(&ShieldedBundle, [u8; 32])],
+        rng: impl RngCore + CryptoRng,
+    ) -> Result<(), BundleVerifyError> {
+        let mut batch = BatchValidator::new();
+        for (wire, sighash) in items {
+            let bundle = to_orchard_bundle(wire)?;
+            batch.add_bundle(&bundle, *sighash);
+        }
+        if batch.validate(verifying_key(), rng) {
+            Ok(())
+        } else {
+            Err(BundleVerifyError::ProofInvalid)
+        }
+    }
 }
 
 #[cfg(feature = "circuit")]
-pub use circuit_verify::{verify_bundle, verify_bundle_with_vk, verifying_key};
+pub use circuit_verify::{verify_bundle, verify_bundle_with_vk, verify_bundles_batched, verifying_key};
 
 /// Gold-standard end-to-end validation of the cryptographic verifier: build a
 /// *real* Orchard bundle (real Halo 2 proof + real RedPallas signatures over our
@@ -334,6 +398,12 @@ mod e2e {
         let mut bad_cv = wire.clone();
         bad_cv.actions[0].cv_net[0] ^= 1; // a different canonical point breaks proof+balance
         assert!(verify_bundle(&bad_cv, &msg).is_err());
+
+        // 8. Batch verification (PLAN §2.8): a batch of valid bundles verifies;
+        //    a batch containing a tampered bundle fails.
+        super::verify_bundles_batched(&[(&wire, msg), (&wire, msg)], rand::rngs::OsRng)
+            .expect("batch of valid bundles verifies");
+        assert!(super::verify_bundles_batched(&[(&wire, msg), (&bad_proof, msg)], rand::rngs::OsRng).is_err());
     }
 }
 

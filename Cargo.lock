@@ -4196,6 +4196,7 @@ dependencies = [
  "blake2b_simd",
  "group",
  "incrementalmerkletree",
+ "nonempty",
  "orchard",
  "pasta_curves",
  "rand 0.8.6",

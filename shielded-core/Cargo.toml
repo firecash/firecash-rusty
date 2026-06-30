@@ -12,9 +12,10 @@ workspace = true
 
 [features]
 default = []
-# Enables Halo 2 proof verification (the `verify` module's circuit path). Pulls
-# halo2_proofs via orchard; kept opt-in so non-verifying consumers stay light.
-circuit = ["orchard/circuit"]
+# Enables Halo 2 proof verification (the `verify` module's circuit path, single
+# + batch). Pulls halo2_proofs via orchard plus the batch/reconstruction deps;
+# kept opt-in so non-verifying consumers stay light.
+circuit = ["orchard/circuit", "dep:nonempty", "dep:rand"]
 
 [dependencies]
 # Orchard primitives (Halo 2 / Pasta). `circuit` (halo2_proofs) is enabled via
@@ -32,7 +33,6 @@ group = "0.13"
 pasta_curves = "0.5"
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
-
-[dev-dependencies]
-# For the gold-standard end-to-end verification test (real proof + signatures).
-rand = { workspace = true }
+# Bundle reconstruction (batch verification) — enabled by the `circuit` feature.
+nonempty = { version = "0.11", default-features = false, optional = true }
+rand = { workspace = true, optional = true }
