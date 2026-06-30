@@ -6,7 +6,8 @@ use crate::constants::{MAX_SOMPI, TX_VERSION_TOCCATA};
 use kaspa_consensus_core::subnets::{
     CoinbaseSubnetwork, NativeSubnetwork, SUBNETWORK_NAMESPACE_LEN, SUBNETWORK_ZERO_TAIL_LEN, Subnetwork,
 };
-use kaspa_consensus_core::tx::Transaction;
+use kaspa_consensus_core::tx::{Transaction, TX_VERSION_SHIELDED};
+use kaspa_shielded_core::bundle::ShieldedBundle;
 use std::collections::HashSet;
 
 impl TransactionValidator {
@@ -25,7 +26,31 @@ impl TransactionValidator {
         check_gas(tx)?;
         check_transaction_subnetwork(tx)?;
         check_transaction_version(tx)?;
-        check_tx_version_specific_fields(tx)
+        check_tx_version_specific_fields(tx)?;
+        self.check_shielded_in_isolation(tx)
+    }
+
+    /// Context-free validity of a shielded transaction (PLAN §2.1, decision D7):
+    /// it carries no transparent value (inputs/outputs are empty — the value lives
+    /// in the Orchard bundle), and the payload decodes to a non-empty bundle. The
+    /// proof / binding-signature / anchor-finality checks are contextual and run
+    /// later (in the virtual processor's shielded state transition).
+    fn check_shielded_in_isolation(&self, tx: &Transaction) -> TxResult<()> {
+        if !tx.is_shielded() {
+            return Ok(());
+        }
+        if !tx.inputs.is_empty() {
+            return Err(TxRuleError::InvalidShieldedTransaction("shielded transaction must have no transparent inputs"));
+        }
+        if !tx.outputs.is_empty() {
+            return Err(TxRuleError::InvalidShieldedTransaction("shielded transaction must have no transparent outputs"));
+        }
+        let bundle = ShieldedBundle::from_bytes(&tx.payload)
+            .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
+        if bundle.actions.is_empty() {
+            return Err(TxRuleError::InvalidShieldedTransaction("shielded bundle has no actions"));
+        }
+        Ok(())
     }
 
     fn check_transaction_inputs_in_isolation(&self, tx: &Transaction) -> TxResult<()> {
@@ -76,7 +101,9 @@ impl TransactionValidator {
     }
 
     fn check_transaction_inputs_count(&self, tx: &Transaction) -> TxResult<()> {
-        if !tx.is_coinbase() && tx.inputs.is_empty() {
+        // Coinbase and shielded transactions legitimately have no transparent
+        // inputs (shielded value lives in the Orchard bundle, decision D7).
+        if !tx.is_coinbase() && !tx.is_shielded() && tx.inputs.is_empty() {
             return Err(TxRuleError::NoTxInputs);
         }
 
@@ -140,6 +167,10 @@ fn check_gas(tx: &Transaction) -> TxResult<()> {
 }
 
 fn check_transaction_version(tx: &Transaction) -> TxResult<()> {
+    // Shielded transactions use a dedicated version (PLAN §2.1, decision D7).
+    if tx.version == TX_VERSION_SHIELDED {
+        return Ok(());
+    }
     if tx.version > TX_VERSION_TOCCATA {
         return Err(TxRuleError::UnknownTxVersion(tx.version));
     }
@@ -223,7 +254,7 @@ mod tests {
         subnets::{SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_NATIVE, SubnetworkId},
         tx::{
             ComputeCommit, ScriptPublicKey, Transaction, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput,
-            scriptvec,
+            TX_VERSION_SHIELDED, scriptvec,
         },
     };
     use kaspa_core::assert_match;
@@ -405,7 +436,8 @@ mod tests {
         assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::ComputeBudgetInV0(_, _)));
 
         let mut tx = valid_tx.clone();
-        tx.version = TX_VERSION_TOCCATA + 1;
+        // A genuinely unknown version (above toccata and not the shielded version).
+        tx.version = TX_VERSION_SHIELDED + 1;
         assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::UnknownTxVersion(_)));
 
         // Test prev version upper bound in header context

@@ -9,7 +9,7 @@ use super::{
 use crate::constants::LOCK_TIME_THRESHOLD;
 use kaspa_consensus_core::{
     constants::{TX_VERSION, TX_VERSION_TOCCATA},
-    tx::Transaction,
+    tx::{Transaction, TX_VERSION_SHIELDED},
 };
 
 pub(crate) enum LockTimeType {
@@ -94,6 +94,10 @@ impl TransactionValidator {
 
     // TODO(post-toccata): Remove the contextual check and only leave the isolated one after the HF
     fn check_transaction_version(&self, tx: &Transaction, block_daa_score: u64) -> TxResult<()> {
+        // Shielded transactions use a dedicated version (PLAN §2.1, decision D7).
+        if tx.version == TX_VERSION_SHIELDED {
+            return Ok(());
+        }
         if self.toccata_activation.is_active(block_daa_score) {
             if tx.version > TX_VERSION_TOCCATA {
                 return Err(TxRuleError::UnknownTxVersion(tx.version));

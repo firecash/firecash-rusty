@@ -18,6 +18,9 @@ pub enum TxRuleError {
     #[error("transaction version {0} is unknown")]
     UnknownTxVersion(u16),
 
+    #[error("invalid shielded transaction: {0}")]
+    InvalidShieldedTransaction(&'static str),
+
     #[error("transaction has {0} inputs where the max allowed is {1}")]
     TooManyInputs(usize, usize),
 
