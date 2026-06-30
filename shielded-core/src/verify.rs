@@ -147,7 +147,7 @@ mod circuit_verify {
             return Err(BundleVerifyError::NoActions);
         }
 
-        let anchor = Option::from(Anchor::from_bytes(bundle.anchor)).ok_or(BundleVerifyError::NonCanonicalField("anchor"))?;
+        let anchor: Anchor = Option::from(Anchor::from_bytes(bundle.anchor)).ok_or(BundleVerifyError::NonCanonicalField("anchor"))?;
         // Orchard flag bits: bit 0 = spends enabled, bit 1 = outputs enabled. Any
         // other bit set is a non-canonical encoding (matches Orchard `Flags::from_byte`).
         if bundle.flags & !0b11 != 0 {
@@ -161,10 +161,10 @@ mod circuit_verify {
         let mut cv_sum: Option<ValueCommitment> = None;
 
         for a in &bundle.actions {
-            let nf = Option::from(Nullifier::from_bytes(&a.nullifier)).ok_or(BundleVerifyError::NonCanonicalField("nullifier"))?;
-            let cmx =
+            let nf: Nullifier = Option::from(Nullifier::from_bytes(&a.nullifier)).ok_or(BundleVerifyError::NonCanonicalField("nullifier"))?;
+            let cmx: ExtractedNoteCommitment =
                 Option::from(ExtractedNoteCommitment::from_bytes(&a.cmx)).ok_or(BundleVerifyError::NonCanonicalField("cmx"))?;
-            let cv_net = Option::from(ValueCommitment::from_bytes(&a.cv_net)).ok_or(BundleVerifyError::NonCanonicalField("cv_net"))?;
+            let cv_net: ValueCommitment = Option::from(ValueCommitment::from_bytes(&a.cv_net)).ok_or(BundleVerifyError::NonCanonicalField("cv_net"))?;
             let rk = VerificationKey::<SpendAuth>::try_from(a.rk).map_err(|_| BundleVerifyError::NonCanonicalField("rk"))?;
 
             // Consensus encoding rules (April-2026 disclosure): rk and epk must be
@@ -172,7 +172,8 @@ mod circuit_verify {
             if rk.is_identity() {
                 return Err(BundleVerifyError::IdentityRk);
             }
-            let epk = Option::from(pallas::Point::from_bytes(&a.ephemeral_key)).ok_or(BundleVerifyError::NonCanonicalField("epk"))?;
+            let epk: pallas::Point =
+                Option::from(pallas::Point::from_bytes(&a.ephemeral_key)).ok_or(BundleVerifyError::NonCanonicalField("epk"))?;
             if bool::from(epk.is_identity()) {
                 return Err(BundleVerifyError::IdentityEpk);
             }
@@ -285,7 +286,7 @@ mod e2e {
         // 1. Keys + an output-only bundle (dummy spends are auto-signed), anchored
         //    at the empty tree (no real spend, so no Merkle path needed).
         let pk = ProvingKey::build();
-        let sk = SpendingKey::random(&mut rng);
+        let sk: SpendingKey = Option::from(SpendingKey::from_bytes([7u8; 32])).expect("valid spending key");
         let fvk = FullViewingKey::from(&sk);
         let recipient = fvk.address_at(0u32, Scope::External);
 
@@ -299,10 +300,10 @@ mod e2e {
         // 3. Compute our sighash over the bundle effects (sigs/proof excluded, so
         //    placeholders are fine here).
         let effects_wire = build_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
-        let sighash = sighash(&effects_wire, ctx);
+        let msg = sighash(&effects_wire, ctx);
 
         // 4. Sign over our sighash (no real spend keys: output-only dummy spends).
-        let authorized: Bundle<Authorized, i64> = proven.apply_signatures(&mut rng, sighash, &[]).unwrap();
+        let authorized: Bundle<Authorized, i64> = proven.apply_signatures(&mut rng, msg, &[]).unwrap();
 
         // 5. Serialize the fully authorized bundle to our wire format.
         let wire = build_wire(
@@ -312,27 +313,27 @@ mod e2e {
             <[u8; 64]>::from(authorized.authorization().binding_signature()),
         );
         // Signing does not change the effects, so the sighash is stable.
-        assert_eq!(sighash(&wire, ctx), sighash, "effects unchanged by signing");
+        assert_eq!(sighash(&wire, ctx), msg, "effects unchanged by signing");
 
         // 6. THE validation: the real bundle verifies.
-        verify_bundle(&wire, &sighash).expect("a valid Orchard bundle must verify");
+        verify_bundle(&wire, &msg).expect("a valid Orchard bundle must verify");
 
         // 7. Tamper detection.
         let mut bad_proof = wire.clone();
         bad_proof.proof[0] ^= 1;
-        assert_eq!(verify_bundle(&bad_proof, &sighash), Err(BundleVerifyError::ProofInvalid));
+        assert_eq!(verify_bundle(&bad_proof, &msg), Err(BundleVerifyError::ProofInvalid));
 
         let mut bad_balance = wire.clone();
         bad_balance.value_balance += 1; // breaks the binding-signature balance
-        assert_eq!(verify_bundle(&bad_balance, &sighash), Err(BundleVerifyError::BindingSigInvalid));
+        assert_eq!(verify_bundle(&bad_balance, &msg), Err(BundleVerifyError::BindingSigInvalid));
 
         let mut bad_sig = wire.clone();
         bad_sig.actions[0].spend_auth_sig[0] ^= 1;
-        assert!(matches!(verify_bundle(&bad_sig, &sighash), Err(BundleVerifyError::SpendAuthSigInvalid(0))));
+        assert!(matches!(verify_bundle(&bad_sig, &msg), Err(BundleVerifyError::SpendAuthSigInvalid(0))));
 
         let mut bad_cv = wire.clone();
         bad_cv.actions[0].cv_net[0] ^= 1; // a different canonical point breaks proof+balance
-        assert!(verify_bundle(&bad_cv, &sighash).is_err());
+        assert!(verify_bundle(&bad_cv, &msg).is_err());
     }
 }
 
