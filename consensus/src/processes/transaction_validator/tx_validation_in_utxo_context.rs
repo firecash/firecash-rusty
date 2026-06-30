@@ -16,6 +16,7 @@ use super::{
     TransactionValidator,
     errors::{TxResult, TxRuleError},
 };
+use kaspa_shielded_core::bundle::ShieldedBundle;
 
 /// The threshold above which we apply parallelism to input script processing
 const CHECK_SCRIPTS_PARALLELISM_THRESHOLD: usize = 1;
@@ -46,7 +47,19 @@ impl TransactionValidator {
         self.check_transaction_coinbase_maturity(tx, pov_daa_score)?;
         let total_in = self.check_transaction_input_amounts(tx)?;
         let total_out = Self::check_transaction_output_values(tx, total_in)?;
-        let fee = total_in - total_out;
+        // A shielded transaction has no transparent value (PLAN §2.1, D7): its fee
+        // is the bundle's public value balance (the amount leaving the shielded
+        // pool, which the miner collects). For transparent txs the fee is in - out.
+        let fee = if tx.tx().is_shielded() {
+            let bundle = ShieldedBundle::from_bytes(&tx.tx().payload)
+                .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
+            if bundle.value_balance < 0 {
+                return Err(TxRuleError::InvalidShieldedTransaction("shielded fee (value balance) must be non-negative"));
+            }
+            bundle.value_balance as u64
+        } else {
+            total_in - total_out
+        };
         if flags != TxValidationFlags::SkipMassCheck {
             self.check_mass_commitment(tx)?;
         }
