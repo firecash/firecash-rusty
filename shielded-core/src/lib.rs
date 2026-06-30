@@ -18,6 +18,7 @@
 //! (PLAN §5, non-negotiable #4).
 
 pub mod bundle;
+pub mod coinbase;
 pub mod nullifier;
 pub mod state;
 pub mod tree;
