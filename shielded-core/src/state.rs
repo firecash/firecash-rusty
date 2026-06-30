@@ -39,6 +39,9 @@ pub struct ShieldedTx {
     /// Public fee paid by the transaction: value leaving the shielded pool to the
     /// miner. (Orchard `value_balance` for a pure shielded payment.)
     pub fee: u64,
+    /// The anchor the bundle's spends prove against. Must be a finalized anchor
+    /// (PLAN §2.5); enforced by the consensus validation layer.
+    pub anchor: [u8; 32],
 }
 
 /// Error extracting a [`ShieldedTx`] from an on-wire [`ShieldedBundle`].
@@ -71,7 +74,7 @@ impl ShieldedTx {
         if bundle.value_balance < 0 {
             return Err(BundleExtractError::MintingValueBalance);
         }
-        Ok(ShieldedTx { nullifiers, commitments, fee: bundle.value_balance as u64 })
+        Ok(ShieldedTx { nullifiers, commitments, fee: bundle.value_balance as u64, anchor: bundle.anchor })
     }
 }
 
@@ -262,7 +265,12 @@ mod tests {
     }
 
     fn tx(nfs: &[u8], cmxs: &[u32], fee: u64) -> ShieldedTx {
-        ShieldedTx { nullifiers: nfs.iter().map(|&n| nf(n)).collect(), commitments: cmxs.iter().map(|&c| cmx(c)).collect(), fee }
+        ShieldedTx {
+            nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
+            commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
+            fee,
+            anchor: [0u8; 32],
+        }
     }
 
     /// THE make-or-break property (PLAN Phase 1 / task #9), at the algorithm

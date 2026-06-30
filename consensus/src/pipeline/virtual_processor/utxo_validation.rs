@@ -316,6 +316,9 @@ impl VirtualStateProcessor {
             Err(crate::processes::shielded::ShieldedManagerError::State(e)) => {
                 return Err(InvalidShieldedState(header.hash, format!("{e:?}")));
             }
+            Err(crate::processes::shielded::ShieldedManagerError::UnfinalizedAnchor(a)) => {
+                return Err(InvalidShieldedState(header.hash, format!("spend references unfinalized anchor {a:02x?}")));
+            }
             Err(crate::processes::shielded::ShieldedManagerError::Store(e)) => {
                 panic!("shielded store read failed during verification: {e}");
             }

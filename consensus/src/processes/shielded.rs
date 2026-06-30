@@ -55,6 +55,9 @@ impl ComputedBlockShielded {
 pub enum ShieldedManagerError {
     /// Invalid shielded state (turnstile / full tree) — the block must be rejected.
     State(ShieldedStateError),
+    /// A spend proved against an anchor not in the finalized window (PLAN §2.5) —
+    /// the block must be rejected.
+    UnfinalizedAnchor([u8; 32]),
     /// A storage error (fatal, as elsewhere in consensus).
     Store(StoreError),
 }
@@ -161,6 +164,15 @@ impl ShieldedStateManager {
         coinbase: Option<&CoinbaseMint>,
         txs: &[ShieldedTx],
     ) -> Result<ComputedBlockShielded, ShieldedManagerError> {
+        // Anchor finality (PLAN §2.5): every *spending* bundle must prove against
+        // an anchor in the finalized window. Pure-output bundles (no nullifiers,
+        // e.g. coinbase-funded) carry the empty-tree anchor and are exempt.
+        for tx in txs {
+            if !tx.nullifiers.is_empty() && !self.is_finalized_anchor(&tx.anchor)? {
+                return Err(ShieldedManagerError::UnfinalizedAnchor(tx.anchor));
+            }
+        }
+
         let mut tree = self.load_tree(selected_parent)?;
         let mut supply = self.load_supply(selected_parent)?;
         let pending = MemNullifierSet::new();
@@ -238,8 +250,18 @@ mod tests {
         b
     }
 
+    /// The empty-tree anchor (the finalized anchor of the genesis chain block).
+    fn empty_anchor() -> [u8; 32] {
+        kaspa_shielded_core::Anchor::empty_tree().to_bytes()
+    }
+
     fn stx(nfs: &[u8], cmxs: &[u32], fee: u64) -> ShieldedTx {
-        ShieldedTx { nullifiers: nfs.iter().map(|&n| nf(n)).collect(), commitments: cmxs.iter().map(|&c| cmx(c)).collect(), fee }
+        ShieldedTx {
+            nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
+            commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
+            fee,
+            anchor: empty_anchor(),
+        }
     }
 
     fn coinbase(subsidy: u64, c: u32) -> CoinbaseMint {
@@ -248,6 +270,14 @@ mod tests {
 
     fn h(n: u8) -> Hash {
         Hash::from_bytes([n; 32])
+    }
+
+    /// A manager with the genesis (empty) anchor published as finalized, so that
+    /// spending transactions referencing it pass the anchor-finality check.
+    fn manager_with_finalized_genesis(db: &Arc<DB>) -> ShieldedStateManager {
+        let mut mgr = ShieldedStateManager::new(Arc::clone(db), CachePolicy::Count(64), 100);
+        mgr.publish_finalized_anchor(h(0)).unwrap();
+        mgr
     }
 
     /// Commit one block (compute → persist → write), mirroring the per-block
@@ -274,7 +304,7 @@ mod tests {
     #[test]
     fn per_block_commit_persists_and_resolves_double_spend() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let mgr = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64), 100);
+        let mgr = manager_with_finalized_genesis(&db);
         let (genesis, b1, b2) = (h(0), h(1), h(2));
 
         let c1 = commit_block(&mgr, &db, b1, genesis, Some(coinbase(50, 10)), vec![stx(&[1], &[100], 5)]);
@@ -300,7 +330,7 @@ mod tests {
     #[test]
     fn revert_removes_block_nullifiers() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let mgr = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64), 100);
+        let mgr = manager_with_finalized_genesis(&db);
         let b1 = h(1);
 
         commit_block(&mgr, &db, b1, h(0), Some(coinbase(10, 1)), vec![stx(&[1], &[100], 0)]);
@@ -322,7 +352,7 @@ mod tests {
     #[test]
     fn rejoin_re_adds_nullifiers_from_store() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let mgr = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64), 100);
+        let mgr = manager_with_finalized_genesis(&db);
         let b1 = h(1);
 
         commit_block(&mgr, &db, b1, h(0), Some(coinbase(10, 1)), vec![stx(&[1], &[100], 0)]);
@@ -342,8 +372,26 @@ mod tests {
     #[test]
     fn rejects_overspend() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let mgr = ShieldedStateManager::new(db, CachePolicy::Count(64), 100);
+        let mgr = manager_with_finalized_genesis(&db);
         let res = mgr.compute(h(0), Some(&coinbase(10, 1)), &[stx(&[7], &[2], 11)]);
         assert!(matches!(res, Err(ShieldedManagerError::State(ShieldedStateError::Turnstile(_)))));
+    }
+
+    /// A spend proving against an anchor that is not in the finalized window is
+    /// rejected (PLAN §2.5). A pure-output bundle (no nullifiers) is exempt.
+    #[test]
+    fn rejects_unfinalized_anchor() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        // Note: genesis anchor NOT published, so no anchor is finalized.
+        let mgr = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64), 100);
+
+        // A spending tx referencing the (unfinalized) empty anchor is rejected.
+        let spend = ShieldedTx { nullifiers: vec![nf(1)], commitments: vec![cmx(1)], fee: 0, anchor: empty_anchor() };
+        let res = mgr.compute(h(0), Some(&coinbase(10, 1)), &[spend]);
+        assert!(matches!(res, Err(ShieldedManagerError::UnfinalizedAnchor(_))));
+
+        // A pure-output bundle (no spends) is exempt from the anchor check.
+        let out_only = ShieldedTx { nullifiers: vec![], commitments: vec![cmx(2)], fee: 0, anchor: [0u8; 32] };
+        assert!(mgr.compute(h(0), Some(&coinbase(10, 1)), &[out_only]).is_ok());
     }
 }
