@@ -59,6 +59,8 @@ pub enum BundleVerifyError {
     IdentityRk,
     /// An action's ephemeral key `epk` is the identity point (consensus rule).
     IdentityEpk,
+    /// The flags byte has bits set outside the two defined flags (non-canonical).
+    NonCanonicalFlags,
     /// The proof length is not the canonical length for this action count
     /// (rejects padded / malleated proofs).
     BadProofLength { expected: usize, got: usize },
@@ -146,7 +148,11 @@ mod circuit_verify {
         }
 
         let anchor = Option::from(Anchor::from_bytes(bundle.anchor)).ok_or(BundleVerifyError::NonCanonicalField("anchor"))?;
-        // Orchard flag bits: bit 0 = spends enabled, bit 1 = outputs enabled.
+        // Orchard flag bits: bit 0 = spends enabled, bit 1 = outputs enabled. Any
+        // other bit set is a non-canonical encoding (matches Orchard `Flags::from_byte`).
+        if bundle.flags & !0b11 != 0 {
+            return Err(BundleVerifyError::NonCanonicalFlags);
+        }
         let enable_spend = bundle.flags & 0b01 != 0;
         let enable_output = bundle.flags & 0b10 != 0;
 
@@ -215,6 +221,120 @@ mod circuit_verify {
 
 #[cfg(feature = "circuit")]
 pub use circuit_verify::{verify_bundle, verify_bundle_with_vk, verifying_key};
+
+/// Gold-standard end-to-end validation of the cryptographic verifier: build a
+/// *real* Orchard bundle (real Halo 2 proof + real RedPallas signatures over our
+/// sighash), serialize it to our wire format, and confirm [`verify_bundle`]
+/// accepts it and rejects tampering. This is the test that proves the
+/// verification math is actually correct (it requires the `circuit` feature, and
+/// is expensive: it builds a proving key and produces a real proof).
+#[cfg(all(test, feature = "circuit"))]
+mod e2e {
+    use super::*;
+    use crate::bundle::{ActionWire, ShieldedBundle};
+    use orchard::{
+        builder::{Builder, BundleType},
+        bundle::{Authorization, Authorized},
+        circuit::ProvingKey,
+        keys::{FullViewingKey, Scope, SpendingKey},
+        value::NoteValue,
+        Action, Anchor, Bundle,
+    };
+
+    /// Extract the effect fields shared by proven and authorized bundles, with a
+    /// caller-supplied per-action spend-auth signature and bundle-level proof /
+    /// binding signature (zeroed when only the sighash is needed).
+    fn build_wire<T: Authorization>(
+        bundle: &Bundle<T, i64>,
+        spend_auth_sig: impl Fn(&Action<T::SpendAuth>) -> [u8; 64],
+        proof: Vec<u8>,
+        binding_sig: [u8; 64],
+    ) -> ShieldedBundle {
+        let actions = bundle
+            .actions()
+            .iter()
+            .map(|a| {
+                let ct = a.encrypted_note();
+                ActionWire {
+                    nullifier: a.nullifier().to_bytes(),
+                    rk: <[u8; 32]>::from(a.rk()),
+                    cmx: a.cmx().to_bytes(),
+                    cv_net: a.cv_net().to_bytes(),
+                    ephemeral_key: ct.epk_bytes,
+                    enc_ciphertext: ct.enc_ciphertext,
+                    out_ciphertext: ct.out_ciphertext,
+                    spend_auth_sig: spend_auth_sig(a),
+                }
+            })
+            .collect();
+        ShieldedBundle {
+            actions,
+            flags: bundle.flags().to_byte(),
+            value_balance: *bundle.value_balance(),
+            anchor: bundle.anchor().to_bytes(),
+            proof,
+            binding_sig,
+        }
+    }
+
+    #[test]
+    fn real_bundle_verifies_and_rejects_tampering() {
+        let mut rng = rand::rngs::OsRng;
+        let ctx = b"kasprivate-e2e-tx-context";
+
+        // 1. Keys + an output-only bundle (dummy spends are auto-signed), anchored
+        //    at the empty tree (no real spend, so no Merkle path needed).
+        let pk = ProvingKey::build();
+        let sk = SpendingKey::random(&mut rng);
+        let fvk = FullViewingKey::from(&sk);
+        let recipient = fvk.address_at(0u32, Scope::External);
+
+        let mut builder = Builder::new(BundleType::DEFAULT, Anchor::empty_tree());
+        builder.add_output(None, recipient, NoteValue::from_raw(5000), [0u8; 512]).unwrap();
+        let (unauth, _meta) = builder.build::<i64>(&mut rng).unwrap().unwrap();
+
+        // 2. Produce the real Halo 2 proof.
+        let proven = unauth.create_proof(&pk, &mut rng).unwrap();
+
+        // 3. Compute our sighash over the bundle effects (sigs/proof excluded, so
+        //    placeholders are fine here).
+        let effects_wire = build_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
+        let sighash = sighash(&effects_wire, ctx);
+
+        // 4. Sign over our sighash (no real spend keys: output-only dummy spends).
+        let authorized: Bundle<Authorized, i64> = proven.apply_signatures(&mut rng, sighash, &[]).unwrap();
+
+        // 5. Serialize the fully authorized bundle to our wire format.
+        let wire = build_wire(
+            &authorized,
+            |a| <[u8; 64]>::from(a.authorization()),
+            authorized.authorization().proof().as_ref().to_vec(),
+            <[u8; 64]>::from(authorized.authorization().binding_signature()),
+        );
+        // Signing does not change the effects, so the sighash is stable.
+        assert_eq!(sighash(&wire, ctx), sighash, "effects unchanged by signing");
+
+        // 6. THE validation: the real bundle verifies.
+        verify_bundle(&wire, &sighash).expect("a valid Orchard bundle must verify");
+
+        // 7. Tamper detection.
+        let mut bad_proof = wire.clone();
+        bad_proof.proof[0] ^= 1;
+        assert_eq!(verify_bundle(&bad_proof, &sighash), Err(BundleVerifyError::ProofInvalid));
+
+        let mut bad_balance = wire.clone();
+        bad_balance.value_balance += 1; // breaks the binding-signature balance
+        assert_eq!(verify_bundle(&bad_balance, &sighash), Err(BundleVerifyError::BindingSigInvalid));
+
+        let mut bad_sig = wire.clone();
+        bad_sig.actions[0].spend_auth_sig[0] ^= 1;
+        assert!(matches!(verify_bundle(&bad_sig, &sighash), Err(BundleVerifyError::SpendAuthSigInvalid(0))));
+
+        let mut bad_cv = wire.clone();
+        bad_cv.actions[0].cv_net[0] ^= 1; // a different canonical point breaks proof+balance
+        assert!(verify_bundle(&bad_cv, &sighash).is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {

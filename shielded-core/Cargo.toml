@@ -32,3 +32,7 @@ group = "0.13"
 pasta_curves = "0.5"
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
+
+[dev-dependencies]
+# For the gold-standard end-to-end verification test (real proof + signatures).
+rand = { workspace = true }

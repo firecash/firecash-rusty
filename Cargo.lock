@@ -4198,6 +4198,7 @@ dependencies = [
  "incrementalmerkletree",
  "orchard",
  "pasta_curves",
+ "rand 0.8.6",
  "serde",
 ]
 
