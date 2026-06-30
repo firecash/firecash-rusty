@@ -31,7 +31,8 @@ kaspa-muhash.workspace = true
 kaspa-notify.workspace = true
 kaspa-pow.workspace = true
 kaspa-seq-commit.workspace = true
-kaspa-shielded-core.workspace = true
+# `circuit` enables Halo 2 proof verification of shielded bundles (consensus-critical).
+kaspa-shielded-core = { workspace = true, features = ["circuit"] }
 kaspa-smt.workspace = true
 kaspa-smt-store.workspace = true
 kaspa-txscript.workspace = true

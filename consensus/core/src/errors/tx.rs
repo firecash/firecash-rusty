@@ -21,6 +21,9 @@ pub enum TxRuleError {
     #[error("invalid shielded transaction: {0}")]
     InvalidShieldedTransaction(&'static str),
 
+    #[error("shielded bundle failed cryptographic verification: {0}")]
+    InvalidShieldedBundle(String),
+
     #[error("transaction has {0} inputs where the max allowed is {1}")]
     TooManyInputs(usize, usize),
 

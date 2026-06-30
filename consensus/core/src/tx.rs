@@ -409,6 +409,21 @@ impl Transaction {
         self.version == TX_VERSION_SHIELDED && !self.is_coinbase()
     }
 
+    /// Canonical "transaction context" bytes that a shielded bundle's sighash
+    /// binds to, so the bundle's signatures commit not just to the bundle but to
+    /// *this* transaction (preventing a valid bundle from being lifted into
+    /// another tx). Covers the transaction-level fields outside the bundle (which
+    /// lives in `payload` and is committed by the bundle-effects part of the
+    /// sighash). Both the verifier and the wallet must produce this identically.
+    pub fn shielded_sighash_context(&self) -> Vec<u8> {
+        let mut ctx = Vec::with_capacity(2 + subnets::SUBNETWORK_ID_SIZE + 8 + 8);
+        ctx.extend_from_slice(&self.version.to_le_bytes());
+        ctx.extend_from_slice(self.subnetwork_id.as_ref());
+        ctx.extend_from_slice(&self.lock_time.to_le_bytes());
+        ctx.extend_from_slice(&self.gas.to_le_bytes());
+        ctx
+    }
+
     /// Recompute and finalize the tx id based on updated tx fields
     pub fn finalize(&mut self) {
         self.id = hashing::tx::id(self);

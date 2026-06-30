@@ -16,10 +16,25 @@ use super::{
     TransactionValidator,
     errors::{TxResult, TxRuleError},
 };
+use kaspa_consensus_core::tx::Transaction;
 use kaspa_shielded_core::bundle::ShieldedBundle;
 
 /// The threshold above which we apply parallelism to input script processing
 const CHECK_SCRIPTS_PARALLELISM_THRESHOLD: usize = 1;
+
+/// Verify the cryptography of a shielded transaction's Orchard bundle (PLAN §3,
+/// the audit-critical layer): the Halo 2 proof, the binding signature (balance),
+/// the per-action spend-authorization signatures, and the encoding consensus
+/// rules. The signatures are checked against the kasprivate shielded sighash,
+/// which binds them to this exact bundle and transaction.
+fn verify_shielded_bundle(tx: &Transaction) -> TxResult<()> {
+    let bundle = ShieldedBundle::from_bytes(&tx.payload)
+        .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
+    let ctx = tx.shielded_sighash_context();
+    let sighash = kaspa_shielded_core::verify::sighash(&bundle, &ctx);
+    kaspa_shielded_core::verify::verify_bundle(&bundle, &sighash)
+        .map_err(|e| TxRuleError::InvalidShieldedBundle(format!("{e:?}")))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TxValidationFlags {
@@ -73,6 +88,13 @@ impl TransactionValidator {
         match flags {
             TxValidationFlags::Full | TxValidationFlags::SkipMassCheck => {
                 self.check_scripts(tx, covenants_ctx, block_daa_score, seq_commit_accessor)?;
+                // Shielded transactions carry no signature scripts; their authority
+                // and balance live in the Orchard bundle. Verify the bundle's
+                // cryptography here, in the same "expensive checks, once" phase as
+                // script verification (skipped on selected-parent replay).
+                if tx.tx().is_shielded() {
+                    verify_shielded_bundle(tx.tx())?;
+                }
             }
             TxValidationFlags::SkipScriptChecks => {}
         }
