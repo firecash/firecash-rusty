@@ -20,7 +20,9 @@ mod build {
         builder::{Builder, BundleType},
         bundle::{Authorization, Authorized},
         circuit::ProvingKey,
-        keys::{FullViewingKey, Scope, SpendingKey},
+        keys::{FullViewingKey, Scope, SpendAuthorizingKey, SpendingKey},
+        note::{ExtractedNoteCommitment, Note},
+        tree::MerklePath,
         value::NoteValue,
         Action, Address, Anchor, Bundle,
     };
@@ -28,7 +30,6 @@ mod build {
 
     /// A wallet's Orchard keys, derived from a 32-byte seed.
     pub struct ShieldedKeys {
-        #[allow(dead_code)]
         sk: SpendingKey,
         fvk: FullViewingKey,
     }
@@ -131,9 +132,94 @@ mod build {
         ))
     }
 
+    /// Build a **spending** shielded transaction: spend `note` (with its
+    /// `merkle_path` proving membership at the anchor it roots to) and send
+    /// `output_value` to `recipient`. The remainder, `note.value −
+    /// output_value`, becomes the public fee (`value_balance`), collected by the
+    /// miner. Proven and signed (with the real spend authority) over the sighash.
+    ///
+    /// The wallet is responsible for tracking each note's `merkle_path` witness as
+    /// the global tree finalizes (PLAN §2.5/§2.10); here it is supplied.
+    pub fn build_spend_bundle(
+        pk: &ProvingKey,
+        keys: &ShieldedKeys,
+        note: Note,
+        merkle_path: MerklePath,
+        recipient: Address,
+        output_value: u64,
+        tx_context: &[u8],
+        mut rng: impl RngCore + CryptoRng,
+    ) -> Result<ShieldedBundle, BuildError> {
+        // The anchor is the root the supplied path proves the note into.
+        let anchor = merkle_path.root(ExtractedNoteCommitment::from(note.commitment()));
+        let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+        builder.add_spend(keys.fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        builder
+            .add_output(None, recipient, NoteValue::from_raw(output_value), [0u8; 512])
+            .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+
+        let (unauth, _meta) =
+            builder.build::<i64>(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
+        let proven = unauth.create_proof(pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+
+        let effects = to_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
+        let msg = sighash(&effects, tx_context);
+        // The real spend is authorized with the spend authorizing key.
+        let ask = SpendAuthorizingKey::from(&keys.sk);
+        let authorized: Bundle<Authorized, i64> =
+            proven.apply_signatures(&mut rng, msg, &[ask]).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+
+        Ok(to_wire(
+            &authorized,
+            |a| <[u8; 64]>::from(a.authorization()),
+            authorized.authorization().proof().as_ref().to_vec(),
+            <[u8; 64]>::from(authorized.authorization().binding_signature()),
+        ))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+        use incrementalmerkletree::{Hashable, Level};
+        use orchard::{
+            note::{RandomSeed, Rho},
+            tree::MerkleHashOrchard,
+        };
+
+        fn canon(seed: u8) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[0] = seed;
+            b
+        }
+
+        /// The transfer loop: the wallet spends a note it owns and the consensus
+        /// verifier accepts the resulting bundle. The note sits alone at position
+        /// 0 of the tree, so its authentication path is the empty-subtree roots.
+        #[test]
+        fn wallet_spend_bundle_verifies() {
+            let pk = ProvingKey::build();
+            let keys = ShieldedKeys::from_seed([5u8; 32]).expect("valid seed");
+            let ctx = b"kasprivate-spend";
+
+            // A note worth 10_000 owned by the wallet.
+            let rho = Option::<Rho>::from(Rho::from_bytes(&canon(1))).unwrap();
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(2), &rho)).unwrap();
+            let note =
+                Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
+
+            // Single-leaf tree at position 0: siblings are the empty-subtree roots.
+            let auth_path: [MerkleHashOrchard; 32] =
+                core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+            let merkle_path = MerklePath::from_parts(0, auth_path);
+
+            let recipient = ShieldedKeys::from_seed([6u8; 32]).unwrap().address();
+            let wire = build_spend_bundle(&pk, &keys, note, merkle_path, recipient, 8_000, ctx, rand::rngs::OsRng).expect("build");
+
+            let msg = sighash(&wire, ctx);
+            crate::verify::verify_bundle(&wire, &msg).expect("wallet spend bundle must verify");
+            // Fee = 10_000 spent − 8_000 output = 2_000 (positive value balance).
+            assert_eq!(wire.value_balance, 2_000);
+        }
 
         /// The full loop: the wallet builds a real shielded bundle, and the
         /// consensus verifier accepts it under the same sighash.
@@ -156,4 +242,4 @@ mod build {
 }
 
 #[cfg(feature = "circuit")]
-pub use build::{build_output_only_bundle, to_wire, BuildError, ShieldedKeys};
+pub use build::{build_output_only_bundle, build_spend_bundle, to_wire, BuildError, ShieldedKeys};
