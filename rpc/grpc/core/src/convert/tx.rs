@@ -487,4 +487,33 @@ mod tests {
         assert_eq!(decoded.inputs[0].compute_budget, 222);
         assert_eq!(decoded.storage_mass, 111);
     }
+
+    /// A shielded transaction (version 2, no transparent inputs/outputs, Orchard
+    /// bundle carried in the payload) must survive the protowire round-trip
+    /// unchanged — this is the gRPC submit_transaction path for a private payment.
+    /// The version must not be clamped and the (large) payload must be preserved.
+    #[test]
+    fn test_rpc_shielded_transaction_roundtrip() {
+        // Stand in for a serialized Orchard bundle: a large, arbitrary payload.
+        let payload: Vec<u8> = (0..900u32).map(|i| (i % 256) as u8).collect();
+        let tx = RpcTransaction {
+            version: 2, // TX_VERSION_SHIELDED
+            inputs: vec![],
+            outputs: vec![],
+            lock_time: 0,
+            subnetwork_id: SubnetworkId::from_bytes([0; 20]),
+            gas: 0,
+            payload: payload.clone(),
+            storage_mass: 0,
+            verbose_data: None,
+        };
+
+        let wire: protowire::RpcTransaction = (&tx).into();
+        assert_eq!(wire.version, 2, "shielded version must not be clamped on the wire");
+
+        let decoded = RpcTransaction::try_from(&wire).unwrap();
+        assert_eq!(decoded.version, 2, "version 2 survives the round-trip");
+        assert!(decoded.inputs.is_empty() && decoded.outputs.is_empty(), "transparent-less shape preserved");
+        assert_eq!(decoded.payload, payload, "the shielded bundle payload survives the round-trip");
+    }
 }
