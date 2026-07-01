@@ -187,6 +187,10 @@ pub struct VirtualStateProcessor {
     // commit hook is wired separately.
     pub(super) shielded_state_manager: crate::processes::shielded::ShieldedStateManager,
 
+    // kasprivate: when true, the coinbase reward enters the shielded pool as
+    // coinbase notes (no transparent outputs) — see `build_coinbase_mint`.
+    pub(super) shielded_coinbase: bool,
+
     // Mining Rule
     _mining_rules: Arc<MiningRules>,
 }
@@ -264,6 +268,7 @@ impl VirtualStateProcessor {
             notification_root,
             counters,
             toccata_activation: params.toccata_activation,
+            shielded_coinbase: params.shielded_coinbase,
             toccata_logger: ForkLogger::new("virtual state processing rules", true),
             smt_stores: storage.smt_stores.clone(),
             smt_metadata_store: storage.smt_metadata_store.clone(),

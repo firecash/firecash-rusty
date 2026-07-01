@@ -134,8 +134,14 @@ impl VirtualStateProcessor {
         let selected_parent_transactions = self.block_transactions_store.get(ctx.selected_parent()).unwrap();
         let validated_coinbase = ValidatedTransaction::new_coinbase(&selected_parent_transactions[0]);
 
-        ctx.mergeset_diff.add_transaction(&validated_coinbase, pov_daa_score).unwrap();
-        ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score);
+        // On a shielded-coinbase network the coinbase's outputs are coinbase-note
+        // descriptors, minted into the shielded pool in verify_expected_utxo_state,
+        // not spendable UTXOs — so they must not enter the UTXO set or its
+        // commitment (coinbase maturity is replaced by anchor finality, §2.5).
+        if !self.shielded_coinbase {
+            ctx.mergeset_diff.add_transaction(&validated_coinbase, pov_daa_score).unwrap();
+            ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score);
+        }
         let validated_coinbase_id = validated_coinbase.id();
         ctx.accepted_tx_ids.push(validated_coinbase_id);
         ctx.accepted_tx_versions.push(validated_coinbase.version());
@@ -305,19 +311,34 @@ impl VirtualStateProcessor {
 
         // Shielded state transition (PLAN §2.4): validate nullifier conflicts and
         // the turnstile against the selected parent's persisted shielded state, and
-        // compute the new state for commit. Coinbase-note minting is not yet active
-        // (PLAN §2.7), so no value enters the pool here. This is a no-op for blocks
-        // with no shielded transactions.
+        // compute the new state for commit. This is a no-op for blocks with no
+        // shielded activity.
         if ctx.shielded_invalid {
             return Err(InvalidShieldedState(header.hash, "malformed shielded bundle".to_string()));
         }
-        match self.shielded_state_manager.compute(ctx.selected_parent(), None, &ctx.shielded_txs) {
+        // On a shielded-coinbase network the block reward enters the pool as
+        // coinbase notes derived from the coinbase transaction (PLAN §2.7); the
+        // matching outputs are diverted from the UTXO set in `calculate_utxo_state`.
+        let coinbase_mint = if self.shielded_coinbase {
+            match crate::processes::shielded::build_coinbase_mint(&txs[0]) {
+                Ok(mint) => Some(mint),
+                Err(e) => return Err(InvalidShieldedState(header.hash, format!("coinbase mint: {e:?}"))),
+            }
+        } else {
+            None
+        };
+        match self.shielded_state_manager.compute(ctx.selected_parent(), coinbase_mint.as_ref(), &ctx.shielded_txs) {
             Ok(computed) => ctx.shielded_computed = Some(computed),
             Err(crate::processes::shielded::ShieldedManagerError::State(e)) => {
                 return Err(InvalidShieldedState(header.hash, format!("{e:?}")));
             }
             Err(crate::processes::shielded::ShieldedManagerError::UnfinalizedAnchor(a)) => {
                 return Err(InvalidShieldedState(header.hash, format!("spend references unfinalized anchor {a:02x?}")));
+            }
+            Err(e @ crate::processes::shielded::ShieldedManagerError::MalformedCoinbaseNote(_)) => {
+                // Not produced by `compute` (only by `build_coinbase_mint` above),
+                // but the match must be exhaustive; treat as an invalid state.
+                return Err(InvalidShieldedState(header.hash, format!("{e:?}")));
             }
             Err(crate::processes::shielded::ShieldedManagerError::Store(e)) => {
                 panic!("shielded store read failed during verification: {e}");

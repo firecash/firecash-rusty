@@ -333,6 +333,13 @@ pub struct Params {
     pub coinbase_payload_script_public_key_max_len: u8,
     pub max_coinbase_payload_len: usize,
 
+    /// kasprivate: when true, the coinbase creates **no transparent outputs**; the
+    /// block reward (subsidy + fees per rewarded block) enters the mandatory
+    /// shielded pool as coinbase notes, minted in the virtual processor (PLAN
+    /// §2.7). The miner's shielded (Orchard) address is carried in the reward's
+    /// `script_public_key` bytes. When false, classic transparent coinbase.
+    pub shielded_coinbase: bool,
+
     pub max_tx_inputs: usize,
     pub max_tx_outputs: usize,
     pub prior_max_signature_script_len: usize,
@@ -571,6 +578,7 @@ impl Params {
                 .unwrap_or(self.coinbase_payload_script_public_key_max_len),
 
             max_coinbase_payload_len: overrides.max_coinbase_payload_len.unwrap_or(self.max_coinbase_payload_len),
+            shielded_coinbase: self.shielded_coinbase,
 
             max_tx_inputs: overrides.max_tx_inputs.unwrap_or(self.max_tx_inputs),
             max_tx_outputs: overrides.max_tx_outputs.unwrap_or(self.max_tx_outputs),
@@ -681,6 +689,7 @@ pub const MAINNET_PARAMS: Params = Params {
     min_difficulty_window_size: MIN_DIFFICULTY_WINDOW_SIZE,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
+    shielded_coinbase: false,
 
     // Limit the cost of calculating compute/transient/storage masses
     max_tx_inputs: 1000,
@@ -743,6 +752,7 @@ pub const TESTNET_PARAMS: Params = Params {
     min_difficulty_window_size: MIN_DIFFICULTY_WINDOW_SIZE,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
+    shielded_coinbase: false,
 
     // Limit the cost of calculating compute/transient/storage masses
     max_tx_inputs: 1000,
@@ -800,6 +810,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pre_deflationary_phase_base_subsidy: TenBps::pre_deflationary_phase_base_subsidy(),
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
+    shielded_coinbase: false,
 
     max_tx_inputs: 1000,
     max_tx_outputs: 1000,
@@ -842,6 +853,7 @@ pub const DEVNET_PARAMS: Params = Params {
     min_difficulty_window_size: MIN_DIFFICULTY_WINDOW_SIZE,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
+    shielded_coinbase: false,
 
     max_tx_inputs: 1000,
     max_tx_outputs: 1000,

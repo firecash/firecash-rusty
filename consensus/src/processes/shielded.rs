@@ -16,8 +16,10 @@
 
 use std::sync::Arc;
 
+use kaspa_consensus_core::tx::Transaction;
 use kaspa_database::prelude::{CachePolicy, StoreError, StoreResult, DB};
 use kaspa_hashes::Hash;
+use kaspa_shielded_core::coinbase::{coinbase_note, derive_coinbase_note_desc};
 use kaspa_shielded_core::nullifier::{MemNullifierSet, NullifierBytes, NullifierSet};
 use kaspa_shielded_core::state::{apply_chain_block_to, BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx};
 #[cfg(test)]
@@ -60,6 +62,10 @@ pub enum ShieldedManagerError {
     /// A spend proved against an anchor not in the finalized window (PLAN §2.5) —
     /// the block must be rejected.
     UnfinalizedAnchor([u8; 32]),
+    /// A shielded-coinbase reward output did not encode a valid coinbase note
+    /// (recipient shorter than an Orchard address, or not a canonical address) —
+    /// the block must be rejected.
+    MalformedCoinbaseNote(&'static str),
     /// A storage error (fatal, as elsewhere in consensus).
     Store(StoreError),
 }
@@ -73,6 +79,39 @@ impl From<StoreError> for ShieldedManagerError {
     fn from(e: StoreError) -> Self {
         Self::Store(e)
     }
+}
+
+/// Build the shielded [`CoinbaseMint`] for a block from its coinbase transaction
+/// (PLAN §2.7), on a `shielded_coinbase` network. Each coinbase output is a reward
+/// for one mergeset block: its `value` is the public reward (subsidy + that
+/// block's fees, already emission-checked by the coinbase verifier) and its
+/// `script_public_key` script carries the recipient's 43-byte Orchard address.
+///
+/// The note's `(rho, rseed)` are **derived deterministically** from the coinbase
+/// transaction id and the output index ([`derive_coinbase_note_desc`]), so every
+/// node computes the identical note commitment and the recipient's wallet can
+/// recompute the note to spend it. No transparent value is created — these outputs
+/// are diverted into the shielded pool instead of the UTXO set.
+pub fn build_coinbase_mint(coinbase_tx: &Transaction) -> Result<CoinbaseMint, ShieldedManagerError> {
+    let txid = coinbase_tx.id();
+    let mut notes = Vec::with_capacity(coinbase_tx.outputs.len());
+    for (i, out) in coinbase_tx.outputs.iter().enumerate() {
+        let script = out.script_public_key.script();
+        if script.len() < 43 {
+            return Err(ShieldedManagerError::MalformedCoinbaseNote("coinbase reward script too short for an Orchard address"));
+        }
+        let recipient: [u8; 43] =
+            script[..43].try_into().expect("checked length >= 43");
+        // Unique per-note seed: coinbase tx id || output index.
+        let mut seed = Vec::with_capacity(32 + 4);
+        seed.extend_from_slice(&txid.as_bytes());
+        seed.extend_from_slice(&(i as u32).to_le_bytes());
+        let desc = derive_coinbase_note_desc(recipient, &seed);
+        let note = coinbase_note(&desc, out.value)
+            .map_err(|_| ShieldedManagerError::MalformedCoinbaseNote("coinbase reward recipient is not a canonical Orchard address"))?;
+        notes.push(note);
+    }
+    Ok(CoinbaseMint::new(notes))
 }
 
 /// A finalized nullifier set layered over the persisted global set plus the
