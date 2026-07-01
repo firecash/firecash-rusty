@@ -17,8 +17,12 @@ kaspa-core.workspace = true
 kaspa-hashes.workspace = true
 kaspa-mining-errors.workspace = true
 kaspa-muhash.workspace = true
+# Shielded-tx nullifier extraction for mempool double-spend detection (no proving
+# circuit needed — just wire-format parsing of the bundle in the tx payload).
+kaspa-shielded-core.workspace = true
 kaspa-txscript.workspace = true
 kaspa-utils.workspace = true
+hex.workspace = true
 
 futures-util.workspace = true
 itertools.workspace = true

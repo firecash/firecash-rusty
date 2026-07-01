@@ -19,6 +19,12 @@ impl Mempool {
         rbf_policy: RbfPolicy,
         virtual_daa_score: u64,
     ) -> RuleResult<Option<f64>> {
+        // Shielded transactions never participate in RBF: a conflict on a spent
+        // note (nullifier) is always rejected outright, since a re-proven Orchard
+        // bundle is a different transaction, not a fee bump. This runs under every
+        // policy because the outpoint-based RBF logic below cannot see nullifier
+        // conflicts (a shielded tx has no transparent inputs).
+        self.transaction_pool.check_nullifier_double_spends(transaction)?;
         match rbf_policy {
             RbfPolicy::Forbidden => {
                 // When RBF is forbidden, fails early on any double spend
@@ -63,6 +69,8 @@ impl Mempool {
         transaction: &MutableTransaction,
         rbf_policy: RbfPolicy,
     ) -> RuleResult<()> {
+        // Shielded nullifier conflicts are always rejected (see get_replace_by_fee_constraint).
+        self.transaction_pool.check_nullifier_double_spends(transaction)?;
         match rbf_policy {
             RbfPolicy::Forbidden => self.transaction_pool.check_double_spends(transaction),
             RbfPolicy::Allowed => Ok(()),
@@ -87,6 +95,8 @@ impl Mempool {
         rbf_policy: RbfPolicy,
         virtual_daa_score: u64,
     ) -> RuleResult<Option<Arc<Transaction>>> {
+        // Shielded nullifier conflicts are always rejected (see get_replace_by_fee_constraint).
+        self.transaction_pool.check_nullifier_double_spends(transaction)?;
         match rbf_policy {
             RbfPolicy::Forbidden => {
                 self.transaction_pool.check_double_spends(transaction)?;

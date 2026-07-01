@@ -30,6 +30,9 @@ pub enum RuleError {
     #[error("output {0} already spent by transaction {1} in the mempool")]
     RejectDoubleSpendInMempool(TransactionOutpoint, TransactionId),
 
+    #[error("shielded nullifier {0} already spent by transaction {1} in the mempool")]
+    RejectDoubleSpendNullifierInMempool(String, TransactionId),
+
     #[error("replace by fee found no double spending transaction in the mempool")]
     RejectRbfNoDoubleSpend,
 

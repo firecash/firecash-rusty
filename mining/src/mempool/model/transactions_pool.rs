@@ -304,6 +304,12 @@ impl TransactionsPool {
         self.utxo_set.check_double_spends(transaction)
     }
 
+    /// Make sure no other transaction in the mempool is already spending a shielded note which one of this
+    /// transaction's nullifiers spends (the shielded analogue of [`Self::check_double_spends`]).
+    pub(crate) fn check_nullifier_double_spends(&self, transaction: &MutableTransaction) -> RuleResult<()> {
+        self.utxo_set.check_nullifier_double_spends(transaction)
+    }
+
     /// Returns the first double spend of every transaction in the mempool double spending on `transaction`
     pub(crate) fn get_double_spend_transaction_ids(&self, transaction: &MutableTransaction) -> Vec<DoubleSpend> {
         self.utxo_set.get_double_spend_transaction_ids(transaction)
