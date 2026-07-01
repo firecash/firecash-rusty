@@ -201,6 +201,20 @@ async fn shielded_coinbase_mints_into_the_pool_live() {
             .assert_tips()
             .assert_valid_utxo_tip();
     }
+
+    // Directly prove value entered the pool: a UTXO-valid chain tip's shielded
+    // anchor must have advanced past the empty tree (coinbase notes were appended).
+    let empty_anchor = kaspa_shielded_core::Anchor::empty_tree().to_bytes();
+    let vp = ctx.consensus.virtual_processor();
+    let advanced = ctx
+        .consensus
+        .body_tips()
+        .iter()
+        .copied()
+        .filter(|h| ctx.consensus.block_status(*h) == BlockStatus::StatusUTXOValid)
+        .filter_map(|h| vp.shielded_anchor_at(h).ok())
+        .any(|anchor| anchor != empty_anchor);
+    assert!(advanced, "shielded coinbase must have appended notes and advanced the anchor past empty");
 }
 
 #[tokio::test]
