@@ -12,6 +12,82 @@
 //! delegated proving for light wallets — by Orchard's key separation, a delegated
 //! prover never gains spend authority. This module is the local-proving core.
 
+/// Wallet scanning — the receive side (§2.10). Trial-decrypts a bundle's outputs
+/// with an incoming viewing key to recover notes sent to the holder. Pure
+/// decryption; no proving circuit required, so this is available without the
+/// `circuit` feature. (Under mandatory privacy, everyone always scans — this is
+/// the hot path a light-wallet indexer accelerates.)
+pub mod scan {
+    use crate::bundle::{ActionWire, ShieldedBundle};
+    use orchard::{
+        keys::{FullViewingKey, IncomingViewingKey, Scope, SpendingKey},
+        note::{ExtractedNoteCommitment, Note, Nullifier, TransmittedNoteCiphertext},
+        note_encryption::OrchardDomain,
+        primitives::redpallas::{Signature, SpendAuth, VerificationKey},
+        value::ValueCommitment,
+        Action,
+    };
+    use zcash_note_encryption::try_note_decryption;
+
+    /// A note recovered from a bundle: which action carried it (its position
+    /// offset within the block's outputs, needed to build a witness later) and
+    /// the recovered [`Note`], which the wallet can subsequently spend.
+    pub struct ReceivedNote {
+        /// Index of the action within the bundle that carried this output.
+        pub action_index: usize,
+        /// The recovered note (spendable via `wallet::build_spend_bundle`).
+        pub note: Note,
+    }
+
+    impl ReceivedNote {
+        /// The note's value in the base unit.
+        pub fn value(&self) -> u64 {
+            self.note.value().inner()
+        }
+    }
+
+    /// Derive an external incoming viewing key from a wallet seed.
+    pub fn ivk_from_seed(seed: [u8; 32]) -> Option<IncomingViewingKey> {
+        let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
+        Some(FullViewingKey::from(&sk).to_ivk(Scope::External))
+    }
+
+    /// Reconstruct an Orchard action from its wire form (auth = its spend-auth
+    /// signature). Returns `None` if any field is malformed (such an action can
+    /// carry no note for us). This mirrors the verifier's reconstruction and thus
+    /// enforces the identity `rk`/`epk` rules via `Action::from_parts`.
+    fn reconstruct_action(a: &ActionWire) -> Option<Action<Signature<SpendAuth>>> {
+        let nf: Nullifier = Option::from(Nullifier::from_bytes(&a.nullifier))?;
+        let rk = VerificationKey::<SpendAuth>::try_from(a.rk).ok()?;
+        let cmx: ExtractedNoteCommitment = Option::from(ExtractedNoteCommitment::from_bytes(&a.cmx))?;
+        let cv: ValueCommitment = Option::from(ValueCommitment::from_bytes(&a.cv_net))?;
+        let ct = TransmittedNoteCiphertext {
+            epk_bytes: a.ephemeral_key,
+            enc_ciphertext: a.enc_ciphertext,
+            out_ciphertext: a.out_ciphertext,
+        };
+        let sig = Signature::<SpendAuth>::from(a.spend_auth_sig);
+        Action::from_parts(nf, rk, cmx, ct, cv, sig).ok()
+    }
+
+    /// Scan a bundle with an incoming viewing key, returning every note addressed
+    /// to the key's holder (trial decryption, §2.10).
+    pub fn scan_bundle(ivk: &IncomingViewingKey, bundle: &ShieldedBundle) -> Vec<ReceivedNote> {
+        let prepared = ivk.prepare();
+        let mut received = Vec::new();
+        for (i, a) in bundle.actions.iter().enumerate() {
+            let Some(action) = reconstruct_action(a) else { continue };
+            let domain = OrchardDomain::for_action(&action);
+            if let Some((note, _addr, _memo)) = try_note_decryption(&domain, &prepared, &action) {
+                received.push(ReceivedNote { action_index: i, note });
+            }
+        }
+        received
+    }
+}
+
+pub use scan::{ivk_from_seed, scan_bundle, ReceivedNote};
+
 #[cfg(feature = "circuit")]
 mod build {
     use crate::bundle::{ActionWire, ShieldedBundle};
@@ -237,6 +313,24 @@ mod build {
             // A different tx context must not verify under the wallet's sighash.
             let other = sighash(&wire, b"different-context");
             assert!(crate::verify::verify_bundle(&wire, &other).is_err());
+        }
+
+        /// Send → receive: a bundle built to a recipient's address is recovered by
+        /// that recipient's incoming viewing key (and by no one else's).
+        #[test]
+        fn scan_recovers_sent_note() {
+            let pk = ProvingKey::build();
+            let recipient = ShieldedKeys::from_seed([2u8; 32]).expect("valid seed");
+            let wire = build_output_only_bundle(&pk, recipient.address(), 4242, b"ctx", rand::rngs::OsRng).expect("build");
+
+            let ivk = crate::wallet::ivk_from_seed([2u8; 32]).unwrap();
+            let received = crate::wallet::scan_bundle(&ivk, &wire);
+            assert_eq!(received.len(), 1, "recipient recovers exactly the note sent to it");
+            assert_eq!(received[0].value(), 4242);
+
+            // A stranger's viewing key recovers nothing.
+            let stranger = crate::wallet::ivk_from_seed([9u8; 32]).unwrap();
+            assert!(crate::wallet::scan_bundle(&stranger, &wire).is_empty());
         }
     }
 }

@@ -36,3 +36,6 @@ blake2b_simd = { workspace = true }
 # Bundle reconstruction (batch verification) — enabled by the `circuit` feature.
 nonempty = { version = "0.11", default-features = false, optional = true }
 rand = { workspace = true, optional = true }
+# Note decryption for wallet scanning (the receive side). Must match the version
+# Orchard links so the OrchardDomain types agree.
+zcash_note_encryption = "0.4"
