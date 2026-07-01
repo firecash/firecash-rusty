@@ -20,6 +20,8 @@ use kaspa_database::prelude::{CachePolicy, StoreError, StoreResult, DB};
 use kaspa_hashes::Hash;
 use kaspa_shielded_core::nullifier::{MemNullifierSet, NullifierBytes, NullifierSet};
 use kaspa_shielded_core::state::{apply_chain_block_to, BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx};
+#[cfg(test)]
+use kaspa_shielded_core::state::CoinbaseNote;
 use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
 use kaspa_shielded_core::turnstile::SupplyLedger;
 use rocksdb::WriteBatch;
@@ -264,8 +266,8 @@ mod tests {
         }
     }
 
-    fn coinbase(subsidy: u64, c: u32) -> CoinbaseMint {
-        CoinbaseMint { subsidy, commitment: cmx(c) }
+    fn coinbase(value: u64, c: u32) -> CoinbaseMint {
+        CoinbaseMint::new(vec![CoinbaseNote { value, commitment: cmx(c) }])
     }
 
     fn h(n: u8) -> Hash {

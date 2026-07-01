@@ -83,10 +83,39 @@ impl ShieldedTx {
 /// schedule by the caller.
 #[derive(Clone, Debug)]
 pub struct CoinbaseMint {
-    /// The block subsidy minted into the pool.
-    pub subsidy: u64,
+    /// One coinbase note per rewarded mergeset block (PLAN §2.7). Kaspa pays each
+    /// merged block's miner separately (subsidy + that block's fees), so a chain
+    /// block's coinbase mints a *set* of notes rather than one.
+    pub notes: Vec<CoinbaseNote>,
+}
+
+/// A single coinbase note minted into the pool: a **publicly stated value**
+/// (the rewarded block's subsidy + fees) and its note commitment.
+///
+/// The value is public (verifiable against the emission schedule and the observed
+/// fees) and the commitment binds it, so a miner cannot mint more than the value
+/// consensus checked. Each note's value enters the turnstile as `cumulative_coinbase
+/// += value`; because a shielded tx's fee is re-minted here (in the coinbase of the
+/// block that merges it) after leaving the pool as `value_balance`, the pool nets to
+/// the cumulative *subsidy* — all value stays shielded (PLAN §2.6, §2.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoinbaseNote {
+    /// The note's public value: the rewarded block's subsidy plus its fees.
+    pub value: u64,
     /// The coinbase note commitment (added to the tree like any other leaf).
     pub commitment: ExtractedNoteCommitment,
+}
+
+impl CoinbaseMint {
+    /// A coinbase mint of the given notes.
+    pub fn new(notes: Vec<CoinbaseNote>) -> Self {
+        Self { notes }
+    }
+
+    /// The total value minted by this coinbase across all its notes.
+    pub fn total_value(&self) -> u128 {
+        self.notes.iter().map(|n| n.value as u128).sum()
+    }
 }
 
 /// Why a shielded state transition was rejected (an invalid state — the block /
@@ -195,11 +224,17 @@ pub fn apply_chain_block_to<S: NullifierSet + ?Sized>(
     let mut total_fees: u128 = 0;
     let mut total_mint: u128 = 0;
 
-    // Coinbase is processed first: it has no nullifiers, mints subsidy, and
-    // contributes its note commitment as the first leaf of the subtree.
+    // Coinbase is processed first: it has no nullifiers, mints its notes' public
+    // values, and contributes their commitments as the first leaves of the
+    // subtree (in the coinbase's own note order, which every node recomputes
+    // identically). Each note's value = a rewarded block's subsidy + fees, so
+    // minting them re-mints the fees that left the pool as `value_balance` when
+    // those blocks were accepted — the pool nets to the cumulative subsidy.
     if let Some(cb) = coinbase {
-        total_mint += cb.subsidy as u128;
-        subtree.push(cb.commitment);
+        for note in &cb.notes {
+            total_mint += note.value as u128;
+            subtree.push(note.commitment);
+        }
     }
 
     for (i, tx) in txs.iter().enumerate() {
@@ -289,7 +324,7 @@ mod tests {
             // Block X (accepted first): coinbase + tx spending nf(1), fee 5, new note cmx(100).
             let out_x = st
                 .apply_chain_block(
-                    Some(&CoinbaseMint { subsidy: 50, commitment: cmx(10) }),
+                    Some(&CoinbaseMint::new(vec![CoinbaseNote { value: 50, commitment: cmx(10) }])),
                     &[tx(&[1], &[100], 5)],
                 )
                 .unwrap();
@@ -298,7 +333,7 @@ mod tests {
             // Block Y (accepted second): coinbase + tx ALSO spending nf(1), new note cmx(200).
             let out_y = st
                 .apply_chain_block(
-                    Some(&CoinbaseMint { subsidy: 50, commitment: cmx(20) }),
+                    Some(&CoinbaseMint::new(vec![CoinbaseNote { value: 50, commitment: cmx(20) }])),
                     &[tx(&[1], &[200], 5)],
                 )
                 .unwrap();
@@ -425,7 +460,7 @@ mod tests {
     #[test]
     fn turnstile_rejects_overspend_and_preserves_state() {
         let mut st = ShieldedState::new();
-        st.apply_chain_block(Some(&CoinbaseMint { subsidy: 10, commitment: cmx(1) }), &[]).unwrap();
+        st.apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: 10, commitment: cmx(1) }])), &[]).unwrap();
         let anchor_before = st.anchor().to_bytes();
 
         // A block whose fees (11) exceed the pool (10) -> PoolUnderflow -> rejected.

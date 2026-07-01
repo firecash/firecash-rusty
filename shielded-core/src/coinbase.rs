@@ -28,7 +28,7 @@ use orchard::{
     Address,
 };
 
-use crate::state::CoinbaseMint;
+use crate::state::{CoinbaseMint, CoinbaseNote};
 
 /// The public description of a coinbase note: everything besides the public value
 /// (the subsidy) needed to recompute its commitment. Carried by the coinbase
@@ -58,22 +58,30 @@ pub enum CoinbaseNoteError {
 }
 
 /// Recompute the coinbase note's extracted commitment from its public description
-/// and public value (the subsidy). Consensus uses this to derive the global-tree
-/// leaf and to bind the commitment to the emission-checked subsidy.
-pub fn coinbase_note_commitment(desc: &CoinbaseNoteDesc, subsidy: u64) -> Result<ExtractedNoteCommitment, CoinbaseNoteError> {
+/// and public `value` (the rewarded block's subsidy + fees). Consensus uses this
+/// to derive the global-tree leaf and to bind the commitment to the emission- and
+/// fee-checked value.
+pub fn coinbase_note_commitment(desc: &CoinbaseNoteDesc, value: u64) -> Result<ExtractedNoteCommitment, CoinbaseNoteError> {
     let recipient: Address =
         Option::from(Address::from_raw_address_bytes(&desc.recipient)).ok_or(CoinbaseNoteError::BadRecipient)?;
     let rho: Rho = Option::from(Rho::from_bytes(&desc.rho)).ok_or(CoinbaseNoteError::BadRho)?;
     let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(desc.rseed, &rho)).ok_or(CoinbaseNoteError::BadRseed)?;
-    let note: Note = Option::from(Note::from_parts(recipient, NoteValue::from_raw(subsidy), rho, rseed))
+    let note: Note = Option::from(Note::from_parts(recipient, NoteValue::from_raw(value), rho, rseed))
         .ok_or(CoinbaseNoteError::BadNote)?;
     Ok(ExtractedNoteCommitment::from(note.commitment()))
 }
 
+/// Build a single [`CoinbaseNote`] (value + commitment) from its public
+/// description and the emission- and fee-checked value.
+pub fn coinbase_note(desc: &CoinbaseNoteDesc, value: u64) -> Result<CoinbaseNote, CoinbaseNoteError> {
+    Ok(CoinbaseNote { value, commitment: coinbase_note_commitment(desc, value)? })
+}
+
 /// Build the [`CoinbaseMint`] for the shielded state transition from a coinbase
-/// note description and the emission-checked subsidy.
-pub fn coinbase_mint(desc: &CoinbaseNoteDesc, subsidy: u64) -> Result<CoinbaseMint, CoinbaseNoteError> {
-    Ok(CoinbaseMint { subsidy, commitment: coinbase_note_commitment(desc, subsidy)? })
+/// transaction's `(description, value)` pairs — one per rewarded mergeset block.
+pub fn coinbase_mint(notes: &[(CoinbaseNoteDesc, u64)]) -> Result<CoinbaseMint, CoinbaseNoteError> {
+    let notes = notes.iter().map(|(desc, value)| coinbase_note(desc, *value)).collect::<Result<Vec<_>, _>>()?;
+    Ok(CoinbaseMint::new(notes))
 }
 
 #[cfg(test)]
@@ -128,11 +136,16 @@ mod tests {
         assert!(matches!(coinbase_note_commitment(&desc, 100), Err(CoinbaseNoteError::BadRecipient)));
     }
 
-    /// A coinbase note feeds the state transition as a mint of exactly the subsidy.
+    /// A coinbase note feeds the state transition as a mint of exactly its public
+    /// value (subsidy + fees); multiple rewarded blocks become multiple notes.
     #[test]
-    fn coinbase_mint_carries_subsidy() {
-        let desc = CoinbaseNoteDesc { recipient: test_recipient().to_raw_address_bytes(), rho: canon32(3), rseed: canon32(4) };
-        let mint = coinbase_mint(&desc, 12_345).unwrap();
-        assert_eq!(mint.subsidy, 12_345);
+    fn coinbase_mint_carries_note_values() {
+        let d1 = CoinbaseNoteDesc { recipient: test_recipient().to_raw_address_bytes(), rho: canon32(3), rseed: canon32(4) };
+        let d2 = CoinbaseNoteDesc { recipient: test_recipient().to_raw_address_bytes(), rho: canon32(5), rseed: canon32(6) };
+        let mint = coinbase_mint(&[(d1, 12_345), (d2, 678)]).unwrap();
+        assert_eq!(mint.notes.len(), 2);
+        assert_eq!(mint.notes[0].value, 12_345);
+        assert_eq!(mint.notes[1].value, 678);
+        assert_eq!(mint.total_value(), 13_023);
     }
 }
