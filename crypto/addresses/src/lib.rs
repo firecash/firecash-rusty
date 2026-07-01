@@ -145,6 +145,12 @@ pub enum Version {
     PubKeyECDSA = 1,
     /// ScriptHash addresses always have the version byte set to 8
     ScriptHash = 8,
+    /// kasprivate shielded (Orchard) addresses have the version byte set to 9.
+    /// The payload is the 43-byte raw Orchard address (diversifier ‖ pk_d). Such
+    /// an address is never spent through a transparent script — it is the
+    /// recipient of a shielded (Orchard) output — so it maps to no standard
+    /// script class (PLAN §2.10).
+    ShieldedOrchard = 9,
 }
 
 impl TryFrom<&str> for Version {
@@ -155,6 +161,7 @@ impl TryFrom<&str> for Version {
             "PubKey" => Ok(Version::PubKey),
             "PubKeyECDSA" => Ok(Version::PubKeyECDSA),
             "ScriptHash" => Ok(Version::ScriptHash),
+            "ShieldedOrchard" => Ok(Version::ShieldedOrchard),
             _ => Err(AddressError::InvalidVersionString(value.to_string())),
         }
     }
@@ -166,7 +173,14 @@ impl Version {
             Version::PubKey => 32,
             Version::PubKeyECDSA => 33,
             Version::ScriptHash => 32,
+            Version::ShieldedOrchard => 43,
         }
+    }
+
+    /// Whether this is a kasprivate shielded (Orchard) address, which is paid via
+    /// a shielded output rather than a transparent script.
+    pub fn is_shielded(&self) -> bool {
+        matches!(self, Version::ShieldedOrchard)
     }
 }
 
@@ -178,6 +192,7 @@ impl TryFrom<u8> for Version {
             0 => Ok(Version::PubKey),
             1 => Ok(Version::PubKeyECDSA),
             8 => Ok(Version::ScriptHash),
+            9 => Ok(Version::ShieldedOrchard),
             _ => Err(AddressError::InvalidVersion(value)),
         }
     }
@@ -189,6 +204,7 @@ impl Display for Version {
             Version::PubKey => write!(f, "PubKey"),
             Version::PubKeyECDSA => write!(f, "PubKeyECDSA"),
             Version::ScriptHash => write!(f, "ScriptHash"),
+            Version::ShieldedOrchard => write!(f, "ShieldedOrchard"),
         }
     }
 }
@@ -196,8 +212,8 @@ impl Display for Version {
 /// Size of the payload vector of an address.
 ///
 /// This size is the smallest SmallVec supported backing store size greater or equal to the largest
-/// possible payload, which is 33 for [`Version::PubKeyECDSA`].
-pub const PAYLOAD_VECTOR_SIZE: usize = 36;
+/// possible payload, which is 43 for [`Version::ShieldedOrchard`].
+pub const PAYLOAD_VECTOR_SIZE: usize = 43;
 
 /// Used as the underlying type for address payload, optimized for the largest version length (33).
 pub type PayloadVec = SmallVec<[u8; PAYLOAD_VECTOR_SIZE]>;
@@ -509,6 +525,32 @@ mod tests {
             let address: Address = address_str.to_string().try_into().expect("Test failed");
             assert_eq!(address, expected_address);
         }
+    }
+
+    /// A shielded (Orchard) address carries a 43-byte payload and round-trips
+    /// through the string form under the kasprivate HRP, decoding back to the
+    /// same version and payload.
+    #[test]
+    fn shielded_orchard_address_roundtrip() {
+        let raw: [u8; 43] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1));
+        let address = Address::new(Prefix::Mainnet, Version::ShieldedOrchard, &raw);
+        assert_eq!(address.version, Version::ShieldedOrchard);
+        assert!(address.version.is_shielded());
+        assert_eq!(address.version.public_key_len(), 43);
+        assert_eq!(address.payload.as_slice(), &raw[..]);
+
+        // Encodes under the mainnet HRP and decodes back identically.
+        let s: String = (&address).into();
+        assert!(s.starts_with("kasprivate:"), "shielded address uses the kasprivate HRP: {s}");
+        let decoded: Address = s.clone().try_into().expect("shielded address must decode");
+        assert_eq!(decoded, address);
+        assert_eq!(decoded.payload.as_slice(), &raw[..]);
+
+        // The version byte and string tag are the shielded ones.
+        assert_eq!(Version::ShieldedOrchard as u8, 9);
+        assert_eq!(Version::try_from(9u8).unwrap(), Version::ShieldedOrchard);
+        assert_eq!(Version::try_from("ShieldedOrchard").unwrap(), Version::ShieldedOrchard);
+        assert!(!Version::PubKey.is_shielded());
     }
 
     #[test]

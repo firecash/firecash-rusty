@@ -134,6 +134,8 @@ impl From<Version> for ScriptClass {
             Version::PubKey => ScriptClass::PubKey,
             Version::PubKeyECDSA => ScriptClass::PubKeyECDSA,
             Version::ScriptHash => ScriptClass::ScriptHash,
+            // A shielded (Orchard) address is not a transparent script recipient.
+            Version::ShieldedOrchard => ScriptClass::NonStandard,
         }
     }
 }

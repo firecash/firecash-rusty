@@ -37,12 +37,32 @@ fn pay_to_script_hash(script_hash: &[u8]) -> ScriptVec {
     SmallVec::from_iter([OpBlake2b, OpData32].iter().copied().chain(script_hash.iter().copied()).chain(once(OpEqual)))
 }
 
+/// The "script" for a shielded (Orchard) address: the raw 43-byte Orchard
+/// address itself, carried verbatim. On a shielded-coinbase network the coinbase
+/// output's `script_public_key` is exactly this 43-byte carrier, from which
+/// consensus derives the coinbase note recipient (`build_coinbase_mint` reads the
+/// first 43 bytes). It is not a spendable transparent script: coinbase outputs are
+/// diverted from the UTXO set on a shielded network (PLAN §2.7) and it matches no
+/// other UTXO, so transparent balance/UTXO queries against a shielded address
+/// return empty. It classifies as NonStandard.
+fn pay_to_shielded_address(address_payload: &[u8]) -> ScriptVec {
+    debug_assert_eq!(address_payload.len(), 43);
+    SmallVec::from_iter(address_payload.iter().copied())
+}
+
 /// Creates a new script to pay a transaction output to the specified address.
 pub fn pay_to_address_script(address: &Address) -> ScriptPublicKey {
     let script = match address.version {
         Version::PubKey => pay_to_pub_key(address.payload.as_slice()),
         Version::PubKeyECDSA => pay_to_pub_key_ecdsa(address.payload.as_slice()),
         Version::ScriptHash => pay_to_script_hash(address.payload.as_slice()),
+        // A shielded (Orchard) address has no transparent script. Its script_public_key
+        // is the raw 43-byte Orchard address, the carrier consensus reads to derive the
+        // coinbase note recipient on a shielded network (build_coinbase_mint). It is not
+        // a spendable UTXO — coinbase outputs are diverted from the UTXO set — so a
+        // transparent balance/UTXO query against a shielded address matches nothing.
+        // Wallets branch on `version.is_shielded()` and build a shielded output instead.
+        Version::ShieldedOrchard => pay_to_shielded_address(address.payload.as_slice()),
     };
     ScriptPublicKey::new(ScriptClass::from(address.version).version(), script)
 }
@@ -163,6 +183,21 @@ pub mod test_helpers {
 mod tests {
     use super::*;
     use kaspa_utils::hex::FromHex;
+
+    /// A shielded (Orchard) address maps to its raw 43-byte carrier script — the
+    /// exact bytes consensus reads to derive the coinbase note recipient on a
+    /// shielded network — classified NonStandard (not a spendable transparent
+    /// output; it matches no UTXO, so balance queries return empty).
+    #[test]
+    fn shielded_address_maps_to_raw_carrier_script() {
+        let raw: [u8; 43] = core::array::from_fn(|i| i as u8);
+        let address = Address::new(Prefix::Mainnet, Version::ShieldedOrchard, &raw);
+        let spk = pay_to_address_script(&address);
+        assert_eq!(spk.script(), &raw[..], "shielded spk must carry the raw 43-byte Orchard address");
+        assert_eq!(spk.version(), 0, "carrier uses script version 0");
+        assert_eq!(ScriptClass::from_script(&spk), ScriptClass::NonStandard, "not a standard transparent script");
+        assert_eq!(ScriptClass::from(Version::ShieldedOrchard), ScriptClass::NonStandard);
+    }
 
     #[test]
     fn test_extract_address_and_encode_script() {
