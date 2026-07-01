@@ -22,13 +22,48 @@
 //! nullifier is unique; consensus derives it deterministically from the coinbase
 //! transaction (e.g. its id), which this module treats as an opaque input.
 
+use group::ff::{FromUniformBytes, PrimeField};
 use orchard::{
     note::{ExtractedNoteCommitment, Note, RandomSeed, Rho},
     value::NoteValue,
     Address,
 };
+use pasta_curves::pallas;
 
 use crate::state::{CoinbaseMint, CoinbaseNote};
+
+/// Deterministically derive a **canonical** coinbase note description for
+/// `recipient` from a unique `seed` (e.g. the coinbase transaction id followed by
+/// the reward's index). Consensus and the recipient's wallet both run this to get
+/// the *identical* note, so the note — and its future nullifier — is fixed by
+/// public data and the miner has no freedom to alter it (the value is bound
+/// separately by [`coinbase_note_commitment`]).
+///
+/// `rho` is reduced into the Pallas base field, so it is always a canonical `Rho`;
+/// `rseed` is derived with a domain counter until it yields a valid ZIP-212 seed
+/// for that `rho` (the first candidate succeeds with overwhelming probability).
+pub fn derive_coinbase_note_desc(recipient: [u8; 43], seed: &[u8]) -> CoinbaseNoteDesc {
+    // rho: hash to 64 bytes and reduce into the field for a guaranteed-canonical value.
+    let mut h = blake2b_simd::Params::new().hash_length(64).personal(b"kaspriv_cb_rho01").to_state();
+    h.update(seed);
+    let rho_field = pallas::Base::from_uniform_bytes(h.finalize().as_array());
+    let rho_bytes = rho_field.to_repr();
+    let rho = Option::<Rho>::from(Rho::from_bytes(&rho_bytes)).expect("reduced field element is a canonical rho");
+
+    // rseed: derive with a counter until it is a valid ZIP-212 seed for this rho.
+    let mut ctr: u32 = 0;
+    let rseed = loop {
+        let mut hr = blake2b_simd::Params::new().hash_length(32).personal(b"kaspriv_cb_seed1").to_state();
+        hr.update(seed);
+        hr.update(&ctr.to_le_bytes());
+        let cand: [u8; 32] = hr.finalize().as_bytes().try_into().expect("32-byte digest");
+        if bool::from(RandomSeed::from_bytes(cand, &rho).is_some()) {
+            break cand;
+        }
+        ctr += 1;
+    };
+    CoinbaseNoteDesc { recipient, rho: rho_bytes, rseed }
+}
 
 /// The public description of a coinbase note: everything besides the public value
 /// (the subsidy) needed to recompute its commitment. Carried by the coinbase
@@ -128,6 +163,31 @@ mod tests {
         assert_eq!(a.to_bytes(), b.to_bytes(), "deterministic");
         let c = coinbase_note_commitment(&desc, 101).unwrap();
         assert_ne!(a.to_bytes(), c.to_bytes(), "commitment binds the public value");
+    }
+
+    /// The deterministic derivation yields a canonical, spendable note that every
+    /// node recomputes identically, and different seeds give different notes.
+    #[test]
+    fn derived_coinbase_note_is_canonical_spendable_and_deterministic() {
+        let recipient = test_recipient();
+        let raw = recipient.to_raw_address_bytes();
+        let value = 5_000_000_000u64;
+
+        let desc = derive_coinbase_note_desc(raw, b"coinbase-txid||0");
+        // Deterministic: same recipient + seed -> same description on every node.
+        assert_eq!(derive_coinbase_note_desc(raw, b"coinbase-txid||0"), desc);
+        // A different reward index (seed) gives a different note.
+        assert_ne!(derive_coinbase_note_desc(raw, b"coinbase-txid||1"), desc);
+
+        // The derived (rho, rseed) reconstruct a valid, spendable Orchard note...
+        let rho: Rho = Option::from(Rho::from_bytes(&desc.rho)).unwrap();
+        let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(desc.rseed, &rho)).unwrap();
+        let note: Note = Option::from(Note::from_parts(recipient, NoteValue::from_raw(value), rho, rseed)).unwrap();
+        // ...whose commitment equals the consensus recompute of the same desc+value.
+        assert_eq!(
+            coinbase_note_commitment(&desc, value).unwrap().to_bytes(),
+            ExtractedNoteCommitment::from(note.commitment()).to_bytes()
+        );
     }
 
     #[test]
