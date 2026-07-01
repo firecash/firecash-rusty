@@ -31,8 +31,10 @@ kaspa-muhash.workspace = true
 kaspa-notify.workspace = true
 kaspa-pow.workspace = true
 kaspa-seq-commit.workspace = true
-# `circuit` enables Halo 2 proof verification of shielded bundles (consensus-critical).
-kaspa-shielded-core = { workspace = true, features = ["circuit"] }
+# Halo 2 proof verification is enabled via this crate's `shielded-circuit`
+# feature (default-on), not forced here, so lightweight tooling that links
+# consensus but never validates blocks can opt out of pulling in halo2.
+kaspa-shielded-core = { workspace = true }
 kaspa-smt.workspace = true
 kaspa-smt-store.workspace = true
 kaspa-txscript.workspace = true
@@ -71,9 +73,14 @@ name = "check_scripts"
 harness = false
 
 [features]
+default = ["shielded-circuit"]
 html_reports = []
 devnet-prealloc = ["kaspa-consensus-core/devnet-prealloc"]
 test-smt-pruning-diagnostics = ["kaspa-smt-store/test-smt-pruning-diagnostics"]
+# Halo 2 proof verification of shielded bundles (consensus-critical). On by
+# default so a validating node always verifies proofs; a build with the feature
+# off cannot verify bundles and therefore rejects every shielded transaction.
+shielded-circuit = ["kaspa-shielded-core/circuit"]
 
 [lints]
 workspace = true

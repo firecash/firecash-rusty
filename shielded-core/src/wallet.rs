@@ -182,6 +182,7 @@ mod build {
         pk: &ProvingKey,
         recipient: Address,
         value: u64,
+        network_domain: &[u8; 32],
         tx_context: &[u8],
         mut rng: impl RngCore + CryptoRng,
     ) -> Result<ShieldedBundle, BuildError> {
@@ -196,7 +197,7 @@ mod build {
 
         // Compute the sighash over the effects (proof/sigs excluded), then sign.
         let effects = to_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
-        let msg = sighash(&effects, tx_context);
+        let msg = sighash(&effects, network_domain, tx_context);
         let authorized: Bundle<Authorized, i64> =
             proven.apply_signatures(&mut rng, msg, &[]).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
@@ -223,6 +224,7 @@ mod build {
         merkle_path: MerklePath,
         recipient: Address,
         output_value: u64,
+        network_domain: &[u8; 32],
         tx_context: &[u8],
         mut rng: impl RngCore + CryptoRng,
     ) -> Result<ShieldedBundle, BuildError> {
@@ -239,7 +241,7 @@ mod build {
         let proven = unauth.create_proof(pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
         let effects = to_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
-        let msg = sighash(&effects, tx_context);
+        let msg = sighash(&effects, network_domain, tx_context);
         // The real spend is authorized with the spend authorizing key.
         let ask = SpendAuthorizingKey::from(&keys.sk);
         let authorized: Bundle<Authorized, i64> =
@@ -289,9 +291,11 @@ mod build {
             let merkle_path = MerklePath::from_parts(0, auth_path);
 
             let recipient = ShieldedKeys::from_seed([6u8; 32]).unwrap().address();
-            let wire = build_spend_bundle(&pk, &keys, note, merkle_path, recipient, 8_000, ctx, rand::rngs::OsRng).expect("build");
+            let net = [0x11u8; 32];
+            let wire =
+                build_spend_bundle(&pk, &keys, note, merkle_path, recipient, 8_000, &net, ctx, rand::rngs::OsRng).expect("build");
 
-            let msg = sighash(&wire, ctx);
+            let msg = sighash(&wire, &net, ctx);
             crate::verify::verify_bundle(&wire, &msg).expect("wallet spend bundle must verify");
             // Fee = 10_000 spent − 8_000 output = 2_000 (positive value balance).
             assert_eq!(wire.value_balance, 2_000);
@@ -304,15 +308,21 @@ mod build {
             let pk = ProvingKey::build();
             let keys = ShieldedKeys::from_seed([3u8; 32]).expect("valid seed");
             let ctx = b"kasprivate-wallet-roundtrip";
+            let net = [0x22u8; 32];
 
-            let wire = build_output_only_bundle(&pk, keys.address(), 1_000, ctx, rand::rngs::OsRng).expect("build");
+            let wire = build_output_only_bundle(&pk, keys.address(), 1_000, &net, ctx, rand::rngs::OsRng).expect("build");
 
-            let msg = sighash(&wire, ctx);
+            let msg = sighash(&wire, &net, ctx);
             crate::verify::verify_bundle(&wire, &msg).expect("wallet-built bundle must verify");
 
             // A different tx context must not verify under the wallet's sighash.
-            let other = sighash(&wire, b"different-context");
+            let other = sighash(&wire, &net, b"different-context");
             assert!(crate::verify::verify_bundle(&wire, &other).is_err());
+
+            // A different network domain must not verify either (replay protection):
+            // this bundle signed for network `net` is invalid on another chain.
+            let other_net = sighash(&wire, &[0x23u8; 32], ctx);
+            assert!(crate::verify::verify_bundle(&wire, &other_net).is_err());
         }
 
         /// Send → receive: a bundle built to a recipient's address is recovered by
@@ -321,7 +331,7 @@ mod build {
         fn scan_recovers_sent_note() {
             let pk = ProvingKey::build();
             let recipient = ShieldedKeys::from_seed([2u8; 32]).expect("valid seed");
-            let wire = build_output_only_bundle(&pk, recipient.address(), 4242, b"ctx", rand::rngs::OsRng).expect("build");
+            let wire = build_output_only_bundle(&pk, recipient.address(), 4242, &[0x33u8; 32], b"ctx", rand::rngs::OsRng).expect("build");
 
             let ivk = crate::wallet::ivk_from_seed([2u8; 32]).unwrap();
             let received = crate::wallet::scan_bundle(&ivk, &wire);

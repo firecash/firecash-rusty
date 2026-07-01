@@ -77,14 +77,21 @@ pub enum BundleVerifyError {
 ///
 /// It is a BLAKE2b-256 commitment to the bundle's **effects** — every field
 /// except the proof and the signatures themselves (which sign this digest, so
-/// including them would be circular) — together with the caller-supplied
-/// `tx_context`. Committing to the effects (nullifiers, note commitments, value
-/// commitments, `rk`, ciphertexts, anchor, value balance, flags) binds the
-/// signatures to *this* bundle; `tx_context` (e.g. the transaction's version,
-/// subnetwork, lock-time and gas) binds them to *this* transaction, so a valid
-/// bundle cannot be lifted into a different one.
-pub fn sighash(bundle: &ShieldedBundle, tx_context: &[u8]) -> [u8; 32] {
+/// including them would be circular) — together with the `network_domain` and
+/// the caller-supplied `tx_context`. Committing to the effects (nullifiers, note
+/// commitments, value commitments, `rk`, ciphertexts, anchor, value balance,
+/// flags) binds the signatures to *this* bundle; `tx_context` (e.g. the
+/// transaction's version, subnetwork, lock-time and gas) binds them to *this*
+/// transaction, so a valid bundle cannot be lifted into a different one.
+///
+/// `network_domain` is a 32-byte per-network separator (the genesis hash) that
+/// binds the signatures to *this chain*. Without it a bundle signed on one
+/// network (e.g. testnet) could be replayed verbatim on another (mainnet), since
+/// the anchor and nullifiers could coincide across a shared history. It is a
+/// mandatory, non-defaultable parameter so no caller can silently omit it.
+pub fn sighash(bundle: &ShieldedBundle, network_domain: &[u8; 32], tx_context: &[u8]) -> [u8; 32] {
     let mut h = Params::new().hash_length(32).personal(SIGHASH_PERSONALIZATION).to_state();
+    h.update(network_domain);
     h.update(&[bundle.flags]);
     h.update(&bundle.value_balance.to_le_bytes());
     h.update(&bundle.anchor);
@@ -364,7 +371,8 @@ mod e2e {
         // 3. Compute our sighash over the bundle effects (sigs/proof excluded, so
         //    placeholders are fine here).
         let effects_wire = build_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
-        let msg = sighash(&effects_wire, ctx);
+        let net = [0x42u8; 32];
+        let msg = sighash(&effects_wire, &net, ctx);
 
         // 4. Sign over our sighash (no real spend keys: output-only dummy spends).
         let authorized: Bundle<Authorized, i64> = proven.apply_signatures(&mut rng, msg, &[]).unwrap();
@@ -377,7 +385,7 @@ mod e2e {
             <[u8; 64]>::from(authorized.authorization().binding_signature()),
         );
         // Signing does not change the effects, so the sighash is stable.
-        assert_eq!(sighash(&wire, ctx), msg, "effects unchanged by signing");
+        assert_eq!(sighash(&wire, &net, ctx), msg, "effects unchanged by signing");
 
         // 6. THE validation: the real bundle verifies.
         verify_bundle(&wire, &msg).expect("a valid Orchard bundle must verify");
@@ -436,24 +444,32 @@ mod tests {
         }
     }
 
+    /// A fixed per-network domain (stands in for a genesis hash) for tests.
+    const NET_A: [u8; 32] = [0xA1; 32];
+    const NET_B: [u8; 32] = [0xB2; 32];
+
     #[test]
     fn sighash_is_deterministic_and_effect_sensitive() {
         let b = bundle(2);
-        let s1 = sighash(&b, b"ctx");
-        let s2 = sighash(&b, b"ctx");
+        let s1 = sighash(&b, &NET_A, b"ctx");
+        let s2 = sighash(&b, &NET_A, b"ctx");
         assert_eq!(s1, s2, "sighash is deterministic");
 
         // Changing any effect changes the sighash.
         let mut b2 = b.clone();
         b2.value_balance += 1;
-        assert_ne!(sighash(&b2, b"ctx"), s1);
+        assert_ne!(sighash(&b2, &NET_A, b"ctx"), s1);
 
         let mut b3 = b.clone();
         b3.actions[0].cmx[0] ^= 1;
-        assert_ne!(sighash(&b3, b"ctx"), s1);
+        assert_ne!(sighash(&b3, &NET_A, b"ctx"), s1);
 
         // Changing tx context changes the sighash.
-        assert_ne!(sighash(&b, b"other"), s1);
+        assert_ne!(sighash(&b, &NET_A, b"other"), s1);
+
+        // Changing the network domain changes the sighash (replay protection):
+        // the same bundle+context signed for network A is not valid for network B.
+        assert_ne!(sighash(&b, &NET_B, b"ctx"), s1);
     }
 
     /// The spend-auth signature is excluded from the sighash (it signs it), so
@@ -461,11 +477,11 @@ mod tests {
     #[test]
     fn sighash_excludes_authorizing_data() {
         let b = bundle(1);
-        let s = sighash(&b, b"");
+        let s = sighash(&b, &NET_A, b"");
         let mut b2 = b.clone();
         b2.actions[0].spend_auth_sig[0] ^= 1;
         b2.binding_sig[0] ^= 1;
         b2.proof[0] ^= 1;
-        assert_eq!(sighash(&b2, b""), s, "sighash must not cover proof/signatures");
+        assert_eq!(sighash(&b2, &NET_A, b""), s, "sighash must not cover proof/signatures");
     }
 }

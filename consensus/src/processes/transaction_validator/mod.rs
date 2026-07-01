@@ -27,6 +27,10 @@ pub struct TransactionValidator {
     sig_cache: Cache<SigCacheKey, bool>,
     toccata_activation: ForkActivation,
     mass_per_sig_op: u64,
+    /// Per-network domain separator bound into the shielded-transaction sighash
+    /// (the genesis hash). Prevents a shielded bundle valid on one network from
+    /// being replayed on another (PLAN §3, replay protection).
+    shielded_network_domain: [u8; 32],
 
     pub(crate) mass_calculator: MassCalculator,
 }
@@ -45,6 +49,7 @@ impl TransactionValidator {
         mass_calculator: MassCalculator,
         toccata_activation: ForkActivation,
         mass_per_sig_op: u64,
+        shielded_network_domain: [u8; 32],
     ) -> Self {
         Self {
             max_tx_inputs,
@@ -58,6 +63,7 @@ impl TransactionValidator {
             mass_calculator,
             toccata_activation,
             mass_per_sig_op,
+            shielded_network_domain,
         }
     }
 
@@ -83,6 +89,7 @@ impl TransactionValidator {
             mass_calculator: MassCalculator::new(0, 0, 0),
             toccata_activation: ForkActivation::never(),
             mass_per_sig_op: 0,
+            shielded_network_domain: [0u8; 32],
         }
     }
 }

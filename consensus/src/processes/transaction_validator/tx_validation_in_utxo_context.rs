@@ -27,13 +27,25 @@ const CHECK_SCRIPTS_PARALLELISM_THRESHOLD: usize = 1;
 /// the per-action spend-authorization signatures, and the encoding consensus
 /// rules. The signatures are checked against the kasprivate shielded sighash,
 /// which binds them to this exact bundle and transaction.
-fn verify_shielded_bundle(tx: &Transaction) -> TxResult<()> {
+#[cfg(feature = "shielded-circuit")]
+fn verify_shielded_bundle(tx: &Transaction, network_domain: &[u8; 32]) -> TxResult<()> {
     let bundle = ShieldedBundle::from_bytes(&tx.payload)
         .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
     let ctx = tx.shielded_sighash_context();
-    let sighash = kaspa_shielded_core::verify::sighash(&bundle, &ctx);
+    // The sighash binds the bundle's signatures to this chain (network_domain) and
+    // this transaction (ctx), so a valid bundle cannot be replayed onto another
+    // network or lifted into a different transaction.
+    let sighash = kaspa_shielded_core::verify::sighash(&bundle, network_domain, &ctx);
     kaspa_shielded_core::verify::verify_bundle(&bundle, &sighash)
         .map_err(|e| TxRuleError::InvalidShieldedBundle(format!("{e:?}")))
+}
+
+/// A build without the `shielded-circuit` feature cannot verify Halo 2 proofs, so
+/// it must not accept shielded transactions at all (accepting an unverified
+/// bundle would be a consensus-critical inflation hole). Reject them outright.
+#[cfg(not(feature = "shielded-circuit"))]
+fn verify_shielded_bundle(_tx: &Transaction, _network_domain: &[u8; 32]) -> TxResult<()> {
+    Err(TxRuleError::InvalidShieldedTransaction("node built without shielded-circuit: cannot verify shielded bundles"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,7 +105,7 @@ impl TransactionValidator {
                 // cryptography here, in the same "expensive checks, once" phase as
                 // script verification (skipped on selected-parent replay).
                 if tx.tx().is_shielded() {
-                    verify_shielded_bundle(tx.tx())?;
+                    verify_shielded_bundle(tx.tx(), &self.shielded_network_domain)?;
                 }
             }
             TxValidationFlags::SkipScriptChecks => {}
@@ -395,6 +407,7 @@ mod tests {
             MassCalculator::new(0, 0, 0),
             ForkActivation::always(),
             params.mass_per_sig_op,
+            params.genesis.hash.as_bytes(),
         );
 
         let schnorr_key = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, &[7u8; 32]).unwrap();
