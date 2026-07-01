@@ -154,6 +154,71 @@ impl TestContext {
         assert!(self.consensus.body_tips().iter().copied().any(|h| self.consensus.block_status(h) == BlockStatus::StatusUTXOValid));
         self
     }
+
+    /// Build a template on the current virtual tips and grind a REAL FishHashPlus
+    /// nonce for it (no skip_proof_of_work). At the easiest target this is 1-2
+    /// hashes. Returns the mined, finalized block.
+    fn mine_real_pow_block(&mut self) -> Block {
+        self.simulated_time += self.consensus.params().target_time_per_block();
+        let mut t = self
+            .consensus
+            .build_block_template(self.miner_data.clone(), Box::new(OnetimeTxSelector::new(Default::default())), TemplateBuildMode::Standard)
+            .unwrap();
+        t.block.header.timestamp = self.simulated_time;
+        let state = kaspa_pow::State::new(&t.block.header);
+        let mut nonce = 0u64;
+        while !state.check_pow(nonce).0 {
+            nonce += 1;
+        }
+        t.block.header.nonce = nonce;
+        t.block.header.finalize();
+        t.block.to_immutable()
+    }
+}
+
+/// LIVE real-PoW proof: mine a chain of blocks whose PoW is the actual
+/// FishHashPlus (KarlsenHashV2) — no `skip_proof_of_work` — while paying a
+/// shielded (Orchard) coinbase. Every block's header goes through the real
+/// `check_pow` path in the pipeline, so reaching UTXOValid means the fishhash
+/// PoW verifies on real blocks AND the shielded coinbase mints into the pool.
+/// This is the first test that exercises FishHashPlus in consensus for real; all
+/// others skip PoW. Uses the easiest target (0x207fffff) so CPU grinding is ~1-2
+/// hashes; run in release so the light cache builds in ~3s.
+#[tokio::test]
+async fn real_fishhash_pow_mines_shielded_chain_live() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    // Real PoW (skip_proof_of_work stays false) but trivial difficulty seeded from
+    // an easy genesis target, so a nonce is found almost immediately.
+    let config = ConfigBuilder::new(params).edit_consensus_params(|p| p.genesis.bits = 0x207fffff).build();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let recipient = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("valid orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)), vec![]);
+
+    let mut tips = BlockHashSet::from_iter([config.genesis.hash]);
+    for _ in 0..4 {
+        let block = ctx.mine_real_pow_block();
+        assert_eq!(tips, BlockHashSet::from_iter(block.header.direct_parents().iter().copied()), "extends the single chain");
+        tips = BlockHashSet::from_iter([block.header.hash]);
+        let status = ctx.consensus.validate_and_insert_block(block).virtual_state_task.await.unwrap();
+        assert!(status.is_utxo_valid_or_pending(), "real-PoW shielded block must be accepted");
+    }
+
+    // The chain tip is UTXO-valid: real FishHashPlus verified every header and the
+    // shielded coinbase advanced the pool anchor past the empty tree.
+    ctx.assert_valid_utxo_tip();
+    let empty_anchor = kaspa_shielded_core::Anchor::empty_tree().to_bytes();
+    let vp = ctx.consensus.virtual_processor();
+    let advanced = ctx
+        .consensus
+        .body_tips()
+        .iter()
+        .copied()
+        .filter(|h| ctx.consensus.block_status(*h) == BlockStatus::StatusUTXOValid)
+        .filter_map(|h| vp.shielded_anchor_at(h).ok())
+        .any(|anchor| anchor != empty_anchor);
+    assert!(advanced, "shielded coinbase mined under real FishHashPlus must advance the anchor");
 }
 
 #[tokio::test]
