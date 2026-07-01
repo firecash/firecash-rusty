@@ -689,7 +689,10 @@ pub const MAINNET_PARAMS: Params = Params {
     min_difficulty_window_size: MIN_DIFFICULTY_WINDOW_SIZE,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
-    shielded_coinbase: false,
+    // kasprivate is private-by-default: the mainnet coinbase creates no transparent
+    // outputs — the reward enters the mandatory shielded pool as coinbase notes (PLAN §2.7).
+    // The miner's Orchard address is carried in the reward's 43-byte script_public_key.
+    shielded_coinbase: true,
 
     // Limit the cost of calculating compute/transient/storage masses
     max_tx_inputs: 1000,

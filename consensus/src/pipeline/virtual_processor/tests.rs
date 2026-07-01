@@ -8,13 +8,23 @@ use kaspa_consensus_core::{
     coinbase::MinerData,
     config::{
         ConfigBuilder,
-        params::{ForkActivation, MAINNET_PARAMS},
+        params::{ForkActivation, MAINNET_PARAMS, Params},
     },
     constants::{BLOCK_VERSION, TOCCATA_BLOCK_VERSION},
     tx::{ScriptPublicKey, ScriptVec, Transaction},
 };
 use kaspa_hashes::Hash;
 use std::{collections::VecDeque, thread::JoinHandle};
+
+/// Mainnet params with the shielded coinbase disabled. Production mainnet is
+/// shielded-by-default (a transparent coinbase there fails the shielded mint), so
+/// consensus tests that mine ordinary transparent coinbases to exercise unrelated
+/// behavior (ghostdag / pruning / utxo / block templates) opt out explicitly.
+fn transparent_mainnet() -> Params {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = false;
+    params
+}
 
 struct OnetimeTxSelector {
     txs: Option<Vec<Transaction>>,
@@ -261,7 +271,7 @@ async fn diag_shielded_coinbase_note_structure() {
 
 #[tokio::test]
 async fn template_mining_sanity_test() {
-    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+    let config = ConfigBuilder::new(transparent_mainnet()).skip_proof_of_work().build();
     let mut ctx = TestContext::new(TestConsensus::new(&config));
     let rounds = 10;
     let width = 3;
@@ -411,7 +421,7 @@ async fn real_shielded_spend_through_mined_block() {
 #[tokio::test]
 async fn block_template_version_changes_to_v2_upon_activation() {
     let activation = MAINNET_PARAMS.genesis.daa_score + 10;
-    let config = ConfigBuilder::new(MAINNET_PARAMS)
+    let config = ConfigBuilder::new(transparent_mainnet())
         .skip_proof_of_work()
         .edit_consensus_params(|p| p.toccata_activation = ForkActivation::new(activation))
         .build();
@@ -445,7 +455,7 @@ async fn block_template_version_changes_to_v2_upon_activation() {
 
 #[tokio::test]
 async fn antichain_merge_test() {
-    let config = ConfigBuilder::new(MAINNET_PARAMS)
+    let config = ConfigBuilder::new(transparent_mainnet())
         .skip_proof_of_work()
         .edit_consensus_params(|p| {
             p.max_block_parents = 4;
@@ -473,7 +483,7 @@ async fn antichain_merge_test() {
 #[tokio::test]
 async fn basic_utxo_disqualified_test() {
     kaspa_core::log::try_init_logger("info");
-    let config = ConfigBuilder::new(MAINNET_PARAMS)
+    let config = ConfigBuilder::new(transparent_mainnet())
         .skip_proof_of_work()
         .edit_consensus_params(|p| {
             p.max_block_parents = 4;
@@ -505,7 +515,7 @@ async fn double_search_disqualified_test() {
     // TODO: add non-coinbase transactions and concurrency in order to complicate the test
 
     kaspa_core::log::try_init_logger("info");
-    let config = ConfigBuilder::new(MAINNET_PARAMS)
+    let config = ConfigBuilder::new(transparent_mainnet())
         .skip_proof_of_work()
         .edit_consensus_params(|p| {
             p.max_block_parents = 4;
@@ -579,7 +589,7 @@ fn new_miner_data() -> MinerData {
 }
 
 fn inactivity_shortcut_config() -> kaspa_consensus_core::config::Config {
-    ConfigBuilder::new(MAINNET_PARAMS)
+    ConfigBuilder::new(transparent_mainnet())
         .skip_proof_of_work()
         .edit_consensus_params(|p| {
             p.finality_depth = 2;
