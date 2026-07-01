@@ -263,6 +263,63 @@ pub mod build {
         ))
     }
 
+    /// Build a **payment** shielded transaction with change: spend `note`, pay
+    /// `amount` to `recipient`, return the remainder minus `fee` to `change_addr`
+    /// (the sender's own address), and leave `fee` as the public `value_balance`
+    /// collected by the miner. This is the real wallet spend shape — unlike
+    /// [`build_spend_bundle`], the sender keeps the change instead of burning it
+    /// into an oversized fee.
+    ///
+    /// Requires `note.value == amount + change + fee`; the caller (the wallet
+    /// facade) sizes `change` from the selected note. Proven and signed with the
+    /// sender's spend authority over the sighash.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_payment_bundle(
+        pk: &ProvingKey,
+        keys: &ShieldedKeys,
+        note: Note,
+        merkle_path: MerklePath,
+        recipient: Address,
+        amount: u64,
+        change_addr: Address,
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+        mut rng: impl RngCore + CryptoRng,
+    ) -> Result<ShieldedBundle, BuildError> {
+        let change = note.value().inner().checked_sub(amount).and_then(|v| v.checked_sub(fee)).ok_or(BuildError::Empty)?;
+
+        let anchor = merkle_path.root(ExtractedNoteCommitment::from(note.commitment()));
+        let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+        builder.add_spend(keys.fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        builder
+            .add_output(None, recipient, NoteValue::from_raw(amount), [0u8; 512])
+            .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        // The change output back to the sender keeps the remainder shielded. Even a
+        // zero-value change output is a real note, preserving a uniform 2-output
+        // shape (better for privacy than a variable output count).
+        builder
+            .add_output(None, change_addr, NoteValue::from_raw(change), [0u8; 512])
+            .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+
+        let (unauth, _meta) =
+            builder.build::<i64>(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
+        let proven = unauth.create_proof(pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+
+        let effects = to_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
+        let msg = sighash(&effects, network_domain, tx_context);
+        let ask = SpendAuthorizingKey::from(&keys.sk);
+        let authorized: Bundle<Authorized, i64> =
+            proven.apply_signatures(&mut rng, msg, &[ask]).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+
+        Ok(to_wire(
+            &authorized,
+            |a| <[u8; 64]>::from(a.authorization()),
+            authorized.authorization().proof().as_ref().to_vec(),
+            <[u8; 64]>::from(authorized.authorization().binding_signature()),
+        ))
+    }
+
     /// End-to-end wallet helper: build a real, proven spend of a coinbase note
     /// that is the SINGLE leaf (position 0) of the finalized global tree, and
     /// return the shielded-bundle wire bytes ready to drop into a version-2
@@ -414,4 +471,4 @@ pub mod build {
 }
 
 #[cfg(feature = "circuit")]
-pub use build::{build_output_only_bundle, build_spend_bundle, to_wire, BuildError, ShieldedKeys};
+pub use build::{build_output_only_bundle, build_payment_bundle, build_spend_bundle, to_wire, BuildError, ShieldedKeys};

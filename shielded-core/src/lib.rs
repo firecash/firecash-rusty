@@ -17,6 +17,7 @@
 //! `incrementalmerkletree` and will pin them to audited commits before launch
 //! (PLAN §5, non-negotiable #4).
 
+pub mod account;
 pub mod bundle;
 pub mod coinbase;
 pub mod nullifier;
@@ -26,6 +27,9 @@ pub mod turnstile;
 pub mod verify;
 pub mod wallet;
 pub mod walletdb;
+
+// The human-facing wallet facade (keys -> kasprivate: address -> scan -> pay).
+pub use account::{orchard_recipient_bytes, PaymentError, ShieldedAccount};
 
 // Re-export the Orchard primitives the consensus layer builds on, so there is a
 // single canonical source for these types across the workspace.

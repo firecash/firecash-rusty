@@ -41,3 +41,7 @@ rand = { workspace = true, optional = true }
 # Note decryption for wallet scanning (the receive side). Must match the version
 # Orchard links so the OrchardDomain types agree.
 zcash_note_encryption = "0.4"
+# Human-facing shielded (Orchard) address encoding for the wallet facade
+# (Version::ShieldedOrchard, kasprivate: HRP). kaspa-addresses is a leaf crate, so
+# no dependency cycle with the consensus layer that depends on shielded-core.
+kaspa-addresses.workspace = true
