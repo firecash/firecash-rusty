@@ -52,6 +52,14 @@ pub mod scan {
         Some(FullViewingKey::from(&sk).to_ivk(Scope::External))
     }
 
+    /// Derive the raw 43-byte external Orchard address for a wallet seed — the
+    /// bytes a miner puts in a shielded-coinbase reward's `script_public_key` so
+    /// consensus pays the block reward to this wallet as a coinbase note (§2.7).
+    pub fn address_bytes_from_seed(seed: [u8; 32]) -> Option<[u8; 43]> {
+        let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
+        Some(FullViewingKey::from(&sk).address_at(0u32, Scope::External).to_raw_address_bytes())
+    }
+
     /// Reconstruct an Orchard action from its wire form (auth = its spend-auth
     /// signature). Returns `None` if any field is malformed (such an action can
     /// carry no note for us). This mirrors the verifier's reconstruction and thus
@@ -86,7 +94,7 @@ pub mod scan {
     }
 }
 
-pub use scan::{ivk_from_seed, scan_bundle, ReceivedNote};
+pub use scan::{address_bytes_from_seed, ivk_from_seed, scan_bundle, ReceivedNote};
 
 #[cfg(feature = "circuit")]
 pub mod build {

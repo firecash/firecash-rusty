@@ -173,6 +173,36 @@ async fn template_mining_sanity_test() {
     }
 }
 
+/// LIVE proof of the shielded coinbase (PLAN §2.7): with `shielded_coinbase`
+/// enabled, mine a row of real blocks whose coinbase pays a shielded (Orchard)
+/// address, run them through the real virtual processor, and require the tip to
+/// be UTXO-valid. Reaching UTXOValid means every block's coinbase reward was
+/// successfully turned into coinbase notes and minted into the shielded pool
+/// (a malformed recipient or a turnstile violation would yield InvalidShieldedState
+/// and the block would not be UTXO-valid). No transparent coinbase value is created.
+#[tokio::test]
+async fn shielded_coinbase_mints_into_the_pool_live() {
+    // kasprivate main params with the shielded coinbase turned on.
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    // The miner is paid in the shielded pool: its reward "script_public_key" is a
+    // real 43-byte Orchard address (what a kasprivate miner reports).
+    let recipient = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("valid orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)), vec![]);
+
+    for _ in 0..5 {
+        ctx.build_block_template_row(0..3)
+            .assert_row_parents()
+            .validate_and_insert_row()
+            .await
+            .assert_tips()
+            .assert_valid_utxo_tip();
+    }
+}
+
 #[tokio::test]
 async fn block_template_version_changes_to_v2_upon_activation() {
     let activation = MAINNET_PARAMS.genesis.daa_score + 10;
