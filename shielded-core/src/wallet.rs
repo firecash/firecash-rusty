@@ -89,7 +89,7 @@ pub mod scan {
 pub use scan::{ivk_from_seed, scan_bundle, ReceivedNote};
 
 #[cfg(feature = "circuit")]
-mod build {
+pub mod build {
     use crate::bundle::{ActionWire, ShieldedBundle};
     use crate::verify::sighash;
     use orchard::{

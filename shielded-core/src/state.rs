@@ -473,3 +473,95 @@ mod tests {
         assert_eq!(st.tree.size(), 1);
     }
 }
+
+/// End-to-end value loop with **real cryptography** (circuit feature): a coinbase
+/// note enters the pool, a real wallet-built + proven bundle spends it, the
+/// consensus verifier accepts it, and the §2.4 state transition applies it. This
+/// exercises coinbase issuance → tree/anchor → real proof → verify → nullifier /
+/// turnstile / tree in one flow — the make-or-break economic loop (PLAN §2.4/2.6/2.7).
+#[cfg(all(test, feature = "circuit"))]
+mod circuit_e2e {
+    use super::*;
+    use crate::coinbase::{coinbase_note_commitment, CoinbaseNoteDesc};
+    use crate::verify::{sighash, verify_bundle};
+    use crate::wallet::build::{build_spend_bundle, ShieldedKeys};
+    use incrementalmerkletree::{Hashable, Level};
+    use orchard::{
+        circuit::ProvingKey,
+        note::{Note, RandomSeed, Rho},
+        tree::{MerkleHashOrchard, MerklePath},
+        value::NoteValue,
+    };
+
+    fn canon(seed: u8) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        b
+    }
+
+    #[test]
+    fn coinbase_note_is_spent_end_to_end() {
+        let pk = ProvingKey::build();
+        let keys = ShieldedKeys::from_seed([5u8; 32]).unwrap();
+        let net = [0x77u8; 32];
+
+        // --- Block 1: a coinbase note worth 10_000 enters the pool for the wallet. ---
+        let value = 10_000u64;
+        let rho = Option::<Rho>::from(Rho::from_bytes(&canon(1))).unwrap();
+        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(2), &rho)).unwrap();
+        let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(value), rho, rseed)).unwrap();
+
+        // Consensus recomputes the coinbase note commitment from its public
+        // description + value, and it must equal the wallet's own note commitment.
+        let desc = CoinbaseNoteDesc { recipient: keys.address().to_raw_address_bytes(), rho: canon(1), rseed: canon(2) };
+        let cmx = coinbase_note_commitment(&desc, value).unwrap();
+        assert_eq!(
+            cmx.to_bytes(),
+            ExtractedNoteCommitment::from(note.commitment()).to_bytes(),
+            "consensus recompute == wallet note commitment"
+        );
+
+        let mut st = ShieldedState::new();
+        st.apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value, commitment: cmx }])), &[]).unwrap();
+        let anchor1 = st.anchor();
+
+        // The coinbase note is leaf 0; its authentication path is the empty-subtree
+        // roots, which must root to the manager's anchor (frontier root ==
+        // authentication-path root — the linchpin that lets wallets prove membership).
+        let auth_path: [MerkleHashOrchard; 32] =
+            core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+        let merkle_path = MerklePath::from_parts(0, auth_path);
+        assert_eq!(merkle_path.root(cmx).to_bytes(), anchor1.to_bytes(), "single-leaf frontier root == path root");
+
+        // --- Block 2: the wallet spends the coinbase note (real proof). ---
+        let recipient = ShieldedKeys::from_seed([6u8; 32]).unwrap().address();
+        let output_value = 8_000u64;
+        let ctx = b"e2e";
+        let wire =
+            build_spend_bundle(&pk, &keys, note, merkle_path, recipient, output_value, &net, ctx, rand::rngs::OsRng).unwrap();
+
+        // The consensus verifier accepts the real bundle, and it spends against the
+        // coinbase anchor with the expected public fee.
+        let msg = sighash(&wire, &net, ctx);
+        verify_bundle(&wire, &msg).expect("real spend bundle must verify");
+        assert_eq!(wire.value_balance, (value - output_value) as i64, "fee = 2_000");
+        assert_eq!(wire.anchor, anchor1.to_bytes(), "spends against the coinbase anchor");
+
+        // The §2.4 transition applies it: nullifier inserted, fee collected, tree advanced.
+        let stx = ShieldedTx::from_bundle(&wire).unwrap();
+        assert_eq!(stx.fee, 2_000);
+        let out2 = st.apply_chain_block(None, &[stx.clone()]).unwrap();
+        assert_eq!(out2.accepted, vec![0], "the real spend is accepted");
+
+        // Turnstile: minted 10_000 (coinbase), collected 2_000 fee -> pool 8_000.
+        // The 2_000 fee left the pool (to be re-minted in a later coinbase); the
+        // 8_000 transferred note remains shielded, so the pool equals output_value.
+        let fee = value - output_value;
+        assert_eq!(st.supply.pool_value().unwrap(), (value - fee) as u128);
+        assert_eq!(st.supply.pool_value().unwrap(), output_value as u128);
+
+        // Double-spend guard: replaying the same real nullifier is dropped.
+        let out3 = st.apply_chain_block(None, &[stx]).unwrap();
+        assert!(out3.accepted.is_empty(), "reused nullifier -> dropped");
+    }
+}
