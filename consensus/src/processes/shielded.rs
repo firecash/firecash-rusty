@@ -409,6 +409,50 @@ mod tests {
         assert!(mgr.nullifiers().contains(&nf(1)).unwrap(), "rejoined block's nullifiers restored");
     }
 
+    /// Reorg with a shielded COINBASE: a coinbase mint on the abandoned branch
+    /// must not leak into the competing branch's pool or anchor, and abandoning
+    /// the branch must revert its nullifiers so the competing branch can re-spend
+    /// the note. Because per-block frontier/supply snapshots are keyed by block
+    /// hash, the competing branch loads its own selected-parent's state and never
+    /// inherits the abandoned coinbase; only the global nullifier set is shared
+    /// and is reverted via the per-block diff.
+    #[test]
+    fn reorg_isolates_and_reverts_shielded_coinbase() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager_with_finalized_genesis(&db);
+        let (genesis, branch_a, branch_b) = (h(0), h(1), h(2));
+
+        // Branch A (from genesis): coinbase mints 100, a tx spends nf(1), fee 5.
+        let ca = commit_block(&mgr, &db, branch_a, genesis, Some(coinbase(100, 10)), vec![stx(&[1], &[100], 5)]);
+        assert_eq!(ca.outcome.accepted, vec![0]);
+        assert!(mgr.nullifiers().contains(&nf(1)).unwrap());
+        let pool_a = ca.supply_totals.cumulative_coinbase - ca.supply_totals.cumulative_fees;
+        assert_eq!(pool_a, 100 - 5, "branch A pool = subsidy - fee");
+        let anchor_a = ca.anchor();
+
+        // Reorg abandons branch A: revert its nullifiers from the global set.
+        let mut rb = WriteBatch::default();
+        mgr.revert_nullifiers_from_store(&mut rb, branch_a).unwrap();
+        db.write(rb).unwrap();
+        assert!(!mgr.nullifiers().contains(&nf(1)).unwrap(), "abandoned coinbase-block's nullifier reverted");
+
+        // Branch B (also from genesis): a DIFFERENT coinbase mints 100, and a tx
+        // re-spends the SAME nf(1) (now allowed) with fee 7. compute() loads the
+        // genesis (empty) snapshot as its parent — branch A's coinbase mint of 100
+        // is NOT present.
+        let cb = commit_block(&mgr, &db, branch_b, genesis, Some(coinbase(100, 20)), vec![stx(&[1], &[200], 7)]);
+        assert_eq!(cb.outcome.accepted, vec![0], "reverted note re-spendable on the competing branch");
+
+        // Isolation: branch B's pool is its own subsidy - fee, NOT A's mint too
+        // (would be 200 - 12 if A had leaked). The abandoned coinbase carried no
+        // value across the reorg.
+        let pool_b = cb.supply_totals.cumulative_coinbase - cb.supply_totals.cumulative_fees;
+        assert_eq!(pool_b, 100 - 7, "branch B pool excludes the abandoned branch's coinbase");
+
+        // Distinct branches, distinct anchors: A's coinbase note never entered B's tree.
+        assert_ne!(cb.anchor(), anchor_a, "competing branch has an independent anchor");
+    }
+
     /// Spending more than was ever minted is rejected (turnstile) at compute time.
     #[test]
     fn rejects_overspend() {
