@@ -20,6 +20,7 @@ use kaspa_consensus_core::{
 };
 use kaspa_core::time::unix_now;
 use kaspa_hashes::{Hash, ZERO_HASH};
+use kaspa_shielded_core::bundle::ShieldedBundle;
 
 use parking_lot::RwLock;
 use std::{collections::HashMap, sync::Arc};
@@ -136,10 +137,24 @@ impl ConsensusApi for ConsensusMock {
         if has_missing_outpoints {
             return Err(TxRuleError::MissingTxOutpoints);
         }
+        mutable_tx.tx.set_storage_mass(self.calculate_transaction_contextual_masses(mutable_tx).unwrap().storage_mass);
+
+        // A shielded transaction has no transparent value: its fee is the bundle's
+        // public value balance (value leaving the shielded pool), mirroring the
+        // real consensus rule (tx_validation_in_utxo_context). This keeps the mock
+        // faithful for the mempool/template integration path.
+        if mutable_tx.tx.is_shielded() {
+            if mutable_tx.calculated_fee.is_none() {
+                let bundle = ShieldedBundle::from_bytes(&mutable_tx.tx.payload).map_err(|_| TxRuleError::MissingTxOutpoints)?;
+                let fee = u64::try_from(bundle.value_balance).map_err(|_| TxRuleError::MissingTxOutpoints)?;
+                mutable_tx.calculated_fee = Some(fee);
+            }
+            return Ok(());
+        }
+
         // At this point we know all UTXO entries are populated, so we can safely calculate the fee
         let total_in: u64 = mutable_tx.entries.iter().map(|x| x.as_ref().unwrap().amount).sum();
         let total_out: u64 = mutable_tx.tx.outputs.iter().map(|x| x.value).sum();
-        mutable_tx.tx.set_storage_mass(self.calculate_transaction_contextual_masses(mutable_tx).unwrap().storage_mass);
 
         if mutable_tx.calculated_fee.is_none() {
             let calculated_fee = total_in - total_out;

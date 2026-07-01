@@ -1544,6 +1544,96 @@ mod tests {
         MinerData::new(script, vec![])
     }
 
+    fn shielded_nf(seed: u8) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        b
+    }
+
+    /// A shielded transaction (v2, empty transparent inputs/outputs, Orchard
+    /// bundle carried in the payload) that spends `nullifiers` and pays `fee` as
+    /// its public value balance. Only the fields the mempool/template path reads
+    /// are populated — the mock verifier does not check the circuit, so no real
+    /// proof is needed here (the live-proof path is covered elsewhere).
+    fn shielded_mutable_tx(nullifiers: &[[u8; 32]], fee: u64) -> MutableTransaction {
+        use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+        use kaspa_shielded_core::bundle::{sizes, ActionWire, ShieldedBundle};
+        let actions = nullifiers
+            .iter()
+            .map(|&nullifier| ActionWire {
+                nullifier,
+                rk: [0u8; sizes::FIELD],
+                cmx: [0u8; sizes::FIELD],
+                cv_net: [0u8; sizes::FIELD],
+                ephemeral_key: [0u8; sizes::FIELD],
+                enc_ciphertext: [0u8; sizes::ENC_CIPHERTEXT],
+                out_ciphertext: [0u8; sizes::OUT_CIPHERTEXT],
+                spend_auth_sig: [0u8; sizes::SIG],
+            })
+            .collect();
+        let bundle = ShieldedBundle {
+            actions,
+            flags: 0b11,
+            value_balance: fee as i64,
+            anchor: [0u8; sizes::FIELD],
+            proof: vec![],
+            binding_sig: [0u8; sizes::SIG],
+        };
+        let tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, bundle.to_bytes());
+        MutableTransaction::from_tx(tx)
+    }
+
+    /// Full mempool→template integration for a shielded transaction (the RPC
+    /// submit path minus the network layer): a shielded tx is admitted to the
+    /// mempool, appears in a built block template, and a second shielded tx
+    /// spending the same note is rejected as a nullifier double-spend — exercising
+    /// the mempool, standard checks, nullifier double-spend detection, pool
+    /// insertion and block-template selection on a transparent-less transaction.
+    #[test]
+    fn test_shielded_transaction_through_mempool_and_template() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let mining_manager = default_mining_manager();
+
+        // Submit a shielded tx as if received over RPC (High priority, no orphan, no RBF).
+        let tx = shielded_mutable_tx(&[shielded_nf(1)], 200_000);
+        let tx_id = tx.id();
+        let result = mining_manager.validate_and_insert_mutable_transaction(
+            consensus.as_ref(),
+            tx,
+            Priority::High,
+            Orphan::Forbidden,
+            RbfPolicy::Forbidden,
+        );
+        assert!(result.is_ok(), "shielded transaction should be accepted into the mempool but got {result:?}");
+
+        // It is present in the mempool.
+        let (pool_txs, _) = mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly);
+        assert!(contained_by(tx_id, &pool_txs), "shielded transaction should be present in the mempool");
+
+        // A built block template includes it (index 0 is the coinbase).
+        let miner_data = get_miner_data(Prefix::Testnet);
+        let template = mining_manager.get_block_template(consensus.as_ref(), &miner_data).expect("failed to build block template");
+        assert!(
+            template.block.transactions.iter().skip(1).any(|t| t.id() == tx_id),
+            "shielded transaction should be included in the block template"
+        );
+
+        // A second shielded transaction spending the same note (nullifier) is a
+        // shielded double-spend and must be rejected at the manager level.
+        let conflict = shielded_mutable_tx(&[shielded_nf(1)], 300_000);
+        let conflict_result = mining_manager.validate_and_insert_mutable_transaction(
+            consensus.as_ref(),
+            conflict,
+            Priority::High,
+            Orphan::Forbidden,
+            RbfPolicy::Forbidden,
+        );
+        assert!(
+            matches!(conflict_result, Err(MiningManagerError::MempoolError(RuleError::RejectDoubleSpendNullifierInMempool(_, owner))) if owner == tx_id),
+            "a shielded tx reusing a note already in the mempool must be rejected but got {conflict_result:?}"
+        );
+    }
+
     #[allow(dead_code)]
     fn all_priority_orphan_combinations() -> impl Iterator<Item = (Priority, Orphan)> {
         [Priority::Low, Priority::High]
