@@ -208,7 +208,7 @@ impl PruningProofManager {
                 continue;
             }
 
-            let block_level = calc_block_level(header, self.max_block_level);
+            let block_level = calc_block_level(header, self.max_block_level, self.skip_proof_of_work);
             self.headers_store.insert(header.hash, header.clone(), block_level).unwrap();
         }
 

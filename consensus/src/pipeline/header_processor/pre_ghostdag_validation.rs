@@ -100,7 +100,7 @@ impl HeaderProcessor {
     }
 
     fn check_pow_and_calc_block_level(&self, header: &Header) -> BlockProcessResult<BlockLevel> {
-        let state = kaspa_pow::State::new(header);
+        let state = if self.skip_proof_of_work { kaspa_pow::State::new_skip_pow(header) } else { kaspa_pow::State::new(header) };
         let (passed, pow) = state.check_pow(header.nonce);
         if passed || self.skip_proof_of_work { Ok(calc_level_from_pow(pow, self.max_block_level)) } else { Err(RuleError::InvalidPoW) }
     }

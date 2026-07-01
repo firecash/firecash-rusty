@@ -71,7 +71,7 @@ impl PruningProofManager {
         for tb in trusted_set.iter() {
             trusted_gd_map.insert(tb.block.hash(), tb.ghostdag.clone().into());
             trusted_header_map.insert(tb.block.hash(), tb.block.header.clone());
-            let tb_block_level = calc_block_level(&tb.block.header, self.max_block_level);
+            let tb_block_level = calc_block_level(&tb.block.header, self.max_block_level, self.skip_proof_of_work);
 
             (0..=tb_block_level).for_each(|current_proof_level| {
                 // If this block was in the original proof, ignore it
@@ -197,7 +197,7 @@ impl PruningProofManager {
         for header in proof.iter().flatten().chain(header_only_chain_segment.iter()).cloned() {
             if let Vacant(e) = dag.entry(header.hash) {
                 // pow passing has already been checked during validation
-                let block_level = calc_block_level(&header, self.max_block_level);
+                let block_level = calc_block_level(&header, self.max_block_level, self.skip_proof_of_work);
                 self.headers_store.insert(header.hash, header.clone(), block_level).idempotent().unwrap();
 
                 let mut parents = BlockHashSet::with_capacity(header.direct_parents().len() * 2);

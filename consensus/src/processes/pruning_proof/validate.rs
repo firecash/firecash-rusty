@@ -165,7 +165,7 @@ impl ProofContext {
         }
 
         let proof_pp_header = proof[0].last().expect("checked if empty").clone();
-        let proof_pp_level = calc_block_level(&proof_pp_header, ppm.max_block_level);
+        let proof_pp_level = calc_block_level(&proof_pp_header, ppm.max_block_level, ppm.skip_proof_of_work);
         let proof_pp = proof_pp_header.hash;
 
         //
@@ -186,7 +186,7 @@ impl ProofContext {
             let mut selected_tip =
                 proof[level_idx].first().map(|header| header.hash).ok_or(PruningImportError::PruningProofNotEnoughHeaders)?;
             for (i, header) in proof[level_idx].iter().enumerate() {
-                let (header_level, pow_passes) = calc_block_level_check_pow(header, ppm.max_block_level);
+                let (header_level, pow_passes) = calc_block_level_check_pow(header, ppm.max_block_level, ppm.skip_proof_of_work);
                 if header_level < level {
                     return Err(PruningImportError::PruningProofWrongBlockLevel(header.hash, header_level, level));
                 }

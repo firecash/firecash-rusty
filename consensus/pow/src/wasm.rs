@@ -1,10 +1,9 @@
-use crate::matrix::Matrix;
 use js_sys::BigInt;
 use kaspa_consensus_client::Header;
 use kaspa_consensus_client::HeaderT;
 use kaspa_consensus_core::hashing;
 use kaspa_hashes::Hash;
-use kaspa_hashes::PowHash;
+use kaspa_hashes::PowB3Hash;
 use kaspa_math::Uint256;
 use kaspa_utils::hex::FromHex;
 use kaspa_utils::hex::ToHex;
@@ -44,10 +43,12 @@ impl PoW {
         // Zero out the time and nonce.
         let pre_pow_hash = hashing::header::hash_override_nonce_time(header, 0, 0);
         // PRE_POW_HASH || TIME || 32 zero byte padding || NONCE
-        let hasher = PowHash::new(pre_pow_hash, timestamp.unwrap_or(header.timestamp));
-        let matrix = Matrix::generate(pre_pow_hash);
+        let hasher = PowB3Hash::new(pre_pow_hash, timestamp.unwrap_or(header.timestamp));
+        // Verification-side helper: uses the shared light context to run the real
+        // FishHashPlus PoW. (A browser miner would supply its own full dataset.)
+        let fish_context = Some(crate::light_context());
 
-        Ok(Self { inner: crate::State { matrix, target, hasher }, pre_pow_hash })
+        Ok(Self { inner: crate::State { target, hasher, fish_context }, pre_pow_hash })
     }
 
     /// The target based on the provided bits.

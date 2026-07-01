@@ -25,9 +25,12 @@ faster-hex.workspace = true
 js-sys = { workspace = true, optional = true }
 kaspa-utils = { workspace = true, default-features = false }
 keccak = { workspace = true, optional = true }
+log.workspace = true
+num_cpus.workspace = true
 serde.workspace = true
 sha2.workspace = true
 sha2-const-stable.workspace = true
+tiny-keccak.workspace = true
 wasm-bindgen.workspace = true
 workflow-wasm = { workspace = true, optional = true }
 zerocopy = { workspace = true, optional = true }

@@ -228,6 +228,7 @@ md-5 = "0.10.6"
 num = "0.4.1"
 num_cpus = "1.16.0"
 num-traits = "0.2.17"
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
 once_cell = { version = "1.18.0", default-features = false }
 pad = "0.1.6"
 parking_lot = "0.12.1"

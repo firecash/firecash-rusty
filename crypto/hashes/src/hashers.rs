@@ -19,6 +19,8 @@ pub trait Hasher: HasherBase + Clone + Default {
 //  struct PowHash => `cSHAKE256("ProofOfWorkHash")
 //  struct KHeavyHash => `cSHAKE256("HeavyHash")
 pub use crate::pow_hashers::{KHeavyHash, PowHash};
+#[cfg(feature = "std")]
+pub use crate::pow_hashers::{calculate_dataset_item_1024, FishHashContext, Hash1024, HashData, PowB3Hash, PowFishHash};
 blake2b_hasher! {
     struct TransactionHash => b"TransactionHash",
     struct TransactionID => b"TransactionID",
