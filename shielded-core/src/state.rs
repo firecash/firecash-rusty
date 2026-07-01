@@ -377,6 +377,72 @@ mod tests {
         assert_eq!(st.tree.size(), 2);
     }
 
+    /// THE fee-reminting property (PLAN §2.7 turnstile), across a chain of
+    /// blocks: a shielded transaction's fee `value_balance` LEAVES the pool when
+    /// its block is accepted, and is RE-MINTED into the coinbase note of a later
+    /// block (whose value = that block's subsidy + the fees it merges). Over the
+    /// full cycle the pool must net to the cumulative subsidy — fees create no
+    /// net inflation and are not burned. This is the accounting the live
+    /// `apply_chain_block_to` performs (mint_coinbase + collect_fees); here we
+    /// drive it end-to-end and pin the invariant, plus a counterfactual proving
+    /// the re-mint is load-bearing.
+    #[test]
+    fn fee_cycle_re_mints_and_pool_nets_to_cumulative_subsidy() {
+        const SUBSIDY: u64 = 10_000;
+        const FEE: u64 = 2_000;
+
+        let mut st = ShieldedState::new();
+
+        // Block 1: pure coinbase, one subsidy, no fees. pool = subsidy.
+        st.apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(1) }])), &[])
+            .unwrap();
+        assert_eq!(st.supply.pool_value().unwrap(), SUBSIDY as u128);
+
+        // Block 2: a shielded payment pays FEE (value leaves the pool), AND this
+        // block's coinbase re-mints that fee: its note value = subsidy + FEE.
+        // (In the live path Kaspa's coinbase manager sets this output value to
+        // the merged block's subsidy + collected fees; build_coinbase_mint turns
+        // it into the note value.)
+        st.apply_chain_block(
+            Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY + FEE, commitment: cmx(2) }])),
+            &[tx(&[1], &[100], FEE)],
+        )
+        .unwrap();
+
+        // Block 3: another plain subsidy, no fees.
+        st.apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(3) }])), &[])
+            .unwrap();
+
+        // Turnstile: pool == cumulative subsidy. The FEE left the pool in block 2
+        // and returned via block 2's coinbase re-mint; it neither inflated the
+        // supply nor was burned.
+        let cumulative_subsidy = (SUBSIDY as u128) * 3;
+        assert_eq!(st.supply.pool_value().unwrap(), cumulative_subsidy, "pool must net to cumulative subsidy");
+
+        // Counterfactual: if block 2 had NOT re-minted the fee (coinbase value =
+        // bare subsidy), the same accepted txs would leave the pool short by
+        // exactly FEE — proving the re-mint is what closes the loop, not that the
+        // fee is silently ignored.
+        let mut no_remint = ShieldedState::new();
+        no_remint
+            .apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(1) }])), &[])
+            .unwrap();
+        no_remint
+            .apply_chain_block(
+                Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(2) }])),
+                &[tx(&[1], &[100], FEE)],
+            )
+            .unwrap();
+        no_remint
+            .apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(3) }])), &[])
+            .unwrap();
+        assert_eq!(
+            no_remint.supply.pool_value().unwrap(),
+            cumulative_subsidy - FEE as u128,
+            "without the re-mint the pool is short by exactly the fee"
+        );
+    }
+
     /// A double-spend across blocks must not change the anchor relative to simply
     /// not including the conflicting transaction at all.
     #[test]
