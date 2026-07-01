@@ -285,6 +285,12 @@ impl VirtualStateProcessor {
         self.shielded_state_manager.anchor_at(block)
     }
 
+    /// Whether `anchor` is currently within the finalized-anchor window that
+    /// spends may prove against (PLAN §2.5). Exposed for tests / wallet checks.
+    pub fn shielded_is_finalized_anchor(&self, anchor: &[u8; 32]) -> Result<bool, kaspa_database::prelude::StoreError> {
+        self.shielded_state_manager.is_finalized_anchor(anchor)
+    }
+
     pub fn worker(self: &Arc<Self>) {
         'outer: while let Ok(msg) = self.receiver.recv() {
             if msg.is_exit_message() {

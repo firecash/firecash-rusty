@@ -465,6 +465,16 @@ pub fn calc_storage_mass(
         },
     )?;
 
+    // Shielded transactions (and any input-less transaction) consume no
+    // transparent UTXOs, so the KIP-0009 input term |I|/A(I) is zero and the
+    // divisions below (by Σ plurality) would be division-by-zero. Storage mass is
+    // then just the output harmonic portion — zero for a shielded tx, which also
+    // has no transparent outputs. This guard keeps the anti-dust rule well-defined
+    // for the one transparent-less transaction class (PLAN §2.1).
+    if inputs.len() == 0 {
+        return Some(harmonic_outs);
+    }
+
     /*
         KIP-0009 defines a relaxed formula for the cases:
             |O| = 1  or  |O| <= |I| <= 2

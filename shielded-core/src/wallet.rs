@@ -263,6 +263,66 @@ pub mod build {
         ))
     }
 
+    /// End-to-end wallet helper: build a real, proven spend of a coinbase note
+    /// that is the SINGLE leaf (position 0) of the finalized global tree, and
+    /// return the shielded-bundle wire bytes ready to drop into a version-2
+    /// transaction's `payload`.
+    ///
+    /// The note is reconstructed from its public coinbase description exactly as
+    /// consensus recomputes it (`derive_coinbase_note_desc` over
+    /// `coinbase_txid || out_index`), so the wallet and consensus agree on the
+    /// commitment. The witness is the single-leaf authentication path, so the
+    /// bundle's anchor equals the minting block's (finalized) anchor. Builds its
+    /// own `ProvingKey`; this is a heavy call (real Halo 2 proof).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_singleleaf_coinbase_spend(
+        owner_seed: [u8; 32],
+        coinbase_txid: [u8; 32],
+        out_index: u32,
+        note_value: u64,
+        recipient_addr: [u8; 43],
+        output_value: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+    ) -> Result<Vec<u8>, BuildError> {
+        use crate::coinbase::derive_coinbase_note_desc;
+        use incrementalmerkletree::{Hashable, Level};
+        use orchard::note::{RandomSeed, Rho};
+        use orchard::tree::MerkleHashOrchard;
+
+        let keys = ShieldedKeys::from_seed(owner_seed).ok_or(BuildError::Empty)?;
+
+        // Reconstruct the coinbase note deterministically (same derivation consensus uses).
+        let mut seed = Vec::with_capacity(36);
+        seed.extend_from_slice(&coinbase_txid);
+        seed.extend_from_slice(&out_index.to_le_bytes());
+        let desc = derive_coinbase_note_desc(keys.address().to_raw_address_bytes(), &seed);
+        let rho = Option::<Rho>::from(Rho::from_bytes(&desc.rho)).ok_or(BuildError::Empty)?;
+        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(desc.rseed, &rho)).ok_or(BuildError::Empty)?;
+        let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(note_value), rho, rseed))
+            .ok_or(BuildError::Empty)?;
+
+        // Single-leaf witness: position 0, siblings are the empty-subtree roots.
+        let auth_path: [MerkleHashOrchard; 32] =
+            core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+        let merkle_path = MerklePath::from_parts(0, auth_path);
+
+        let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
+        let pk = ProvingKey::build();
+        let wire = build_spend_bundle(
+            &pk,
+            &keys,
+            note,
+            merkle_path,
+            recipient,
+            output_value,
+            network_domain,
+            tx_context,
+            rand::rngs::OsRng,
+        )?;
+        Ok(wire.to_bytes())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;

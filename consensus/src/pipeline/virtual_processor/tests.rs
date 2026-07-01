@@ -159,10 +159,16 @@ impl TestContext {
     /// nonce for it (no skip_proof_of_work). At the easiest target this is 1-2
     /// hashes. Returns the mined, finalized block.
     fn mine_real_pow_block(&mut self) -> Block {
+        self.mine_real_pow_block_with(Default::default())
+    }
+
+    /// As `mine_real_pow_block`, but includes the given transactions (a miner
+    /// picking them up from the mempool).
+    fn mine_real_pow_block_with(&mut self, txs: Vec<Transaction>) -> Block {
         self.simulated_time += self.consensus.params().target_time_per_block();
         let mut t = self
             .consensus
-            .build_block_template(self.miner_data.clone(), Box::new(OnetimeTxSelector::new(Default::default())), TemplateBuildMode::Standard)
+            .build_block_template(self.miner_data.clone(), Box::new(OnetimeTxSelector::new(txs)), TemplateBuildMode::Standard)
             .unwrap();
         t.block.header.timestamp = self.simulated_time;
         let state = kaspa_pow::State::new(&t.block.header);
@@ -219,6 +225,38 @@ async fn real_fishhash_pow_mines_shielded_chain_live() {
         .filter_map(|h| vp.shielded_anchor_at(h).ok())
         .any(|anchor| anchor != empty_anchor);
     assert!(advanced, "shielded coinbase mined under real FishHashPlus must advance the anchor");
+}
+
+#[tokio::test]
+async fn diag_shielded_coinbase_note_structure() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let recipient = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).unwrap();
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)), vec![]);
+
+    let empty = kaspa_shielded_core::Anchor::empty_tree().to_bytes();
+    let mut parent = config.genesis.hash;
+    for i in 0..6u64 {
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block();
+        let mut t = ctx
+            .consensus
+            .build_block_template(ctx.miner_data.clone(), Box::new(OnetimeTxSelector::new(Default::default())), TemplateBuildMode::Standard)
+            .unwrap();
+        t.block.header.timestamp = ctx.simulated_time;
+        t.block.header.finalize();
+        let cb_outs = t.block.transactions[0].outputs.len();
+        let cb_out_values: Vec<u64> = t.block.transactions[0].outputs.iter().map(|o| o.value).collect();
+        let h = t.block.header.hash;
+        ctx.consensus.validate_and_insert_block(t.block.to_immutable()).virtual_state_task.await.unwrap();
+        let anchor = ctx.consensus.virtual_processor().shielded_anchor_at(h).ok();
+        println!(
+            "block {i} hash={h} cb_outputs={cb_outs} values={cb_out_values:?} anchor_advanced={} parent={parent}",
+            anchor.map(|a| a != empty).unwrap_or(false)
+        );
+        parent = h;
+    }
 }
 
 #[tokio::test]
@@ -280,6 +318,94 @@ async fn shielded_coinbase_mints_into_the_pool_live() {
         .filter_map(|h| vp.shielded_anchor_at(h).ok())
         .any(|anchor| anchor != empty_anchor);
     assert!(advanced, "shielded coinbase must have appended notes and advanced the anchor past empty");
+}
+
+/// THE end-to-end milestone (PLAN §2): under REAL FishHashPlus PoW, mine a
+/// shielded-coinbase chain, then have the "wallet" build a REAL Orchard spend of
+/// a mined coinbase note and push it through a mined block. The consensus layer
+/// verifies the Halo 2 proof + binding/spend-auth signatures, checks the spend's
+/// anchor is finalized, and applies the §2.4 transition (nullifier + turnstile).
+/// This is the first fully-live private payment: mining + shielded coinbase +
+/// real proof verification + state transition, all through the actual pipeline.
+/// Run in release (light cache ~3s; real proof a few seconds).
+#[tokio::test]
+async fn real_shielded_spend_through_mined_block() {
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    // Real PoW at trivial difficulty; small finality so the coinbase note's anchor
+    // finalizes within a short chain (spends must reference a finalized anchor).
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    // Block 0 mints no note (genesis merge); block 1's coinbase mints the first and
+    // only note, at tree position 0 (verified by diag_shielded_coinbase_note_structure).
+    let mut block1 = None;
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        block1 = Some(b);
+    }
+    let block1 = block1.unwrap();
+    let cb = &block1.transactions[0];
+    assert_eq!(cb.outputs.len(), 1, "block 1 coinbase is a single note at position 0");
+    let cb_txid = cb.id();
+    let note_value = cb.outputs[0].value;
+    let anchor1 = ctx.consensus.virtual_processor().shielded_anchor_at(block1.header.hash).unwrap();
+
+    // Mine empty blocks until block 1's anchor enters the finalized window.
+    let mut guard = 0;
+    while !ctx.consensus.virtual_processor().shielded_is_finalized_anchor(&anchor1).unwrap() {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+        guard += 1;
+        assert!(guard < 30, "coinbase-note anchor never finalized");
+    }
+
+    // Wallet side: build a REAL proven spend of block 1's coinbase note, paying a
+    // recipient (fee = 2_000). The sighash context binds to this exact tx.
+    let recipient_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap();
+    let output_value = note_value - 2_000;
+    let mut spend_tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    let tx_ctx = spend_tx.shielded_sighash_context();
+    let payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend(
+        miner_seed,
+        cb_txid.as_bytes(),
+        0,
+        note_value,
+        recipient_addr,
+        output_value,
+        &net,
+        &tx_ctx,
+    )
+    .expect("wallet builds a real spend bundle");
+    spend_tx.payload = payload;
+    spend_tx.finalize();
+    assert!(spend_tx.is_shielded(), "constructed a shielded (v2) transaction");
+
+    // Mine a block that includes the shielded spend and validate it end-to-end.
+    let spend_block = ctx.mine_real_pow_block_with(vec![spend_tx.clone()]);
+    let spend_block_hash = spend_block.header.hash;
+    let status = ctx.consensus.validate_and_insert_block(spend_block).virtual_state_task.await.unwrap();
+    assert!(status.is_utxo_valid_or_pending(), "real shielded spend accepted: {status:?}");
+
+    // The spend was actually included and its shielded state applied: the block is
+    // UTXO-valid and its anchor advanced beyond block 1's (coinbase + spend outputs).
+    assert_eq!(ctx.consensus.block_status(spend_block_hash), BlockStatus::StatusUTXOValid);
+    let spend_anchor = ctx.consensus.virtual_processor().shielded_anchor_at(spend_block_hash).unwrap();
+    assert_ne!(spend_anchor, anchor1, "spend block's shielded state advanced");
 }
 
 #[tokio::test]
