@@ -148,4 +148,22 @@ mod tests {
         let stop = AtomicBool::new(true);
         assert_eq!(mine_header(&header, None, 2, &stop), None, "a pre-set stop flag aborts before any hashing");
     }
+
+    /// End-to-end **real PoW**: run the actual FishHashPlus light kernel (builds the
+    /// ~75MB cache, then the memory-hard hash) and confirm the parallel miner finds
+    /// a nonce that satisfies the genuine consensus `check_pow` — i.e. it mines a
+    /// real block, not a skip-PoW placeholder. Ignored by default because building
+    /// the cache + hashing is slow in debug; run explicitly with
+    /// `cargo test -p kaspa-miner -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "slow: builds the real FishHash cache + runs the memory-hard kernel"]
+    fn mine_header_finds_a_real_fishhash_block() {
+        // Easiest target (~2^255): ~half of nonces win, so a handful of real hashes
+        // suffice once the cache is built.
+        let header = header_with_bits(0x207f_ffff);
+        let stop = AtomicBool::new(false);
+        let nonce = mine_header(&header, None, num_cpus::get(), &stop).expect("real FishHash miner finds a block");
+        // Verify against a freshly built consensus verification State (the node's path).
+        assert!(State::new(&header).check_pow(nonce).0, "mined nonce passes the real consensus FishHashPlus check");
+    }
 }
