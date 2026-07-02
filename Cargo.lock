@@ -3886,6 +3886,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaspa-miner"
+version = "2.0.1"
+dependencies = [
+ "clap",
+ "kaspa-addresses",
+ "kaspa-consensus-core",
+ "kaspa-core",
+ "kaspa-grpc-client",
+ "kaspa-hashes",
+ "kaspa-math",
+ "kaspa-notify",
+ "kaspa-pow",
+ "kaspa-rpc-core",
+ "kaspa-utils",
+ "log",
+ "num_cpus",
+ "rand 0.8.6",
+ "tokio",
+]
+
+[[package]]
 name = "kaspa-mining"
 version = "2.0.1"
 dependencies = [

@@ -20,6 +20,7 @@ members = [
     "consensus/smt-store",
     "shielded-core",
     "shielded-wallet",
+    "miner",
     "consensus/wasm",
     "kaspad",
     "simpa",

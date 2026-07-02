@@ -1,0 +1,40 @@
+[package]
+name = "kaspa-miner"
+description = "kasprivate standalone CPU miner (FishHashPlus / KarlsenHashV2 proof-of-work)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "kasprivate-miner"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The mining address (kasprivate: shielded Orchard address) the reward is paid to.
+kaspa-addresses.workspace = true
+# The consensus block/header shape the template converts into and PoW runs over.
+kaspa-consensus-core.workspace = true
+# Logging init (kaspa_core::log) shared with the rest of the workspace.
+kaspa-core.workspace = true
+# gRPC client to talk get_block_template / submit_block to a kaspad node.
+kaspa-grpc-client.workspace = true
+kaspa-notify.workspace = true
+# RpcApi trait + Rpc* message/model types (RpcRawBlock, RpcAddress, ...).
+kaspa-rpc-core.workspace = true
+# THE shared PoW: State / check_pow and the FishHash context. Reusing this is what
+# makes a nonce this miner finds one the node accepts by construction (no drift).
+kaspa-pow.workspace = true
+kaspa-hashes.workspace = true
+kaspa-math.workspace = true
+kaspa-utils.workspace = true
+
+clap.workspace = true
+log.workspace = true
+num_cpus.workspace = true
+rand.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "time", "sync"] }
