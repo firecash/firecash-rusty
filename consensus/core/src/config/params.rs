@@ -375,9 +375,42 @@ pub struct Params {
     pub crescendo_activation: ForkActivation,
 
     pub toccata_activation: ForkActivation,
+
+    /// kasprivate launch difficulty schedule — number of blocks (blue-score units) at the
+    /// start of the chain during which difficulty is **pinned** to the genesis target
+    /// (super-easy) so the chain can be bootstrap-mined on CPU. `0` (together with
+    /// `difficulty_ramp_blocks == 0`) disables the schedule.
+    pub low_difficulty_start_blocks: u64,
+
+    /// kasprivate launch difficulty schedule — number of blocks (blue-score units) after the
+    /// low-difficulty start window over which the difficulty *ceiling* tightens geometrically from the
+    /// genesis target toward real difficulty. After this ramp the ceiling is lifted and the
+    /// pure DAA governs, so post-launch blocks are **not** easily mined. `0` disables the
+    /// entire launch schedule (upstream KIP-0004 behaviour).
+    pub difficulty_ramp_blocks: u64,
 }
 
 impl Params {
+    /// Blue score at and below which difficulty is pinned to the (super-easy) genesis
+    /// target during the low-difficulty start. See [`Self::difficulty_ramp_end_blue_score`].
+    #[inline]
+    #[must_use]
+    pub fn low_difficulty_end_blue_score(&self) -> u64 {
+        self.low_difficulty_start_blocks
+    }
+
+    /// Blue score at and above which the launch difficulty ceiling is fully lifted and the
+    /// pure DAA governs difficulty. Returns `0` — meaning the launch schedule is disabled —
+    /// when `difficulty_ramp_blocks == 0`.
+    #[inline]
+    #[must_use]
+    pub fn difficulty_ramp_end_blue_score(&self) -> u64 {
+        if self.difficulty_ramp_blocks == 0 {
+            0
+        } else {
+            self.low_difficulty_start_blocks.saturating_add(self.difficulty_ramp_blocks)
+        }
+    }
     /// Returns the past median time sample rate
     #[inline]
     #[must_use]
@@ -614,6 +647,10 @@ impl Params {
 
             crescendo_activation: overrides.crescendo_activation.unwrap_or(self.crescendo_activation),
             toccata_activation: overrides.toccata_activation.unwrap_or(self.toccata_activation),
+
+            // Consensus-critical launch schedule; not exposed as a CLI override.
+            low_difficulty_start_blocks: self.low_difficulty_start_blocks,
+            difficulty_ramp_blocks: self.difficulty_ramp_blocks,
         }
     }
 }
@@ -734,6 +771,15 @@ pub const MAINNET_PARAMS: Params = Params {
 
     // Roughly 2026-06-30 1615 UTC
     toccata_activation: ForkActivation::new(474_165_565),
+
+    // kasprivate launch difficulty schedule (blue-score units, 10 BPS):
+    //  - first 50_000 blocks: difficulty pinned to the (super-easy) genesis target → CPU-mineable low-difficulty start.
+    //  - next 864_000 blocks (≈ 1 day at the 10 BPS target rate): the difficulty *ceiling*
+    //    tightens geometrically toward real difficulty; the pure DAA takes over the moment the
+    //    ceiling drops below actual network difficulty, so there is no post-start difficulty
+    //    cliff and post-launch blocks are not easily mined.
+    low_difficulty_start_blocks: 50_000,
+    difficulty_ramp_blocks: 864_000,
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -796,6 +842,10 @@ pub const TESTNET_PARAMS: Params = Params {
 
     // ~16:00 UTC, May 18, 2026
     toccata_activation: ForkActivation::new(467_579_632),
+
+    // Launch difficulty schedule disabled on testnet.
+    low_difficulty_start_blocks: 0,
+    difficulty_ramp_blocks: 0,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -842,6 +892,10 @@ pub const SIMNET_PARAMS: Params = Params {
 
     crescendo_activation: ForkActivation::always(),
     toccata_activation: ForkActivation::always(),
+
+    // Launch difficulty schedule disabled on simnet.
+    low_difficulty_start_blocks: 0,
+    difficulty_ramp_blocks: 0,
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -887,6 +941,10 @@ pub const DEVNET_PARAMS: Params = Params {
 
     crescendo_activation: ForkActivation::always(),
     toccata_activation: ForkActivation::never(),
+
+    // Launch difficulty schedule disabled on devnet.
+    low_difficulty_start_blocks: 0,
+    difficulty_ramp_blocks: 0,
 };
 
 #[cfg(test)]

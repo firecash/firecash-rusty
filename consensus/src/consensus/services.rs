@@ -102,6 +102,8 @@ impl ConsensusServices {
             params.difficulty_sample_rate,
             params.past_median_time_window_size,
             params.past_median_time_sample_rate,
+            params.low_difficulty_end_blue_score(),
+            params.difficulty_ramp_end_blue_score(),
         );
         let depth_manager = BlockDepthManager::new(
             params.merge_depth(),

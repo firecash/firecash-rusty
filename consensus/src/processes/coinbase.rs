@@ -22,6 +22,16 @@ const MIN_PAYLOAD_LENGTH: usize =
 // SECONDS_PER_MONTH = 30.4375 * 24 * 60 * 60
 const SECONDS_PER_MONTH: u64 = 2629800;
 
+// kasprivate monetary policy: the block subsidy uses Kaspa's *exact* `SUBSIDY_BY_MONTH_TABLE`
+// reward values, but halves every 3 months instead of every 12. Kaspa's table encodes a smooth
+// decay with `LEGACY_MONTHS_PER_HALVING` (=12) monthly steps per halving; we traverse it
+// `LEGACY_MONTHS_PER_HALVING / SUBSIDY_HALVING_INTERVAL_MONTHS` = 4× faster so a full halving
+// takes 3 months. Net effect: identical per-block reward *values* as Kaspa on the same curve
+// shape, reached 4× sooner (so the total emitted supply is ≈ 1/4 of Kaspa's for a given BPS).
+const SUBSIDY_HALVING_INTERVAL_MONTHS: u64 = 3;
+// The number of monthly table steps that constitute one halving in Kaspa's original table.
+const LEGACY_MONTHS_PER_HALVING: u64 = 12;
+
 pub const SUBSIDY_BY_MONTH_TABLE_SIZE: usize = 426;
 pub type SubsidyByMonthTable = [u64; SUBSIDY_BY_MONTH_TABLE_SIZE];
 
@@ -256,7 +266,11 @@ impl CoinbaseManager {
                 + (daa_score - self.crescendo_activation_daa_score) / self.bps_history.after()
         };
 
-        seconds_since_deflationary_phase_started / SECONDS_PER_MONTH
+        // Traverse Kaspa's monthly table `LEGACY_MONTHS_PER_HALVING / SUBSIDY_HALVING_INTERVAL_MONTHS`×
+        // faster so the subsidy halves every `SUBSIDY_HALVING_INTERVAL_MONTHS` (=3) months. u128 math
+        // avoids overflow for far-future DAA scores; the index is clamped to the table in the caller.
+        ((seconds_since_deflationary_phase_started as u128 * LEGACY_MONTHS_PER_HALVING as u128)
+            / (SECONDS_PER_MONTH as u128 * SUBSIDY_HALVING_INTERVAL_MONTHS as u128)) as u64
     }
 
     #[cfg(test)]
@@ -266,13 +280,16 @@ impl CoinbaseManager {
         }
 
         // Note that this calculation implicitly assumes that block per second = 1 (by assuming daa score diff is in second units).
-        let months_since_deflationary_phase_started = (daa_score - self.deflationary_phase_daa_score) / SECONDS_PER_MONTH;
-        assert!(months_since_deflationary_phase_started <= usize::MAX as u64);
-        let months_since_deflationary_phase_started: usize = months_since_deflationary_phase_started as usize;
-        if months_since_deflationary_phase_started >= SUBSIDY_BY_MONTH_TABLE.len() {
+        // Like `subsidy_month`, the monthly table is traversed 4× faster so the subsidy halves every
+        // `SUBSIDY_HALVING_INTERVAL_MONTHS` (=3) months instead of the original 12.
+        let table_index = ((daa_score - self.deflationary_phase_daa_score) as u128 * LEGACY_MONTHS_PER_HALVING as u128
+            / (SECONDS_PER_MONTH as u128 * SUBSIDY_HALVING_INTERVAL_MONTHS as u128)) as u64;
+        assert!(table_index <= usize::MAX as u64);
+        let table_index: usize = table_index as usize;
+        if table_index >= SUBSIDY_BY_MONTH_TABLE.len() {
             *SUBSIDY_BY_MONTH_TABLE.last().unwrap()
         } else {
-            SUBSIDY_BY_MONTH_TABLE[months_since_deflationary_phase_started]
+            SUBSIDY_BY_MONTH_TABLE[table_index]
         }
     }
 }
@@ -434,7 +451,8 @@ mod tests {
         const PRE_DEFLATIONARY_PHASE_BASE_SUBSIDY: u64 = 50000000000;
         const DEFLATIONARY_PHASE_INITIAL_SUBSIDY: u64 = 44000000000;
         const SECONDS_PER_MONTH: u64 = 2629800;
-        const SECONDS_PER_HALVING: u64 = SECONDS_PER_MONTH * 12;
+        // kasprivate halves every 3 months (see SUBSIDY_HALVING_INTERVAL_MONTHS).
+        const SECONDS_PER_HALVING: u64 = SECONDS_PER_MONTH * 3;
 
         for network_id in NetworkId::iter() {
             let mut params: Params = network_id.into();
