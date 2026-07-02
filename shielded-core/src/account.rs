@@ -193,6 +193,16 @@ mod tests {
         let transparent = Address::new(Prefix::Mainnet, Version::PubKey, &[0u8; 32]);
         assert_eq!(orchard_recipient_bytes(&transparent), None);
     }
+
+    /// Utility: print a deterministic mainnet mining address for manual node/miner
+    /// bring-up. Run with `cargo test -p kaspa-shielded-core --release print_mainnet_mining_address -- --nocapture --ignored`.
+    #[test]
+    #[ignore = "prints an address for manual bring-up, not an assertion"]
+    fn print_mainnet_mining_address() {
+        let acct = ShieldedAccount::from_seed([7u8; 32]).unwrap();
+        let addr: String = (&acct.receiving_address(Prefix::Mainnet)).into();
+        println!("MINING_ADDRESS_SEED07={addr}");
+    }
 }
 
 /// The complete private-payment loop with live crypto (circuit feature), driven
