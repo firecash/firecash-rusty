@@ -1,0 +1,31 @@
+[package]
+name = "kaspa-shielded-wallet"
+description = "kasprivate shielded wallet glue: accepted-block -> note effects extraction and version-2 shielded transaction assembly"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Forwards to shielded-core's circuit feature so a spend can be proven end-to-end
+# in tests through the full wallet -> tx -> effects loop.
+circuit = ["kaspa-shielded-core/circuit"]
+
+[dependencies]
+# Transaction shape (version-2 shielded tx, coinbase outputs, sighash context).
+kaspa-consensus-core.workspace = true
+# The shielded primitives + wallet facade this crate wires to the chain: coinbase
+# note derivation, bundle wire format, and the ShieldedAccount facade.
+kaspa-shielded-core.workspace = true
+
+[dev-dependencies]
+# Parity test: assert this crate's coinbase extraction reproduces EXACTLY the notes
+# the real consensus `build_coinbase_mint` mints (single source of truth check).
+kaspa-consensus.workspace = true
+kaspa-txscript.workspace = true
+kaspa-addresses.workspace = true

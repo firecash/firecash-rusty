@@ -3891,6 +3891,7 @@ version = "2.0.1"
 dependencies = [
  "criterion",
  "futures-util",
+ "hex",
  "itertools 0.13.0",
  "kaspa-addresses",
  "kaspa-consensus-core",
@@ -3899,6 +3900,7 @@ dependencies = [
  "kaspa-hashes",
  "kaspa-mining-errors",
  "kaspa-muhash",
+ "kaspa-shielded-core",
  "kaspa-txscript",
  "kaspa-utils",
  "log",
@@ -4199,12 +4201,24 @@ dependencies = [
  "blake2b_simd",
  "group",
  "incrementalmerkletree",
+ "kaspa-addresses",
  "nonempty",
  "orchard",
  "pasta_curves",
  "rand 0.8.6",
  "serde",
  "zcash_note_encryption",
+]
+
+[[package]]
+name = "kaspa-shielded-wallet"
+version = "2.0.1"
+dependencies = [
+ "kaspa-addresses",
+ "kaspa-consensus",
+ "kaspa-consensus-core",
+ "kaspa-shielded-core",
+ "kaspa-txscript",
 ]
 
 [[package]]

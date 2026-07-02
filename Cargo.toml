@@ -19,6 +19,7 @@ members = [
     "consensus/seq-commit",
     "consensus/smt-store",
     "shielded-core",
+    "shielded-wallet",
     "consensus/wasm",
     "kaspad",
     "simpa",
@@ -129,6 +130,7 @@ kaspa-pow = { version = "2.0.1", path = "consensus/pow" }
 kaspa-rpc-core = { version = "2.0.1", path = "rpc/core" }
 kaspa-seq-commit = { version = "2.0.1", path = "consensus/seq-commit" }
 kaspa-shielded-core = { version = "2.0.1", path = "shielded-core" }
+kaspa-shielded-wallet = { version = "2.0.1", path = "shielded-wallet" }
 kaspa-rpc-macros = { version = "2.0.1", path = "rpc/macros" }
 kaspa-rpc-service = { version = "2.0.1", path = "rpc/service" }
 kaspa-txscript = { version = "2.0.1", path = "crypto/txscript" }
