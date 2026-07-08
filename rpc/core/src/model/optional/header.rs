@@ -129,6 +129,7 @@ impl TryFrom<RpcOptionalHeader> for Header {
             pruning_point: header
                 .pruning_point
                 .ok_or(RpcError::MissingRpcFieldError("RpcHeader".to_owned(), "pruning_point".to_owned()))?,
+            aux_pow: None,
         })
     }
 }
@@ -162,6 +163,7 @@ impl TryFrom<&RpcOptionalHeader> for Header {
             pruning_point: header
                 .pruning_point
                 .ok_or(RpcError::MissingRpcFieldError("RpcHeader".to_owned(), "pruning_point".to_owned()))?,
+            aux_pow: None,
         })
     }
 }

@@ -1,36 +1,29 @@
-//! The proof-of-work search core (PLAN §1 — FishHashPlus / KarlsenHashV2 PoW).
+//! The proof-of-work search core (PLAN §1 — kHeavyHash PoW).
 //!
 //! This is deliberately thin: it runs the **same** [`kaspa_pow::State`] the
 //! consensus layer uses to *verify* a block. A nonce this module accepts is one
 //! the node accepts by construction — there is no second PoW implementation that
 //! could drift from consensus. The miner's only job is to search the nonce space
-//! for a value whose FishHashPlus output meets the header's target.
+//! for a value whose kHeavyHash output meets the header's target.
 //!
 //! [`solve_range`] is the pure, single-threaded primitive (unit-tested here);
 //! [`mine_header`] fans it out across worker threads with early-exit, striping the
 //! nonce space so no two workers test the same nonce.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 
 use kaspa_consensus_core::header::Header;
-use kaspa_hashes::FishHashContext;
 use kaspa_pow::State;
 
 /// How many nonces a worker checks between polls of the shared stop flag. Small
 /// enough to abandon a stale template promptly, large enough that the atomic load
-/// is negligible against the memory-hard hash.
+/// is negligible against the hash.
 const STOP_POLL_STRIDE: u64 = 512;
 
-/// Build the PoW [`State`] for `header`. With `full_ctx = None` the shared light
-/// verification cache is used (correct, but recomputes dataset items on demand —
-/// fine to bootstrap a low-difficulty chain); pass a prebuilt full-dataset context
-/// for the fast memory-hard path.
-pub fn build_state(header: &Header, full_ctx: Option<Arc<FishHashContext>>) -> State {
-    match full_ctx {
-        Some(ctx) => State::with_context(header, Some(ctx)),
-        None => State::new(header),
-    }
+/// Build the PoW [`State`] for `header` (the same state the node verifies with).
+/// kHeavyHash needs no precomputed dataset, so this is just the verification state.
+pub fn build_state(header: &Header) -> State {
+    State::new(header)
 }
 
 /// Search nonces `[start, start + count)` for one whose PoW meets `state`'s target,
@@ -45,15 +38,15 @@ pub fn solve_range(state: &State, start: u64, count: u64) -> Option<u64> {
 /// is found or `stop` is set (e.g. the template went stale). Workers stripe the
 /// space from a random base so restarts don't re-test the same nonces first.
 /// Returns the winning nonce, or `None` if `stop` fired before a solution.
-pub fn mine_header(header: &Header, full_ctx: Option<Arc<FishHashContext>>, threads: usize, stop: &AtomicBool) -> Option<u64> {
-    // Fast path: an already-stale template. Return before building the (possibly
-    // expensive) PoW state so a caller that races the stop flag pays nothing.
+pub fn mine_header(header: &Header, threads: usize, stop: &AtomicBool) -> Option<u64> {
+    // Fast path: an already-stale template. Return before building the PoW state so
+    // a caller that races the stop flag pays nothing.
     if stop.load(Ordering::Relaxed) {
         return None;
     }
     let threads = threads.max(1);
     let base: u64 = rand::random();
-    let state = build_state(header, full_ctx);
+    let state = build_state(header);
     let found = AtomicU64::new(0);
     let has_found = AtomicBool::new(false);
 
@@ -95,9 +88,8 @@ mod tests {
     use kaspa_consensus_core::header::Header;
     use kaspa_hashes::Hash;
 
-    /// A header with the given compact `bits`, using the cheap skip-PoW hash so the
-    /// test never builds the 75MB FishHash cache or runs the memory-hard kernel —
-    /// the nonce-search logic is identical regardless of which hash backs `State`.
+    /// A header with the given compact `bits`. The nonce-search logic is identical
+    /// regardless of which hash backs `State`.
     fn header_with_bits(bits: u32) -> Header {
         Header::new_finalized(
             1,
@@ -138,32 +130,26 @@ mod tests {
     }
 
     /// The parallel driver honours the stop flag: a pre-set stop returns `None`
-    /// immediately, before building the PoW state or hashing (so this stays cheap
-    /// and never touches the FishHash cache). The winning-nonce path is covered by
-    /// `solve_range_finds_a_valid_nonce_for_easy_target` — `mine_header` runs the
-    /// same `check_pow` primitive, just striped across threads.
+    /// immediately, before building the PoW state or hashing. The winning-nonce path
+    /// is covered by `solve_range_finds_a_valid_nonce_for_easy_target` — `mine_header`
+    /// runs the same `check_pow` primitive, just striped across threads.
     #[test]
     fn mine_header_respects_a_preset_stop_flag() {
         let header = header_with_bits(0x207f_ffff);
         let stop = AtomicBool::new(true);
-        assert_eq!(mine_header(&header, None, 2, &stop), None, "a pre-set stop flag aborts before any hashing");
+        assert_eq!(mine_header(&header, 2, &stop), None, "a pre-set stop flag aborts before any hashing");
     }
 
-    /// End-to-end **real PoW**: run the actual FishHashPlus light kernel (builds the
-    /// ~75MB cache, then the memory-hard hash) and confirm the parallel miner finds
-    /// a nonce that satisfies the genuine consensus `check_pow` — i.e. it mines a
-    /// real block, not a skip-PoW placeholder. Ignored by default because building
-    /// the cache + hashing is slow in debug; run explicitly with
-    /// `cargo test -p kaspa-miner -- --ignored --nocapture`.
+    /// End-to-end **real PoW**: run the actual kHeavyHash kernel and confirm the
+    /// parallel miner finds a nonce that satisfies the genuine consensus `check_pow`
+    /// — i.e. it mines a real block, not a skip-PoW placeholder.
     #[test]
-    #[ignore = "slow: builds the real FishHash cache + runs the memory-hard kernel"]
-    fn mine_header_finds_a_real_fishhash_block() {
-        // Easiest target (~2^255): ~half of nonces win, so a handful of real hashes
-        // suffice once the cache is built.
+    fn mine_header_finds_a_real_kheavyhash_block() {
+        // Easiest target (~2^255): ~half of nonces win, so a handful of real hashes suffice.
         let header = header_with_bits(0x207f_ffff);
         let stop = AtomicBool::new(false);
-        let nonce = mine_header(&header, None, num_cpus::get(), &stop).expect("real FishHash miner finds a block");
+        let nonce = mine_header(&header, num_cpus::get(), &stop).expect("real kHeavyHash miner finds a block");
         // Verify against a freshly built consensus verification State (the node's path).
-        assert!(State::new(&header).check_pow(nonce).0, "mined nonce passes the real consensus FishHashPlus check");
+        assert!(State::new(&header).check_pow(nonce).0, "mined nonce passes the real consensus kHeavyHash check");
     }
 }

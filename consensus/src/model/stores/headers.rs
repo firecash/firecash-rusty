@@ -79,6 +79,8 @@ impl From<HeaderWithBlockLevel2> for HeaderWithBlockLevel {
                 blue_work: value.header.blue_work,
                 blue_score: value.header.blue_score,
                 pruning_point: value.header.pruning_point,
+                // Legacy (pre-RLE) stored headers never carried a merged-mining witness.
+                aux_pow: None,
             }
             .into(),
             block_level: value.block_level,

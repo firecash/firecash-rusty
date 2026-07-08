@@ -69,13 +69,13 @@ pub enum AddressError {
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Hash, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[borsh(use_discriminant = true)]
 pub enum Prefix {
-    #[serde(rename = "kasprivate")]
+    #[serde(rename = "firecash")]
     Mainnet,
-    #[serde(rename = "kasprivatetest")]
+    #[serde(rename = "firecashtest")]
     Testnet,
-    #[serde(rename = "kasprivatesim")]
+    #[serde(rename = "firecashsim")]
     Simnet,
-    #[serde(rename = "kasprivatedev")]
+    #[serde(rename = "firecashdev")]
     Devnet,
     #[cfg(test)]
     A,
@@ -86,10 +86,10 @@ pub enum Prefix {
 impl Prefix {
     fn as_str(&self) -> &'static str {
         match self {
-            Prefix::Mainnet => "kasprivate",
-            Prefix::Testnet => "kasprivatetest",
-            Prefix::Simnet => "kasprivatesim",
-            Prefix::Devnet => "kasprivatedev",
+            Prefix::Mainnet => "firecash",
+            Prefix::Testnet => "firecashtest",
+            Prefix::Simnet => "firecashsim",
+            Prefix::Devnet => "firecashdev",
             #[cfg(test)]
             Prefix::A => "a",
             #[cfg(test)]
@@ -117,10 +117,10 @@ impl TryFrom<&str> for Prefix {
 
     fn try_from(prefix: &str) -> Result<Self, Self::Error> {
         match prefix {
-            "kasprivate" => Ok(Prefix::Mainnet),
-            "kasprivatetest" => Ok(Prefix::Testnet),
-            "kasprivatesim" => Ok(Prefix::Simnet),
-            "kasprivatedev" => Ok(Prefix::Devnet),
+            "firecash" => Ok(Prefix::Mainnet),
+            "firecashtest" => Ok(Prefix::Testnet),
+            "firecashsim" => Ok(Prefix::Simnet),
+            "firecashdev" => Ok(Prefix::Devnet),
             #[cfg(test)]
             "a" => Ok(Prefix::A),
             #[cfg(test)]
@@ -145,7 +145,7 @@ pub enum Version {
     PubKeyECDSA = 1,
     /// ScriptHash addresses always have the version byte set to 8
     ScriptHash = 8,
-    /// kasprivate shielded (Orchard) addresses have the version byte set to 9.
+    /// firecash shielded (Orchard) addresses have the version byte set to 9.
     /// The payload is the 43-byte raw Orchard address (diversifier ‖ pk_d). Such
     /// an address is never spent through a transparent script — it is the
     /// recipient of a shielded (Orchard) output — so it maps to no standard
@@ -177,7 +177,7 @@ impl Version {
         }
     }
 
-    /// Whether this is a kasprivate shielded (Orchard) address, which is paid via
+    /// Whether this is a firecash shielded (Orchard) address, which is paid via
     /// a shielded output rather than a transparent script.
     pub fn is_shielded(&self) -> bool {
         matches!(self, Version::ShieldedOrchard)
@@ -502,11 +502,11 @@ mod tests {
             (Address::new(Prefix::B, Version::ScriptHash, b"1234598760"), "b:pqcnyve5x5unsdekxqeusxeyu2"),
             (Address::new(Prefix::B, Version::ScriptHash, b"abcdefghijklmnopqrstuvwxyz"), "b:ppskycmyv4nxw6rfdf4kcmtwdac8zunnw36hvamc09aqtpppz8lk"),
             (Address::new(Prefix::B, Version::ScriptHash, b"000000000000000000000000000000000000000000"), "b:pqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrq7ag684l3"),
-            (Address::new(Prefix::Testnet, Version::PubKey, &[0u8; 32]),      "kasprivatetest:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq0gjdcpx3"),
-            (Address::new(Prefix::Testnet, Version::PubKeyECDSA, &[0u8; 33]), "kasprivatetest:qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqf5jfr4n"),
-            (Address::new(Prefix::Testnet, Version::PubKeyECDSA, b"\xba\x01\xfc\x5f\x4e\x9d\x98\x79\x59\x9c\x69\xa3\xda\xfd\xb8\x35\xa7\x25\x5e\x5f\x2e\x93\x4e\x93\x22\xec\xd3\xaf\x19\x0a\xb0\xf6\x0e"), "kasprivatetest:qxaqrlzlf6wes72en3568khahq66wf27tuhfxn5nytkd8tcep2c0vrsw2mwvsfw"),
-            (Address::new(Prefix::Mainnet, Version::PubKey, &[0u8; 32]),      "kasprivate:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqhey699x5"),
-            (Address::new(Prefix::Mainnet, Version::PubKey, b"\x5f\xff\x3c\x4d\xa1\x8f\x45\xad\xcd\xd4\x99\xe4\x46\x11\xe9\xff\xf1\x48\xba\x69\xdb\x3c\x4e\xa2\xdd\xd9\x55\xfc\x46\xa5\x95\x22"), "kasprivate:qp0l70zd5x85ttwd6jv7g3s3a8llzj96d8dncn4zmhv4tlzx5k2jypglgdl6l"),
+            (Address::new(Prefix::Testnet, Version::PubKey, &[0u8; 32]),      "firecashtest:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp3032w74"),
+            (Address::new(Prefix::Testnet, Version::PubKeyECDSA, &[0u8; 33]), "firecashtest:qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq5gf74dqw"),
+            (Address::new(Prefix::Testnet, Version::PubKeyECDSA, b"\xba\x01\xfc\x5f\x4e\x9d\x98\x79\x59\x9c\x69\xa3\xda\xfd\xb8\x35\xa7\x25\x5e\x5f\x2e\x93\x4e\x93\x22\xec\xd3\xaf\x19\x0a\xb0\xf6\x0e"), "firecashtest:qxaqrlzlf6wes72en3568khahq66wf27tuhfxn5nytkd8tcep2c0vrs6txzs7un"),
+            (Address::new(Prefix::Mainnet, Version::PubKey, &[0u8; 32]),      "firecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqquzn95rkl"),
+            (Address::new(Prefix::Mainnet, Version::PubKey, b"\x5f\xff\x3c\x4d\xa1\x8f\x45\xad\xcd\xd4\x99\xe4\x46\x11\xe9\xff\xf1\x48\xba\x69\xdb\x3c\x4e\xa2\xdd\xd9\x55\xfc\x46\xa5\x95\x22"), "firecash:qp0l70zd5x85ttwd6jv7g3s3a8llzj96d8dncn4zmhv4tlzx5k2jy2nghue25"),
         ]
         // cspell:enable
     }
@@ -528,7 +528,7 @@ mod tests {
     }
 
     /// A shielded (Orchard) address carries a 43-byte payload and round-trips
-    /// through the string form under the kasprivate HRP, decoding back to the
+    /// through the string form under the firecash HRP, decoding back to the
     /// same version and payload.
     #[test]
     fn shielded_orchard_address_roundtrip() {
@@ -541,7 +541,7 @@ mod tests {
 
         // Encodes under the mainnet HRP and decodes back identically.
         let s: String = (&address).into();
-        assert!(s.starts_with("kasprivate:"), "shielded address uses the kasprivate HRP: {s}");
+        assert!(s.starts_with("firecash:"), "shielded address uses the firecash HRP: {s}");
         let decoded: Address = s.clone().try_into().expect("shielded address must decode");
         assert_eq!(decoded, address);
         assert_eq!(decoded.payload.as_slice(), &raw[..]);
@@ -556,17 +556,17 @@ mod tests {
     #[test]
     fn test_errors() {
         // cspell:disable
-        let address_str: String = "kasprivate:qqqqqqqqqqqqq1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e".to_string();
+        let address_str: String = "firecash:qqqqqqqqqqqqq1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e".to_string();
         let address: Result<Address, AddressError> = address_str.try_into();
         assert_eq!(Err(AddressError::DecodingError('1')), address);
 
         let invalid_char = 124u8 as char;
-        let address_str: String = format!("kasprivate:qqqqqqqqqqqqq{invalid_char}qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e");
+        let address_str: String = format!("firecash:qqqqqqqqqqqqq{invalid_char}qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e");
         let address: Result<Address, AddressError> = address_str.try_into();
         assert_eq!(Err(AddressError::DecodingError(invalid_char)), address);
 
         let invalid_char = 129u8 as char;
-        let address_str: String = format!("kasprivate:qqqqqqqqqqqqq{invalid_char}qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e");
+        let address_str: String = format!("firecash:qqqqqqqqqqqqq{invalid_char}qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e");
         let address: Result<Address, AddressError> = address_str.try_into();
         assert!(matches!(address, Err(AddressError::DecodingError(_))));
 
@@ -578,11 +578,11 @@ mod tests {
         let address: Result<Address, AddressError> = address_str.try_into();
         assert_eq!(Err(AddressError::MissingPrefix), address);
 
-        let address_str: String = "kasprivate:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4l".to_string();
+        let address_str: String = "firecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4l".to_string();
         let address: Result<Address, AddressError> = address_str.try_into();
         assert_eq!(Err(AddressError::BadChecksum), address);
 
-        let address_str: String = "kasprivate:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e".to_string();
+        let address_str: String = "firecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e".to_string();
         let address: Result<Address, AddressError> = address_str.try_into();
         assert_eq!(Err(AddressError::BadChecksum), address);
         // cspell:enable

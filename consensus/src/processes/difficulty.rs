@@ -113,7 +113,7 @@ pub struct SampledDifficultyManager<T: HeaderStoreReader, U: GhostdagStoreReader
     min_difficulty_window_size: usize,
     difficulty_sample_rate: u64,
     target_time_per_block: u64,
-    /// kasprivate launch difficulty schedule (blue-score units). While
+    /// firecash launch difficulty schedule (blue-score units). While
     /// `blue_score <= low_difficulty_end_blue_score` difficulty is pinned to `genesis_target`
     /// (super-easy, CPU-mineable low-difficulty start). Between there and `ramp_end_blue_score` the
     /// difficulty *ceiling* tightens geometrically toward real difficulty. At/after
@@ -188,7 +188,7 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
 
     /// Returns the required difficulty bits for a block whose GHOSTDAG data is
     /// `ghostdag_data`, applying the KIP-0004 sampled DAA and then, during the
-    /// launch window, the kasprivate difficulty ceiling (see [`Self::launch_min_target`]).
+    /// launch window, the firecash difficulty ceiling (see [`Self::launch_min_target`]).
     pub fn calculate_difficulty_bits(&self, window: &BlockWindowHeap, ghostdag_data: &GhostdagData) -> u32 {
         let base_bits = self.calculate_base_difficulty_bits(window, ghostdag_data);
         match self.launch_min_target(ghostdag_data.blue_score) {
@@ -268,7 +268,7 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> DifficultyManagerExtension fo
     }
 }
 
-/// Pure implementation of the kasprivate launch difficulty ceiling (see
+/// Pure implementation of the firecash launch difficulty ceiling (see
 /// [`SampledDifficultyManager::launch_min_target`]). Kept free-standing so it can be
 /// unit-tested without a store-backed manager. Returns the floor on the block target
 /// (= ceiling on difficulty) at `blue_score`, or `None` when the schedule is disabled

@@ -8,20 +8,40 @@
 //! total_value_in_shielded_pool == cumulative_coinbase_issued − cumulative_fees_paid
 //! ```
 //!
-//! Two layers cooperate:
+//! Two mechanisms cooperate, and it is important to be precise about *where each
+//! one lives*, because a subtle misreading here would look like a missing
+//! consensus check when there is none:
 //!
-//! - **Public ledger** ([`SupplyLedger`]): the integer accounting of subsidy
-//!   minted into the pool (the one transparent seam, §2.7) and fees removed from
-//!   it. The pool may never hold negative value — that would mean value was
-//!   spent that was never issued.
+//! - **Public ledger** ([`SupplyLedger`], a hard consensus rule): the integer
+//!   accounting of subsidy minted into the pool (the one transparent seam, §2.7)
+//!   and fees removed from it. The pool may never hold negative value — that
+//!   would mean value was spent that was never issued. Checked after every block
+//!   in [`crate::state::apply_chain_block_to`].
 //!
-//! - **Homomorphic reconciliation** ([`reconcile`]): each Orchard action carries
-//!   a value commitment `cv_net` to `(value_in − value_out)`. Summed over the
-//!   whole accepted set, `Σ cv_net = commit(−pool_value, R)` for an aggregate
-//!   trapdoor `R` (recovered from the bundles' binding signatures — wired in the
-//!   validation task). Checking the homomorphic sum against the public pool
-//!   value turns any inflation bug from "silent counterfeiting" into "the chain
-//!   rejects", the only acceptable failure mode here.
+//! - **Homomorphic balance, enforced PER BUNDLE by the binding signature** (a
+//!   hard consensus rule, in [`crate::verify`]). Each Orchard action carries a
+//!   value commitment `cv_net` to `(value_in − value_out)`. For one bundle the
+//!   binding signature verifies under `bvk = Σ_actions cv_net − commit(value_balance, 0)`,
+//!   which is a valid RedPallas key **iff** `Σ v_net = value_balance` — i.e. the
+//!   bundle's true net value equals its declared, public `value_balance`. Since
+//!   consensus takes that same `value_balance` as the tx's fee (the amount
+//!   leaving the pool, [`crate::state::ShieldedTx::from_bundle`]) and requires it
+//!   to be non-negative, the integer ledger above is fed *crypto-pinned* numbers:
+//!   no bundle can move value the binding signature did not authorize. This is
+//!   the anti-inflation guarantee, and it is already wired.
+//!
+//! **Why there is no separate chain-level reconciliation against an aggregate
+//! trapdoor.** One might imagine summing `cv_net` over the whole accepted set and
+//! checking `Σ cv_net = commit(−pool_value, R)` for an aggregate trapdoor
+//! `R = Σ rcv`. A validator can never do this: the binding signature proves
+//! knowledge of `R` in **zero knowledge**, so `R` is never revealed on-chain and
+//! cannot be reconstructed. The only aggregate statement checkable without `R` —
+//! "each bundle's `bvk` verifies its binding signature" — is exactly the
+//! per-bundle check above; summing the bundles adds no new constraint. So the
+//! per-bundle binding signature *is* the homomorphic turnstile; there is nothing
+//! left to "wire" at the block level, and any function taking an explicit
+//! aggregate trapdoor (see [`reconcile`]) is a reference/test utility, **not** a
+//! consensus entry point.
 
 use orchard::value::{NoteValue, ValueCommitTrapdoor, ValueCommitment, ValueSum};
 
@@ -34,8 +54,10 @@ pub enum TurnstileViolation {
     PoolUnderflow { coinbase: u128, fees: u128 },
     /// An accumulation overflowed (degenerate; treated as invalid).
     Overflow,
-    /// The homomorphic value-commitment sum did not reconcile with the public
-    /// net pool value — possible inflation.
+    /// A homomorphic value-commitment sum did not reconcile with the claimed net
+    /// value under the given trapdoor. Used only by the reference [`reconcile`]
+    /// utility (see its docs) — the live consensus anti-inflation check is the
+    /// per-bundle binding signature in [`crate::verify`], which needs no trapdoor.
     CommitmentMismatch,
 }
 
@@ -151,13 +173,18 @@ impl Default for ValueCommitmentAccumulator {
     }
 }
 
-/// Reconcile the homomorphic sum of net value commitments with the public pool
-/// value (PLAN §2.6).
+/// Reference/test utility: check `Σ cv_net = commit(−pool_value, R)` for a
+/// *known* aggregate trapdoor `R` (PLAN §2.6).
 ///
-/// Each action's `cv_net` commits to `(value_in − value_out)`, so over the whole
-/// accepted set `Σ cv_net = commit(−pool_value, R)`, where `R` is the aggregate
-/// value-commitment trapdoor recovered from the bundles' binding signatures.
-/// Returns [`TurnstileViolation::CommitmentMismatch`] if they disagree.
+/// **This is not a consensus entry point.** As explained in the module docs, a
+/// validator never learns the aggregate trapdoor `R = Σ rcv` (the binding
+/// signature proves knowledge of it in zero knowledge), so consensus cannot and
+/// does not call this. The live anti-inflation guarantee is the *per-bundle*
+/// binding-signature check in [`crate::verify`], which requires no trapdoor. This
+/// function exists to demonstrate — and test — the homomorphism that check relies
+/// on: with `R` in hand (as a prover/test has), the summed net commitments open
+/// to exactly `−pool_value`. Returns [`TurnstileViolation::CommitmentMismatch`]
+/// on disagreement.
 pub fn reconcile(
     sum_cv: &ValueCommitment,
     pool_value: i64,

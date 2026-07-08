@@ -32,4 +32,9 @@ pub enum ConversionError {
 
     #[error(transparent)]
     CompressedParentsError(#[from] kaspa_consensus_core::errors::header::CompressedParentsError),
+
+    // `ConversionError` derives `Clone`, but `std::io::Error` is not `Clone`, so we
+    // carry the borsh decode failure as a string rather than `#[from]`.
+    #[error("AuxPoW borsh decode error: {0}")]
+    AuxPowDecodeError(String),
 }

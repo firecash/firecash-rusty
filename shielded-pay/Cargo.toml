@@ -1,0 +1,39 @@
+[package]
+name = "kaspa-shielded-pay"
+description = "firecash live shielded-payment client: reconstruct a coinbase note, build a real Orchard spend, and submit it as a version-2 shielded transaction over gRPC (blocker #2)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "shielded-pay"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Address parsing/formatting for the recipient and for deriving a wallet's own
+# firecash: shielded address (to hand to the miner as the reward address).
+kaspa-addresses.workspace = true
+# The version-2 shielded transaction shape (payment_tx wraps a bundle payload).
+kaspa-consensus-core.workspace = true
+# Shared logger init.
+kaspa-core.workspace = true
+# gRPC transport: get_block_dag_info / get_virtual_chain_from_block / get_block /
+# submit_transaction against a running kaspad node.
+kaspa-grpc-client.workspace = true
+kaspa-rpc-core.workspace = true
+# The shielded primitives: coinbase-note reconstruction + real Halo 2 spend proof
+# (circuit feature) and the recipient-address -> raw Orchard bytes helper.
+kaspa-shielded-core = { workspace = true, features = ["circuit"] }
+# The consensus-coupled glue: canonical shielded-tx shape + its sighash context.
+kaspa-shielded-wallet.workspace = true
+
+clap.workspace = true
+log.workspace = true
+# CSPRNG for message signing (OsRng).
+rand.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "time", "sync"] }

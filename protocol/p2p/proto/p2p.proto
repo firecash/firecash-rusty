@@ -86,6 +86,9 @@ message BlockHeader{
   bytes blueWork = 10;
   Hash pruningPoint = 14;
   uint64 blueScore = 13;
+  // Optional merged-mining (AuxPoW) witness, borsh-encoded. Empty for natively-mined
+  // blocks. Not covered by the header hash, so it never affects H_fc.
+  bytes auxPow = 15;
 }
 
 message BlockLevelParents {

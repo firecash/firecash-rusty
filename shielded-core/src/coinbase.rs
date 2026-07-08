@@ -32,6 +32,25 @@ use pasta_curves::pallas;
 
 use crate::state::{CoinbaseMint, CoinbaseNote};
 
+/// Whether `script` is a canonical Orchard payout address: exactly 43 bytes that
+/// decode to a valid Orchard [`Address`].
+///
+/// On a shielded-coinbase network every block's declared coinbase payout MUST
+/// satisfy this. Consensus validates it at **body acceptance** (before the block
+/// enters the DAG), because otherwise a block declaring a non-address payout would
+/// be accepted, and any *later* block that merges it — and must pay it — could not
+/// mint the reward note ([`coinbase_note`] would fail on a non-canonical
+/// recipient), which under the accepted-order model would stall every merger of
+/// that block. Rejecting the bad block up front (its own data) removes the hazard
+/// at the source. Requiring exactly 43 bytes also removes any ambiguity about
+/// trailing bytes after the address.
+pub fn is_canonical_orchard_payout(script: &[u8]) -> bool {
+    let Ok(bytes) = <[u8; 43]>::try_from(script) else {
+        return false;
+    };
+    Option::<Address>::from(Address::from_raw_address_bytes(&bytes)).is_some()
+}
+
 /// Deterministically derive a **canonical** coinbase note description for
 /// `recipient` from a unique `seed` (e.g. the coinbase transaction id followed by
 /// the reward's index). Consensus and the recipient's wallet both run this to get
@@ -44,7 +63,7 @@ use crate::state::{CoinbaseMint, CoinbaseNote};
 /// for that `rho` (the first candidate succeeds with overwhelming probability).
 pub fn derive_coinbase_note_desc(recipient: [u8; 43], seed: &[u8]) -> CoinbaseNoteDesc {
     // rho: hash to 64 bytes and reduce into the field for a guaranteed-canonical value.
-    let mut h = blake2b_simd::Params::new().hash_length(64).personal(b"kaspriv_cb_rho01").to_state();
+    let mut h = blake2b_simd::Params::new().hash_length(64).personal(b"firecash_cb_rho0").to_state();
     h.update(seed);
     let rho_field = pallas::Base::from_uniform_bytes(h.finalize().as_array());
     let rho_bytes = rho_field.to_repr();
@@ -53,7 +72,7 @@ pub fn derive_coinbase_note_desc(recipient: [u8; 43], seed: &[u8]) -> CoinbaseNo
     // rseed: derive with a counter until it is a valid ZIP-212 seed for this rho.
     let mut ctr: u32 = 0;
     let rseed = loop {
-        let mut hr = blake2b_simd::Params::new().hash_length(32).personal(b"kaspriv_cb_seed1").to_state();
+        let mut hr = blake2b_simd::Params::new().hash_length(32).personal(b"firecash_cb_seed").to_state();
         hr.update(seed);
         hr.update(&ctr.to_le_bytes());
         let cand: [u8; 32] = hr.finalize().as_bytes().try_into().expect("32-byte digest");

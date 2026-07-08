@@ -25,7 +25,7 @@ const CHECK_SCRIPTS_PARALLELISM_THRESHOLD: usize = 1;
 /// Verify the cryptography of a shielded transaction's Orchard bundle (PLAN §3,
 /// the audit-critical layer): the Halo 2 proof, the binding signature (balance),
 /// the per-action spend-authorization signatures, and the encoding consensus
-/// rules. The signatures are checked against the kasprivate shielded sighash,
+/// rules. The signatures are checked against the firecash shielded sighash,
 /// which binds them to this exact bundle and transaction.
 #[cfg(feature = "shielded-circuit")]
 fn verify_shielded_bundle(tx: &Transaction, network_domain: &[u8; 32]) -> TxResult<()> {

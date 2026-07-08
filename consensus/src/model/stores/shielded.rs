@@ -13,8 +13,9 @@
 //!   by each chain block so a reorg can remove an abandoned branch's nullifiers.
 //! - [`DbShieldedSupplyStore`] — the turnstile cumulative totals snapshot at each
 //!   chain block (§2.6).
-//! - [`DbShieldedAnchorsStore`] — a single ring buffer of recent finalized
-//!   anchors at the virtual tip that spends reference (§2.5).
+//! - [`DbAnchorBlockStore`] — maps each shielded tree root (anchor) to the block
+//!   that produced it, so anchor-finality is decided reorg-consistently at
+//!   validation time (canonical ancestor + `shielded_anchor_depth` deep), §2.5.
 //!
 //! The append/conflict/turnstile logic lives in `kaspa-shielded-core`; these are
 //! the rocksdb-backed persistence the virtual processor drives.
@@ -23,11 +24,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use kaspa_consensus_core::BlockHasher;
-use kaspa_database::prelude::{
-    BatchDbWriter, CachePolicy, CachedDbAccess, CachedDbItem, DirectDbWriter, StoreError, StoreResult, DB,
-};
+use kaspa_database::prelude::{BatchDbWriter, CachePolicy, CachedDbAccess, StoreError, StoreResult, DB};
 use kaspa_database::registry::DatabaseStorePrefixes;
 use kaspa_hashes::Hash;
+use kaspa_math::Uint3072;
+use kaspa_muhash::MuHash;
 use kaspa_shielded_core::tree::FrontierState;
 use kaspa_utils::mem_size::MemSizeEstimator;
 use rocksdb::WriteBatch;
@@ -251,83 +252,126 @@ impl ShieldedSupplyStoreReader for DbShieldedSupplyStore {
     }
 }
 
-// ------------------------- Finalized anchor ring -------------------------
+// ------------------------ Nullifier MuHash accumulator ------------------------
 
-/// A bounded ring buffer of the most recent finalized anchors (PLAN §2.5). A
-/// spend may prove against any anchor still present here.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnchorRingBuffer {
-    /// Maximum number of anchors retained (the anchor-depth window).
-    pub capacity: u32,
-    /// Recent anchors, oldest first.
-    pub anchors: Vec<[u8; 32]>,
+pub trait ShieldedNullifierMuHashStoreReader {
+    /// The MuHash accumulator over all spent nullifiers as of the given chain
+    /// block. A block with no shielded activity has never been written and
+    /// inherits the empty accumulator, so `default` (empty) is returned.
+    fn get(&self, block: Hash) -> StoreResult<MuHash>;
 }
 
-impl AnchorRingBuffer {
-    pub fn new(capacity: u32) -> Self {
-        Self { capacity, anchors: Vec::new() }
-    }
-
-    /// Push a newly finalized anchor, evicting the oldest beyond `capacity`.
-    pub fn push(&mut self, anchor: [u8; 32]) {
-        self.anchors.push(anchor);
-        let cap = self.capacity.max(1) as usize;
-        if self.anchors.len() > cap {
-            let overflow = self.anchors.len() - cap;
-            self.anchors.drain(0..overflow);
-        }
-    }
-
-    /// Whether `anchor` is within the current finalized window.
-    pub fn contains(&self, anchor: &[u8; 32]) -> bool {
-        self.anchors.iter().any(|a| a == anchor)
-    }
-
-    /// The most recent (tip) finalized anchor, if any.
-    pub fn latest(&self) -> Option<&[u8; 32]> {
-        self.anchors.last()
-    }
-}
-
-pub trait ShieldedAnchorsStoreReader {
-    fn get(&self) -> StoreResult<AnchorRingBuffer>;
-}
-
-/// Single-item store for the finalized-anchor ring buffer at the virtual tip.
+/// Per-chain-block snapshot of the [`MuHash`] accumulator over the global
+/// spent-nullifier set (PLAN §2.2, §2.10).
+///
+/// Unlike [`DbNullifierDiffStore`] (which records per-block *diffs* so the flat
+/// membership set can be reorged), this is an **absolute** snapshot of the
+/// accumulator *value* as of each block — mirroring [`DbShieldedSupplyStore`] and
+/// the frontier store. Because the accumulator only ever *adds* nullifiers along
+/// a given chain (a reorg recomputes from the selected parent, never subtracts
+/// from a snapshot), the stored value finalizes to a single field element and is
+/// persisted as [`Uint3072`], exactly like the UTXO multiset. It lets the
+/// shielded state root commit to double-spend prevention so a fast/pruned node
+/// can trust the nullifier set at a checkpoint without replaying from genesis.
 #[derive(Clone)]
-pub struct DbShieldedAnchorsStore {
+pub struct DbShieldedNullifierMuHashStore {
     db: Arc<DB>,
-    access: CachedDbItem<AnchorRingBuffer>,
-    default_capacity: u32,
+    access: CachedDbAccess<Hash, Uint3072, BlockHasher>,
 }
 
-impl DbShieldedAnchorsStore {
-    pub fn new(db: Arc<DB>, default_capacity: u32) -> Self {
+impl DbShieldedNullifierMuHashStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
         Self {
             db: Arc::clone(&db),
-            access: CachedDbItem::new(db, DatabaseStorePrefixes::ShieldedAnchors.into()),
-            default_capacity,
+            access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedNullifierMuHash.into()),
         }
     }
 
-    pub fn clone_with_new_cache(&self) -> Self {
-        Self::new(Arc::clone(&self.db), self.default_capacity)
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
     }
 
-    pub fn set_batch(&mut self, batch: &mut WriteBatch, ring: &AnchorRingBuffer) -> StoreResult<()> {
-        self.access.write(BatchDbWriter::new(batch), ring)
+    pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash, muhash: MuHash) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), block, muhash.try_into().expect("nullifier muhash is add-only, so finalizes"))
     }
 
-    pub fn set(&mut self, ring: &AnchorRingBuffer) -> StoreResult<()> {
-        self.access.write(DirectDbWriter::new(&self.db), ring)
+    pub fn delete_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), block)
     }
 }
 
-impl ShieldedAnchorsStoreReader for DbShieldedAnchorsStore {
-    fn get(&self) -> StoreResult<AnchorRingBuffer> {
-        match self.access.read() {
-            Ok(ring) => Ok(ring),
-            Err(StoreError::KeyNotFound(_)) => Ok(AnchorRingBuffer::new(self.default_capacity)),
+impl ShieldedNullifierMuHashStoreReader for DbShieldedNullifierMuHashStore {
+    fn get(&self, block: Hash) -> StoreResult<MuHash> {
+        match self.access.read(block) {
+            Ok(u) => Ok(u.into()),
+            Err(StoreError::KeyNotFound(_)) => Ok(MuHash::new()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+// ------------------------- Finalized anchor ring -------------------------
+
+/// An anchor (global tree root) as a database key: its 32-byte encoding.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AnchorKey(pub [u8; 32]);
+
+impl AsRef<[u8]> for AnchorKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Display for AnchorKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+pub trait AnchorBlockStoreReader {
+    /// The chain block whose shielded tree root equals `anchor`, if any block ever
+    /// produced it. `None` means no block did (the anchor is not a real tree root).
+    fn get(&self, anchor: &[u8; 32]) -> StoreResult<Option<Hash>>;
+}
+
+/// Maps each shielded tree root (anchor) to the block that produced it (PLAN §2.5).
+///
+/// An anchor is a collision-resistant hash of the entire note sequence up to a
+/// block, so it uniquely identifies `(block, its selected-chain history)`. This
+/// index lets anchor-finality be decided reorg-consistently at validation time:
+/// a spend's anchor is acceptable iff its source block is a selected-chain
+/// ancestor of the spending block **and** at least `shielded_anchor_depth` deep.
+/// Because that canonicality is re-checked via reachability on every query, the
+/// index itself is append-only and needs no reorg reverting — an anchor from an
+/// abandoned branch simply fails the ancestor check.
+#[derive(Clone)]
+pub struct DbAnchorBlockStore {
+    db: Arc<DB>,
+    access: CachedDbAccess<AnchorKey, Hash>,
+}
+
+impl DbAnchorBlockStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedAnchors.into()) }
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    pub fn set_batch(&self, batch: &mut WriteBatch, anchor: [u8; 32], block: Hash) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), AnchorKey(anchor), block)
+    }
+}
+
+impl AnchorBlockStoreReader for DbAnchorBlockStore {
+    fn get(&self, anchor: &[u8; 32]) -> StoreResult<Option<Hash>> {
+        match self.access.read(AnchorKey(*anchor)) {
+            Ok(block) => Ok(Some(block)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -340,16 +384,17 @@ mod tests {
     use kaspa_database::prelude::ConnBuilder;
 
     #[test]
-    fn anchor_ring_evicts_oldest() {
-        let mut r = AnchorRingBuffer::new(3);
-        for i in 0u8..5 {
-            r.push([i; 32]);
-        }
-        assert_eq!(r.anchors.len(), 3);
-        assert!(!r.contains(&[0; 32]));
-        assert!(r.contains(&[2; 32]));
-        assert!(r.contains(&[4; 32]));
-        assert_eq!(r.latest(), Some(&[4u8; 32]));
+    fn anchor_block_index_roundtrip() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbAnchorBlockStore::new(db.clone(), CachePolicy::Count(16));
+        let anchor = [9u8; 32];
+        let block = Hash::from_bytes([3u8; 32]);
+        assert_eq!(store.get(&anchor).unwrap(), None);
+        let mut b = WriteBatch::default();
+        store.set_batch(&mut b, anchor, block).unwrap();
+        db.write(b).unwrap();
+        assert_eq!(store.get(&anchor).unwrap(), Some(block));
+        assert_eq!(store.get(&[0u8; 32]).unwrap(), None);
     }
 
     #[test]

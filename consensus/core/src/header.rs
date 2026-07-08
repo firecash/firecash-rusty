@@ -1,4 +1,4 @@
-use crate::{BlueWorkType, hashing};
+use crate::{BlueWorkType, auxpow::AuxPow, hashing};
 use borsh::{BorshDeserialize, BorshSerialize};
 use itertools::Itertools;
 use kaspa_hashes::Hash;
@@ -150,6 +150,19 @@ pub struct Header {
     pub blue_work: BlueWorkType,
     pub blue_score: u64,
     pub pruning_point: Hash,
+    /// Optional merged-mining (AuxPoW) proof. **Deliberately excluded from the header
+    /// hash** (`hashing::header::hash` serializes only the fields above), so `H_fc`
+    /// stays stable whether the block was mined natively or via a parent kHeavyHash
+    /// block. It is a witness that travels alongside the header (borsh/serde/p2p) and
+    /// is consulted only by the PoW gate once merged mining activates. `None` for a
+    /// natively-mined block.
+    ///
+    /// `#[serde(default)]` (without `skip_serializing_if`) keeps this tolerant of
+    /// inputs that omit the field — e.g. RPC JSON — while still always emitting it for
+    /// non-self-describing formats like bincode (the header store), where a skipped
+    /// field would corrupt the round-trip.
+    #[serde(default)]
+    pub aux_pow: Option<Box<AuxPow>>,
 }
 
 impl Header {
@@ -182,9 +195,17 @@ impl Header {
             blue_work,
             blue_score,
             pruning_point,
+            aux_pow: None,
         };
         header.finalize();
         header
+    }
+
+    /// Attach a merged-mining (AuxPoW) proof to a finalized header. The header hash is
+    /// unaffected (aux data is not hashed), so this does not require re-finalizing.
+    pub fn with_aux_pow(mut self, aux_pow: AuxPow) -> Self {
+        self.aux_pow = Some(Box::new(aux_pow));
+        self
     }
 
     /// Finalizes the header and recomputes the header hash
@@ -223,6 +244,7 @@ impl Header {
             blue_work: 0.into(),
             blue_score: 0,
             pruning_point: Default::default(),
+            aux_pow: None,
         }
     }
 }
@@ -238,6 +260,13 @@ impl MemSizeEstimator for Header {
         size_of::<Self>()
             + self.parents_by_level.0.iter().map(|(_, l)| l.len()).sum::<usize>() * size_of::<Hash>()
             + self.parents_by_level.0.len() * size_of::<(u8, Vec<Hash>)>()
+            // The AuxPoW witness lives on the heap (parent header + coinbase + Merkle branch).
+            + self.aux_pow.as_ref().map_or(0, |a| {
+                size_of::<AuxPow>()
+                    + a.parent_header.estimate_mem_bytes()
+                    + a.parent_coinbase.payload.len()
+                    + a.coinbase_merkle_branch.len() * size_of::<Hash>()
+            })
     }
 }
 

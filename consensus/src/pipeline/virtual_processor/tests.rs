@@ -165,7 +165,7 @@ impl TestContext {
         self
     }
 
-    /// Build a template on the current virtual tips and grind a REAL FishHashPlus
+    /// Build a template on the current virtual tips and grind a REAL kHeavyHash
     /// nonce for it (no skip_proof_of_work). At the easiest target this is 1-2
     /// hashes. Returns the mined, finalized block.
     fn mine_real_pow_block(&mut self) -> Block {
@@ -193,15 +193,14 @@ impl TestContext {
 }
 
 /// LIVE real-PoW proof: mine a chain of blocks whose PoW is the actual
-/// FishHashPlus (KarlsenHashV2) — no `skip_proof_of_work` — while paying a
-/// shielded (Orchard) coinbase. Every block's header goes through the real
-/// `check_pow` path in the pipeline, so reaching UTXOValid means the fishhash
-/// PoW verifies on real blocks AND the shielded coinbase mints into the pool.
-/// This is the first test that exercises FishHashPlus in consensus for real; all
-/// others skip PoW. Uses the easiest target (0x207fffff) so CPU grinding is ~1-2
-/// hashes; run in release so the light cache builds in ~3s.
+/// kHeavyHash — no `skip_proof_of_work` — while paying a shielded (Orchard)
+/// coinbase. Every block's header goes through the real `check_pow` path in the
+/// pipeline, so reaching UTXOValid means the kHeavyHash PoW verifies on real
+/// blocks AND the shielded coinbase mints into the pool. This is the first test
+/// that exercises kHeavyHash in consensus for real; all others skip PoW. Uses the
+/// easiest target (0x207fffff) so CPU grinding is ~1-2 hashes.
 #[tokio::test]
-async fn real_fishhash_pow_mines_shielded_chain_live() {
+async fn real_kheavyhash_pow_mines_shielded_chain_live() {
     let mut params = MAINNET_PARAMS.clone();
     params.shielded_coinbase = true;
     // Real PoW (skip_proof_of_work stays false) but trivial difficulty seeded from
@@ -221,7 +220,7 @@ async fn real_fishhash_pow_mines_shielded_chain_live() {
         assert!(status.is_utxo_valid_or_pending(), "real-PoW shielded block must be accepted");
     }
 
-    // The chain tip is UTXO-valid: real FishHashPlus verified every header and the
+    // The chain tip is UTXO-valid: real kHeavyHash verified every header and the
     // shielded coinbase advanced the pool anchor past the empty tree.
     ctx.assert_valid_utxo_tip();
     let empty_anchor = kaspa_shielded_core::Anchor::empty_tree().to_bytes();
@@ -295,14 +294,14 @@ async fn template_mining_sanity_test() {
 /// and the block would not be UTXO-valid). No transparent coinbase value is created.
 #[tokio::test]
 async fn shielded_coinbase_mints_into_the_pool_live() {
-    // kasprivate main params with the shielded coinbase turned on.
+    // firecash main params with the shielded coinbase turned on.
     let mut params = MAINNET_PARAMS.clone();
     params.shielded_coinbase = true;
     let config = ConfigBuilder::new(params).skip_proof_of_work().build();
 
     let mut ctx = TestContext::new(TestConsensus::new(&config));
     // The miner is paid in the shielded pool: its reward "script_public_key" is a
-    // real 43-byte Orchard address (what a kasprivate miner reports).
+    // real 43-byte Orchard address (what a firecash miner reports).
     let recipient = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("valid orchard address");
     ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)), vec![]);
 
@@ -351,6 +350,9 @@ async fn real_shielded_spend_through_mined_block() {
         .edit_consensus_params(|p| {
             p.genesis.bits = 0x207fffff;
             p.blockrate.finality_depth = 5;
+            // Small shielded-spend maturity so the coinbase note's anchor matures
+            // within a short chain (a spend must prove a matured, canonical anchor).
+            p.blockrate.shielded_anchor_depth = 5;
         })
         .build();
     let net = config.genesis.hash.as_bytes();
@@ -375,13 +377,12 @@ async fn real_shielded_spend_through_mined_block() {
     let note_value = cb.outputs[0].value;
     let anchor1 = ctx.consensus.virtual_processor().shielded_anchor_at(block1.header.hash).unwrap();
 
-    // Mine empty blocks until block 1's anchor enters the finalized window.
-    let mut guard = 0;
-    while !ctx.consensus.virtual_processor().shielded_is_finalized_anchor(&anchor1).unwrap() {
+    // Mine empty blocks until block 1's anchor matures (its source block, block 1 at
+    // blue score 1, must be >= shielded_anchor_depth deep below the spend block).
+    // depth = 5, so mining 6 blocks puts the spend block well past maturity.
+    for _ in 0..6 {
         let b = ctx.mine_real_pow_block();
         ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
-        guard += 1;
-        assert!(guard < 30, "coinbase-note anchor never finalized");
     }
 
     // Wallet side: build a REAL proven spend of block 1's coinbase note, paying a
@@ -416,6 +417,194 @@ async fn real_shielded_spend_through_mined_block() {
     assert_eq!(ctx.consensus.block_status(spend_block_hash), BlockStatus::StatusUTXOValid);
     let spend_anchor = ctx.consensus.virtual_processor().shielded_anchor_at(spend_block_hash).unwrap();
     assert_ne!(spend_anchor, anchor1, "spend block's shielded state advanced");
+}
+
+/// NEGATIVE / soundness + LIVENESS (PLAN §2.5, task #31): a **cryptographically
+/// valid** shielded spend whose anchor has not yet matured must not be applied —
+/// but it must be **dropped**, NOT disqualify the block that merges it.
+///
+/// The spend below is a real, proven Orchard bundle against block 1's *real*
+/// anchor — the binding signature, the Halo 2 proof and the spend-auth signature
+/// all verify. The ONLY thing wrong is that the anchor is too shallow: it has not
+/// reached `shielded_anchor_depth` below the spending block, so `is_shielded_anchor_final`
+/// correctly refuses it.
+///
+/// This is the regression test for the live-mainnet halt: the offending spend is
+/// immutably embedded in an already-mined merged block, so hard-rejecting the
+/// MERGING block made that block un-mergeable and froze the whole selected chain.
+/// The fix drops the spend (exactly as a nullifier double-spend is dropped): the
+/// merging child stays UTXO-valid, the sink advances, and — because the spend is
+/// filtered out before the state transition — no value is ever created (drop-safety
+/// is additionally pinned by the `state`/`shielded` unit tests).
+#[tokio::test]
+async fn immature_shielded_anchor_spend_is_dropped_not_fatal() {
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    // A *large* maturity so a short chain can never mature the anchor: the spend
+    // is guaranteed immature no matter the exact blue score.
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+            p.blockrate.shielded_anchor_depth = 1_000;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    // Mine block 0 (genesis merge, no note) and block 1 (mints the position-0 note).
+    let mut block1 = None;
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        block1 = Some(b);
+    }
+    let block1 = block1.unwrap();
+    let cb = &block1.transactions[0];
+    let cb_txid = cb.id();
+    let note_value = cb.outputs[0].value;
+    // Sanity: the note's anchor exists and is indexed (so rejection is due to
+    // *immaturity*, not an unknown anchor).
+    let anchor1 = ctx.consensus.virtual_processor().shielded_anchor_at(block1.header.hash).unwrap();
+    let sink_before = ctx.consensus.get_sink();
+
+    // Build a REAL proven spend against block 1's anchor — but do NOT mine the
+    // ~1000 blocks needed to mature it.
+    let recipient_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap();
+    let output_value = note_value - 2_000;
+    let mut spend_tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    let tx_ctx = spend_tx.shielded_sighash_context();
+    let payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend(
+        miner_seed,
+        cb_txid.as_bytes(),
+        0,
+        note_value,
+        recipient_addr,
+        output_value,
+        &net,
+        &tx_ctx,
+    )
+    .expect("wallet builds a real spend bundle");
+    spend_tx.payload = payload;
+    spend_tx.finalize();
+    // The bundle references block 1's real anchor (so the only defect is maturity).
+    let bundle = kaspa_shielded_core::bundle::ShieldedBundle::from_bytes(&spend_tx.payload).unwrap();
+    assert_eq!(bundle.anchor, anchor1, "spend proves against block 1's real anchor");
+
+    // Mine block B carrying the immature spend in its body. In Kaspa a block's own
+    // transactions are *accepted* by the block that merges it, not by itself, so B's
+    // body validity does not yet exercise the anchor-finality gate.
+    let spend_block = ctx.mine_real_pow_block_with(vec![spend_tx]);
+    assert_eq!(spend_block.transactions.len(), 2, "the immature spend was included in the block body");
+    ctx.consensus.validate_and_insert_block(spend_block).virtual_state_task.await.unwrap();
+
+    // Mine child C on top of B. C *merges* B, so B's immature spend now enters C's
+    // accepted set and is checked by the shielded state transition. The spend proves
+    // against an anchor nowhere near `shielded_anchor_depth` deep, so the maturity
+    // gate refuses it — and DROPS it (does not disqualify C). C therefore validates
+    // normally (its coinbase mints, the immature spend is simply ignored) and the
+    // chain keeps advancing. This is the fix for the observed mainnet halt.
+    let child = ctx.mine_real_pow_block();
+    let child_hash = child.header.hash;
+    ctx.consensus.validate_and_insert_block(child).virtual_state_task.await.unwrap();
+
+    // LIVENESS: the block merging an immature-anchor spend is NOT disqualified — it is
+    // UTXO-valid and the sink advances to it. (Before the fix this was
+    // StatusDisqualifiedFromChain and the chain froze here.)
+    assert_eq!(
+        ctx.consensus.block_status(child_hash),
+        BlockStatus::StatusUTXOValid,
+        "merging an immature-anchor spend must NOT disqualify the block (drop the spend, keep liveness)"
+    );
+    assert_eq!(ctx.consensus.get_sink(), child_hash, "the sink advances to the child — the chain did not halt");
+    assert_ne!(ctx.consensus.get_sink(), sink_before, "the chain advanced past the pre-spend sink");
+}
+
+/// NEGATIVE / soundness (PLAN §2.5, task #29 — the shallow-anchor value-creation
+/// vector): the anchor-finality gate `is_shielded_anchor_final` must reject an
+/// anchor whose source block is **not a selected-chain ancestor** of the spending
+/// block's selected parent. This is what stops a spend from proving its input note
+/// into a tree state that is not in its own past — whether that state lives on an
+/// abandoned reorg branch or simply in the chain's *future*. Both reduce to the
+/// same `is_chain_ancestor_of(source, selected_parent)` check, so we exercise it on
+/// a plain linear chain (no reorg orchestration needed): an anchor from a *later*
+/// block is not an ancestor of an *earlier* selected parent.
+///
+/// Maturity is deliberately made trivial (`shielded_anchor_depth = 1`) and the
+/// blue score passed generously, so the ONLY thing under test here is canonicality
+/// — the maturity dimension is covered by
+/// `immature_shielded_anchor_spend_is_dropped_not_fatal`.
+#[tokio::test]
+async fn non_canonical_anchor_is_not_final() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff; // trivial real PoW
+            p.blockrate.shielded_anchor_depth = 1; // make maturity trivial; isolate canonicality
+        })
+        .build();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    // Mine a linear shielded chain and record each block's hash in chain order.
+    let mut chain = Vec::new();
+    for _ in 0..6 {
+        let b = ctx.mine_real_pow_block();
+        let h = b.header.hash;
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+        chain.push(h);
+    }
+
+    let vp = ctx.consensus.virtual_processor();
+    let empty_anchor = kaspa_shielded_core::Anchor::empty_tree().to_bytes();
+    let blue_score = |h: Hash| ctx.consensus.get_header(h).unwrap().blue_score;
+
+    // p (earlier) and q (later, a chain-descendant of p): both have minted notes, so
+    // their committed anchors are non-empty and distinct (the tree advanced p→q).
+    let (p, q) = (chain[2], chain[4]);
+    assert!(ctx.consensus.reachability_service().is_chain_ancestor_of(p, q), "p precedes q on the selected chain");
+    assert!(!ctx.consensus.reachability_service().is_chain_ancestor_of(q, p), "q does NOT precede p");
+    let anchor_p = vp.shielded_anchor_at(p).unwrap();
+    let anchor_q = vp.shielded_anchor_at(q).unwrap();
+    assert_ne!(anchor_p, empty_anchor, "p minted a note (non-empty anchor)");
+    assert_ne!(anchor_q, empty_anchor, "q minted a note (non-empty anchor)");
+    assert_ne!(anchor_p, anchor_q, "the note-commitment tree advanced from p to q");
+
+    // POSITIVE: p's anchor is final relative to a spending block whose selected
+    // parent is q — p is a canonical ancestor of q and (depth=1) matured.
+    assert!(
+        vp.is_shielded_anchor_final(&anchor_p, q, blue_score(q)),
+        "an anchor from a canonical ancestor, matured, must be final"
+    );
+
+    // NEGATIVE (canonicality — the #29 defense): q's anchor must NOT be final for a
+    // spending block whose selected parent is p. q is not in p's past, so proving a
+    // note into q's tree from a p-rooted block would be creating value out of a
+    // state that does not exist there. Rejected regardless of (generous) blue score.
+    assert!(
+        !vp.is_shielded_anchor_final(&anchor_q, p, u64::MAX),
+        "an anchor whose source is not an ancestor of the selected parent must be rejected"
+    );
+
+    // NEGATIVE (fabricated): an anchor no block ever produced is not a real tree root
+    // of any committed block, so it can never be final.
+    assert!(
+        !vp.is_shielded_anchor_final(&[0x33u8; 32], q, u64::MAX),
+        "an anchor no block ever produced must be rejected"
+    );
+
+    // Genesis's empty-tree anchor is always final (canonical + mature by definition).
+    assert!(vp.is_shielded_anchor_final(&empty_anchor, q, blue_score(q)), "the empty-tree (genesis) anchor is always final");
 }
 
 #[tokio::test]

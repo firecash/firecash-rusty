@@ -97,6 +97,9 @@ pub enum RuleError {
     #[error("coinbase blue score of {0} is not the expected value of {1}")]
     BadCoinbasePayloadBlueScore(u64, u64),
 
+    #[error("coinbase payout address is not a canonical Orchard address (required on a shielded network)")]
+    BadShieldedCoinbasePayout,
+
     #[error("transaction in isolation validation failed for tx {0}: {1}")]
     TxInIsolationValidationFailed(TransactionId, TxRuleError),
 

@@ -879,7 +879,7 @@ impl ConsensusApi for Consensus {
 
         // Part 1: Add samples from pruning point headers.
         // Note: Kaspa prepended 16 hardcoded pre-genesis (daa 0..1312860, Nov-2021) samples here
-        // because its mainnet used a checkpoint-style genesis. kasprivate cuts a fresh genesis at
+        // because its mainnet used a checkpoint-style genesis. firecash cuts a fresh genesis at
         // daa_score 0, so there is no pre-genesis history — seeding those Kaspa anchors would badly
         // skew daa-score→timestamp estimation. Samples come from pruning point headers and recent
         // chain blocks (Part 2) like every other network.

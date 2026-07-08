@@ -1,0 +1,317 @@
+//! Merged-mining (AuxPoW) proof-of-work verification — the "work" half of
+//! Option-2 dual acceptance. The data type and the structural (commitment +
+//! coinbase-Merkle) checks live in [`kaspa_consensus_core::auxpow`]; here we add
+//! the piece that needs the kHeavyHash [`State`]: does the parent header's PoW
+//! clear *our* target.
+//!
+//! A FireCash block is accepted if it satisfies **either** PoW path against its own
+//! target (`header.bits`):
+//! - **native** — `kHeavyHash(header)` clears the target (the mode a solo
+//!   `firecash-miner` produces); or
+//! - **aux** — it carries an [`AuxPow`] whose parent header's kHeavyHash clears the
+//!   target and is bound to this block's hash.
+//!
+//! Both are the *same* hash function against the *same* target, so their work adds
+//! directly — which is exactly why the chain runs kHeavyHash. Crucially, the aux
+//! target is FireCash's own (set by our DAA), **not** Kaspa's: a single Kaspa hash
+//! that fails Kaspa's hard target routinely clears our easy one.
+
+use kaspa_consensus_core::{auxpow::AuxPow, header::Header};
+use kaspa_hashes::Hash;
+use kaspa_math::Uint256;
+
+use crate::State;
+
+/// The parent header's kHeavyHash value, computed independently of the parent's own
+/// `bits` (we compare it against *our* target, not the parent's). This is the work
+/// metric for an AuxPoW block.
+fn parent_pow(aux: &AuxPow) -> Uint256 {
+    State::new(&aux.parent_header).calculate_pow(aux.parent_header.nonce)
+}
+
+/// Full AuxPoW verification for a FireCash block with hash `expected` and target
+/// `target` (decoded from its `bits`):
+/// 1. the parent coinbase commits to `expected` exactly once and is Merkle-included
+///    under the parent header ([`AuxPow::verify_binding`]); **and**
+/// 2. the parent header's kHeavyHash clears `target`.
+pub fn verify_aux_pow(aux: &AuxPow, expected: Hash, target: Uint256) -> bool {
+    aux.verify_binding(expected) && parent_pow(aux) <= target
+}
+
+/// The Option-2 dual-acceptance PoW gate. Returns `(passed, pow)` mirroring
+/// [`State::check_pow`]: `passed` is whether the block's PoW is valid under either
+/// path, and `pow` is the work value for block-level math (the parent's kHeavyHash
+/// for an aux block, the header's own for a native block).
+///
+/// `header.hash` is the commitment `H_fc` an aux parent must carry — it is the
+/// header hash *excluding* any AuxPoW data, so it is stable regardless of how the
+/// block was mined.
+pub fn check_pow_dual(header: &Header, aux: Option<&AuxPow>) -> (bool, Uint256) {
+    match aux {
+        Some(a) => {
+            let target = Uint256::from_compact_target_bits(header.bits);
+            let pow = parent_pow(a);
+            (verify_aux_pow(a, header.hash, target), pow)
+        }
+        None => State::new(header).check_pow(header.nonce),
+    }
+}
+
+/// Merged-mining-aware PoW gate — the single entry point the header pipeline calls,
+/// so the day-14 activation is the only switch. Acceptance is genuinely *either/or*:
+///
+/// - A valid **native** nonce always suffices, even if a (possibly bogus) aux witness
+///   is also attached. Because the aux field is not covered by `H_fc` and could be
+///   stripped or replaced in transit, it must never be able to *invalidate* a block
+///   that already clears the native target — so the native path is tried first.
+/// - Otherwise, once `merged_mining_active` is `true`, a valid **AuxPoW** proof is
+///   accepted, and its work value is the parent's kHeavyHash.
+///
+/// Before activation the aux witness is ignored entirely. Returns `(passed, pow)` as
+/// in [`check_pow_dual`]; `pow` is the work value used for block-level math.
+pub fn check_pow_gated(header: &Header, aux: Option<&AuxPow>, merged_mining_active: bool) -> (bool, Uint256) {
+    let (native_ok, native_pow) = State::new(header).check_pow(header.nonce);
+    if native_ok {
+        return (true, native_pow);
+    }
+    if merged_mining_active {
+        if let Some(a) = aux {
+            let target = Uint256::from_compact_target_bits(header.bits);
+            if verify_aux_pow(a, header.hash, target) {
+                return (true, parent_pow(a));
+            }
+        }
+    }
+    (false, native_pow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaspa_consensus_core::auxpow::AuxPow;
+    use kaspa_consensus_core::header::Header;
+    use kaspa_consensus_core::merkle::calc_hash_merkle_root;
+    use kaspa_consensus_core::subnets::{SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_NATIVE};
+    use kaspa_consensus_core::tx::Transaction;
+    use kaspa_consensus_core::{hashing, BlueWorkType};
+    use kaspa_hashes::{Hash, ZERO_HASH};
+    use kaspa_merkle::merkle_hash;
+
+    const EASY_BITS: u32 = 0x207f_ffff; // target ~2^255 → ~half of nonces pass
+
+    fn target(bits: u32) -> Uint256 {
+        Uint256::from_compact_target_bits(bits)
+    }
+
+    /// A FireCash block header; its `.hash` is the commitment `H_fc`.
+    fn firecash_header(seed: u64, bits: u32) -> Header {
+        Header::new_finalized(
+            1,
+            vec![vec![Hash::from_u64_word(seed)]].try_into().unwrap(),
+            Hash::from_u64_word(seed.wrapping_mul(3)),
+            ZERO_HASH,
+            ZERO_HASH,
+            123_456,
+            bits,
+            0,
+            0,
+            BlueWorkType::from(0u64),
+            0,
+            ZERO_HASH,
+        )
+    }
+
+    fn coinbase_committing(commitment: Hash) -> Transaction {
+        let payload = AuxPow::embed_commitment(&[0xaa, 0xbb], commitment, &[0xcc]);
+        Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, payload)
+    }
+
+    fn tx(tag: u8) -> Transaction {
+        Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, tag as u64, vec![tag; 4])
+    }
+
+    /// Compute the leaf-0 (coinbase) Merkle branch, replicating Kaspa's tx-tree
+    /// construction *including its None/ZERO propagation for sparse right subtrees*
+    /// (see `kaspa_merkle::calc_merkle_root_with_hasher`). Asserted below to
+    /// reproduce `calc_hash_merkle_root`, so the verifier and this helper agree.
+    fn leaf0_branch(txs: &[Transaction]) -> Vec<Hash> {
+        if txs.len() <= 1 {
+            return vec![];
+        }
+        let np = txs.len().next_power_of_two();
+        let mut level: Vec<Option<Hash>> = (0..np).map(|i| txs.get(i).map(hashing::tx::hash)).collect();
+        let mut branch = vec![];
+        while level.len() > 1 {
+            branch.push(level[1].unwrap_or(ZERO_HASH));
+            let mut next = Vec::with_capacity(level.len() / 2);
+            let mut t = 0;
+            while t < level.len() {
+                let node = match level[t] {
+                    None => None, // Kaspa keeps a node None when its left child is None
+                    Some(l) => Some(merkle_hash(l, level[t + 1].unwrap_or(ZERO_HASH))),
+                };
+                next.push(node);
+                t += 2;
+            }
+            level = next;
+        }
+        branch
+    }
+
+    /// Build a parent block over `txs` (coinbase at index 0) and grind its nonce
+    /// until its kHeavyHash clears `target`. Returns the mined parent header + the
+    /// coinbase leaf-0 branch.
+    fn mine_parent(txs: &[Transaction], bits: u32) -> (Header, Vec<Hash>) {
+        let root = calc_hash_merkle_root(txs.iter());
+        let branch = leaf0_branch(txs);
+        // Sanity: our hand-rolled branch must fold back to Kaspa's root.
+        let mut acc = hashing::tx::hash(&txs[0]);
+        for s in &branch {
+            acc = merkle_hash(acc, *s);
+        }
+        assert_eq!(acc, root, "leaf0_branch must reproduce calc_hash_merkle_root");
+
+        let mut parent = Header::from_precomputed_hash(ZERO_HASH, vec![Hash::from_u64_word(0xdead)]);
+        parent.hash_merkle_root = root;
+        parent.timestamp = 555;
+        parent.bits = bits;
+
+        let state = State::new(&parent);
+        let tgt = target(bits);
+        let mut nonce = 0u64;
+        while state.calculate_pow(nonce) > tgt {
+            nonce += 1;
+            assert!(nonce < 1 << 20, "easy target should be hit quickly");
+        }
+        parent.nonce = nonce;
+        (parent, branch)
+    }
+
+    #[test]
+    fn native_path_unchanged_by_dual_gate() {
+        // With no aux proof, check_pow_dual is exactly the native check.
+        let mut h = firecash_header(1, EASY_BITS);
+        let state = State::new(&h);
+        let mut nonce = 0u64;
+        while !state.check_pow(nonce).0 {
+            nonce += 1;
+        }
+        h.nonce = nonce;
+        h.finalize();
+        assert!(check_pow_dual(&h, None).0, "a valid native nonce passes the dual gate");
+    }
+
+    #[test]
+    fn aux_pow_accepts_single_tx_parent() {
+        let fc = firecash_header(2, EASY_BITS);
+        let hfc = fc.hash;
+        let cb = coinbase_committing(hfc);
+        let (parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
+        let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: branch };
+
+        assert!(verify_aux_pow(&aux, hfc, target(EASY_BITS)), "real mined parent, correct commitment → valid");
+        let (passed, _pow) = check_pow_dual(&fc, Some(&aux));
+        assert!(passed, "dual gate accepts the aux block");
+    }
+
+    #[test]
+    fn aux_pow_accepts_multi_tx_parent() {
+        // A deeper (5-tx) parent Merkle tree exercises the sparse-subtree branch.
+        let fc = firecash_header(3, EASY_BITS);
+        let hfc = fc.hash;
+        let cb = coinbase_committing(hfc);
+        let txs = vec![cb.clone(), tx(1), tx(2), tx(3), tx(4)];
+        let (parent, branch) = mine_parent(&txs, EASY_BITS);
+        let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: branch };
+        assert!(verify_aux_pow(&aux, hfc, target(EASY_BITS)), "5-tx parent, correct commitment → valid");
+    }
+
+    #[test]
+    fn aux_pow_rejects_wrong_commitment() {
+        let fc = firecash_header(4, EASY_BITS);
+        let cb = coinbase_committing(fc.hash);
+        let (parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
+        let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: branch };
+        // A different FireCash block cannot claim this parent's work.
+        let other = firecash_header(999, EASY_BITS).hash;
+        assert!(!verify_aux_pow(&aux, other, target(EASY_BITS)), "parent commits to fc, not `other`");
+    }
+
+    #[test]
+    fn aux_pow_rejects_insufficient_work() {
+        // Mine only to the easy target, then demand an impossible one (bits=0 ⇒ target 0).
+        let fc = firecash_header(5, EASY_BITS);
+        let hfc = fc.hash;
+        let cb = coinbase_committing(hfc);
+        let (parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
+        let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: branch };
+        assert!(!verify_aux_pow(&aux, hfc, target(0)), "parent PoW does not clear an impossible target");
+    }
+
+    #[test]
+    fn aux_pow_rejects_tampered_merkle_root() {
+        // If the parent's committed merkle root does not match the coinbase+branch,
+        // inclusion fails deterministically — the coinbase (and thus H_fc) is no
+        // longer proven to be under the PoW-bearing header.
+        let fc = firecash_header(6, EASY_BITS);
+        let hfc = fc.hash;
+        let cb = coinbase_committing(hfc);
+        let (mut parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
+        parent.hash_merkle_root = Hash::from_bytes([0x77u8; 32]); // not the real root
+        let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: branch };
+        assert!(!aux.verify_coinbase_inclusion(), "coinbase no longer folds to the (tampered) root");
+        assert!(!verify_aux_pow(&aux, hfc, target(EASY_BITS)), "binding failure rejects the block");
+    }
+
+    #[test]
+    fn gate_ignores_aux_until_active() {
+        // A valid aux block: correct commitment + mined parent.
+        let fc = firecash_header(42, EASY_BITS);
+        let cb = coinbase_committing(fc.hash);
+        let (parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
+        let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: branch };
+
+        // Before activation the aux witness must have *no effect* — the gate is exactly
+        // the native-only check (deterministic regardless of whether fc's nonce passes).
+        assert_eq!(
+            check_pow_gated(&fc, Some(&aux), false),
+            check_pow_dual(&fc, None),
+            "an inactive gate ignores the aux proof entirely"
+        );
+        // Once active, the valid aux proof is accepted.
+        assert!(check_pow_gated(&fc, Some(&aux), true).0, "an active gate accepts the valid aux proof");
+    }
+
+    #[test]
+    fn native_block_not_invalidated_by_bogus_aux() {
+        // A validly native-mined header ...
+        let mut fc = firecash_header(77, EASY_BITS);
+        let state = State::new(&fc);
+        let mut nonce = 0u64;
+        while !state.check_pow(nonce).0 {
+            nonce += 1;
+        }
+        fc.nonce = nonce;
+        fc.finalize();
+        // ... with a bogus aux attached (commits to a different block).
+        let cb = coinbase_committing(firecash_header(999, EASY_BITS).hash);
+        let bogus = AuxPow { parent_header: firecash_header(0, EASY_BITS), parent_coinbase: cb, coinbase_merkle_branch: vec![] };
+        // The native path is tried first, so the block is accepted despite the invalid
+        // aux — an unhashed, tamperable witness must never invalidate a valid block.
+        assert!(check_pow_gated(&fc, Some(&bogus), true).0, "valid native PoW is not invalidated by a bogus aux witness");
+    }
+
+    #[test]
+    fn aux_pow_rejects_stolen_pow_for_different_block() {
+        // The canonical merged-mining attack: reuse one parent's PoW for a *second*
+        // FireCash block. The parent commits to fc_a's hash, so fc_b cannot claim it.
+        let fc_a = firecash_header(10, EASY_BITS);
+        let fc_b = firecash_header(11, EASY_BITS);
+        let cb = coinbase_committing(fc_a.hash);
+        let (parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
+        let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: branch };
+        assert!(verify_aux_pow(&aux, fc_a.hash, target(EASY_BITS)), "legit for fc_a");
+        assert!(!verify_aux_pow(&aux, fc_b.hash, target(EASY_BITS)), "same PoW cannot be stolen for fc_b");
+        assert!(!check_pow_dual(&fc_b, Some(&aux)).0, "dual gate rejects the stolen-PoW block");
+    }
+}

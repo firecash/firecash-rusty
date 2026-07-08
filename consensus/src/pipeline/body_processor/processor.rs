@@ -62,6 +62,11 @@ pub struct BlockBodyProcessor {
     pub(super) block_lane_limits: BlockLaneLimits,
     pub(super) genesis: GenesisBlock,
     pub(super) _ghostdag_k: KType,
+    /// Whether the block reward is a shielded (Orchard) coinbase note. When set,
+    /// every block's declared coinbase payout address must be a canonical Orchard
+    /// address (validated at body acceptance so a bad-address block never enters
+    /// the DAG to stall a later merger's coinbase mint — see the R2 halt vector).
+    pub(super) shielded_coinbase: bool,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -115,6 +120,7 @@ impl BlockBodyProcessor {
             block_lane_limits: params.block_lane_limits,
             genesis: params.genesis.clone(),
             _ghostdag_k: params.ghostdag_k(),
+            shielded_coinbase: params.shielded_coinbase,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),

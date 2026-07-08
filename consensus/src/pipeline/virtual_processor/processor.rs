@@ -121,6 +121,14 @@ pub struct VirtualStateProcessor {
     pub(super) max_block_parents: u8,
     pub(super) mergeset_size_limit: u64,
     pub(super) finality_depth: u64,
+    /// Shielded-spend anchor maturity (PLAN §2.5): a shielded spend must prove its
+    /// input note into the anchor as of the chain block this many blue-score units
+    /// back from the sink. Decoupled from `finality_depth` (which governs chain
+    /// finality/pruning) so a note becomes spendable in ~10 minutes rather than the
+    /// full ~12-hour finality window.
+    pub(super) shielded_anchor_depth: u64,
+    /// The Orchard empty-tree anchor, precomputed (always canonical/mature, PLAN §2.5).
+    pub(super) empty_shielded_anchor: [u8; 32],
     pub(super) mempool_mass_cofactors: kaspa_consensus_core::config::params::ForkedParam<kaspa_consensus_core::mass::MassCofactors>,
     pub(super) block_version: ForkedParam<u16>,
 
@@ -187,7 +195,7 @@ pub struct VirtualStateProcessor {
     // commit hook is wired separately.
     pub(super) shielded_state_manager: crate::processes::shielded::ShieldedStateManager,
 
-    // kasprivate: when true, the coinbase reward enters the shielded pool as
+    // firecash: when true, the coinbase reward enters the shielded pool as
     // coinbase notes (no transparent outputs) — see `build_coinbase_mint`.
     pub(super) shielded_coinbase: bool,
 
@@ -211,13 +219,27 @@ impl VirtualStateProcessor {
         counters: Arc<ProcessingCounters>,
         mining_rules: Arc<MiningRules>,
     ) -> Self {
-        // Reorg-safe driver over the shielded state stores. Anchor depth (the
-        // finalized-anchor window, PLAN §2.5) is tied to finality: spends prove
-        // against anchors at least a finality window deep.
+        // Mandatory-circuit guard (consensus safety): on a shielded-coinbase
+        // network every block reward — and every payment — lives in the Orchard
+        // pool, so a node that cannot verify Halo 2 proofs would reject every
+        // shielded transaction and *fork away* from circuit-enabled peers. A
+        // build without the `shielded-circuit` feature must therefore refuse to
+        // run such a network rather than split consensus. (The feature is on by
+        // default; this only fires for a deliberate `--no-default-features` build.)
+        #[cfg(not(feature = "shielded-circuit"))]
+        assert!(
+            !params.shielded_coinbase,
+            "this consensus build lacks the mandatory `shielded-circuit` feature and cannot verify \
+             Orchard proofs; it must not run a shielded network (it would reject every shielded \
+             transaction and fork). Rebuild with default features enabled."
+        );
+
+        // Reorg-safe driver over the shielded state stores. Anchor-finality
+        // (maturity at `shielded_anchor_depth` + canonical ancestry, PLAN §2.5) is
+        // decided here in the virtual processor via reachability, not by the manager.
         let shielded_state_manager = crate::processes::shielded::ShieldedStateManager::new(
             Arc::clone(&db),
             kaspa_database::prelude::CachePolicy::Count(10_000),
-            params.finality_depth() as u32,
         );
         Self {
             receiver,
@@ -275,6 +297,8 @@ impl VirtualStateProcessor {
             shielded_state_manager,
             _mining_rules: mining_rules,
             finality_depth: params.finality_depth(),
+            shielded_anchor_depth: params.shielded_anchor_depth(),
+            empty_shielded_anchor: kaspa_shielded_core::Anchor::empty_tree().to_bytes(),
         }
     }
 
@@ -285,10 +309,11 @@ impl VirtualStateProcessor {
         self.shielded_state_manager.anchor_at(block)
     }
 
-    /// Whether `anchor` is currently within the finalized-anchor window that
-    /// spends may prove against (PLAN §2.5). Exposed for tests / wallet checks.
-    pub fn shielded_is_finalized_anchor(&self, anchor: &[u8; 32]) -> Result<bool, kaspa_database::prelude::StoreError> {
-        self.shielded_state_manager.is_finalized_anchor(anchor)
+    /// The canonical shielded state root (PLAN §2.10) as of a given chain block —
+    /// the value a child block's coinbase must commit to. Exposed for block
+    /// construction (templates/tests) and sync verification.
+    pub fn shielded_state_root_at(&self, block: kaspa_hashes::Hash) -> Result<[u8; 32], kaspa_database::prelude::StoreError> {
+        self.shielded_state_manager.state_root_at(block)
     }
 
     pub fn worker(self: &Arc<Self>) {
@@ -373,12 +398,10 @@ impl VirtualStateProcessor {
             )
             .expect("all possible rule errors are unexpected here");
 
-        // Shielded (PLAN §2.4 step 5, §2.5): publish the finalized anchor — the
-        // shielded tree root as of the finality point, which is reorg-safe — into
-        // the ring buffer that spends prove against. The manager's stores share
-        // the same DB, so a clone writes through; the publish is idempotent and
-        // a no-op while the shielded tree is empty.
-        self.shielded_state_manager.clone().publish_finalized_anchor(finality_point).unwrap();
+        // Shielded (PLAN §2.5): nothing to publish here. Anchor-finality is decided
+        // per spend at block-validation time (`is_shielded_anchor_final`) via the
+        // reorg-safe anchor→block index + reachability + `shielded_anchor_depth`, so
+        // there is no tip-level anchor window to maintain.
 
         let compact_sink_ghostdag_data = if let Some(sink_ghostdag_data) = Lazy::get(&sink_ghostdag_data) {
             // If we had to retrieve the full data, we convert it to compact
@@ -432,6 +455,36 @@ impl VirtualStateProcessor {
             // or disagreeing with the pruning point chain, we take the pruning point itself as the finality point
             pruning_point
         }
+    }
+
+    /// Whether a shielded spend proving against `anchor` is acceptable in a block
+    /// with selected parent `selected_parent` and blue score `block_blue_score`
+    /// (PLAN §2.5). Reorg-safe by construction: an anchor is final iff its source
+    /// block (from the append-only anchor→block index) is
+    ///
+    ///  1. **canonical** — a selected-chain ancestor of `selected_parent` (an anchor
+    ///     from an abandoned branch fails this, so a >`shielded_anchor_depth` reorg
+    ///     cannot resurrect it — closing the shallow-anchor value-creation vector), and
+    ///  2. **matured** — at least `shielded_anchor_depth` blue-score units deep
+    ///     relative to this block (~10 min at 10 BPS), so the note it proves cannot
+    ///     be cheaply reorged out from under the spend.
+    ///
+    /// The empty-tree anchor is genesis (always canonical and mature); a spend can
+    /// never actually prove a note into it, so its proof fails elsewhere.
+    pub(super) fn is_shielded_anchor_final(&self, anchor: &[u8; 32], selected_parent: Hash, block_blue_score: u64) -> bool {
+        if *anchor == self.empty_shielded_anchor {
+            return true;
+        }
+        let Some(source) = self.shielded_state_manager.anchor_source_block(anchor).unwrap() else {
+            return false; // not a real tree root of any block
+        };
+        // Canonical: the source block is on this block's selected chain.
+        if source != selected_parent && !self.reachability_service.is_chain_ancestor_of(source, selected_parent) {
+            return false;
+        }
+        // Matured: at least `shielded_anchor_depth` deep relative to this block.
+        let source_blue_score = self.ghostdag_store.get_blue_score(source).unwrap();
+        block_blue_score.saturating_sub(source_blue_score) >= self.shielded_anchor_depth
     }
 
     /// Calculates the UTXO state of `to` starting from the state of `from`.
@@ -1515,6 +1568,10 @@ impl VirtualStateProcessor {
         let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
         let header_pruning_point =
             self.pruning_point_manager.expected_header_pruning_point(virtual_state.ghostdag_data.to_compact()).pruning_point;
+        // Commit to the selected parent's shielded state root (PLAN §2.10) so the template's
+        // coinbase matches what `verify_coinbase_transaction` will expect for this block.
+        let shielded_commitment =
+            self.shielded_state_manager.state_root_at(virtual_state.ghostdag_data.selected_parent).unwrap();
         let coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -1523,6 +1580,7 @@ impl VirtualStateProcessor {
                 &virtual_state.ghostdag_data,
                 &virtual_state.mergeset_rewards,
                 &virtual_state.mergeset_non_daa,
+                shielded_commitment,
             )
             .unwrap();
         txs.insert(0, coinbase.tx);

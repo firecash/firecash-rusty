@@ -100,8 +100,20 @@ impl HeaderProcessor {
     }
 
     fn check_pow_and_calc_block_level(&self, header: &Header) -> BlockProcessResult<BlockLevel> {
-        let state = if self.skip_proof_of_work { kaspa_pow::State::new_skip_pow(header) } else { kaspa_pow::State::new(header) };
-        let (passed, pow) = state.check_pow(header.nonce);
-        if passed || self.skip_proof_of_work { Ok(calc_level_from_pow(pow, self.max_block_level)) } else { Err(RuleError::InvalidPoW) }
+        if self.skip_proof_of_work {
+            // PoW is not enforced in this mode; the native kHeavyHash value is computed
+            // purely to derive the block level. Any AuxPoW witness is ignored here.
+            let pow = kaspa_pow::State::new_skip_pow(header).check_pow(header.nonce).1;
+            return Ok(calc_level_from_pow(pow, self.max_block_level));
+        }
+        // Option-2 dual acceptance: past the merged-mining activation a block may satisfy
+        // PoW either natively or via a valid AuxPoW proof carried on the header. Before
+        // activation the aux witness is ignored and only the native path can pass. Gating
+        // on `header.daa_score` (the block's own claimed score) matches the other
+        // header-stage fork gates; the score is re-derived and enforced in context, so a
+        // block cannot lie about it to unlock aux acceptance early.
+        let merged_mining_active = self.merged_mining_activation.is_active(header.daa_score);
+        let (passed, pow) = kaspa_pow::auxpow::check_pow_gated(header, header.aux_pow.as_deref(), merged_mining_active);
+        if passed { Ok(calc_level_from_pow(pow, self.max_block_level)) } else { Err(RuleError::InvalidPoW) }
     }
 }

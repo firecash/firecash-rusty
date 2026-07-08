@@ -1,9 +1,25 @@
-use crate::RpcError;
+use crate::{FromRpcHex, RpcError, ToRpcHex};
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_consensus_core::{
     BlueWorkType,
+    auxpow::AuxPow,
     header::{CompressedParents, Header},
 };
+
+/// Encode a header's optional AuxPoW witness as a borsh hex string (empty if none).
+fn aux_pow_to_hex(header: &Header) -> String {
+    header.aux_pow.as_ref().map(|a| borsh::to_vec(a).expect("AuxPow is always borsh-serializable").to_rpc_hex()).unwrap_or_default()
+}
+
+/// Decode the borsh-hex AuxPoW witness (empty string ⇒ None) and attach it to `header`.
+fn attach_aux_pow(header: Header, aux_pow_hex: &str) -> Result<Header, RpcError> {
+    if aux_pow_hex.is_empty() {
+        return Ok(header);
+    }
+    let bytes = Vec::<u8>::from_rpc_hex(aux_pow_hex).map_err(|e| RpcError::General(format!("invalid auxPow hex: {e}")))?;
+    let aux: AuxPow = borsh::from_slice(&bytes).map_err(|e| RpcError::General(format!("invalid auxPow bytes: {e}")))?;
+    Ok(header.with_aux_pow(aux))
+}
 use kaspa_hashes::Hash;
 use serde::{Deserialize, Serialize};
 use workflow_serializer::prelude::*;
@@ -28,6 +44,12 @@ pub struct RpcRawHeader {
     pub blue_work: BlueWorkType,
     pub blue_score: u64,
     pub pruning_point: Hash,
+    /// Optional merged-mining (AuxPoW) witness carried on the submit path, as a hex
+    /// string of the borsh-encoded `AuxPow` (empty for a natively-mined block). Not
+    /// part of the block hash. This lets a miner submit a merged-mined block via the
+    /// standard `submit_block` RPC.
+    #[serde(default)]
+    pub aux_pow: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -119,6 +141,8 @@ impl TryFrom<RpcHeader> for Header {
             blue_work: header.blue_work,
             blue_score: header.blue_score,
             pruning_point: header.pruning_point,
+            // RpcHeader does not carry the merged-mining witness.
+            aux_pow: None,
         })
     }
 }
@@ -141,6 +165,8 @@ impl TryFrom<&RpcHeader> for Header {
             blue_work: header.blue_work,
             blue_score: header.blue_score,
             pruning_point: header.pruning_point,
+            // RpcHeader does not carry the merged-mining witness.
+            aux_pow: None,
         })
     }
 }
@@ -207,7 +233,7 @@ impl TryFrom<RpcRawHeader> for Header {
     type Error = RpcError;
 
     fn try_from(header: RpcRawHeader) -> Result<Self, Self::Error> {
-        Ok(Self::new_finalized(
+        let built = Self::new_finalized(
             header.version,
             header.parents_by_level.try_into()?,
             header.hash_merkle_root,
@@ -220,7 +246,8 @@ impl TryFrom<RpcRawHeader> for Header {
             header.blue_work,
             header.blue_score,
             header.pruning_point,
-        ))
+        );
+        attach_aux_pow(built, &header.aux_pow)
     }
 }
 
@@ -228,7 +255,7 @@ impl TryFrom<&RpcRawHeader> for Header {
     type Error = RpcError;
 
     fn try_from(header: &RpcRawHeader) -> Result<Self, Self::Error> {
-        Ok(Self::new_finalized(
+        let built = Self::new_finalized(
             header.version,
             header.parents_by_level.clone().try_into()?,
             header.hash_merkle_root,
@@ -241,7 +268,8 @@ impl TryFrom<&RpcRawHeader> for Header {
             header.blue_work,
             header.blue_score,
             header.pruning_point,
-        ))
+        );
+        attach_aux_pow(built, &header.aux_pow)
     }
 }
 
@@ -260,6 +288,7 @@ impl From<&Header> for RpcRawHeader {
             blue_work: header.blue_work,
             blue_score: header.blue_score,
             pruning_point: header.pruning_point,
+            aux_pow: aux_pow_to_hex(header),
         }
     }
 }
@@ -268,6 +297,7 @@ impl From<Header> for RpcRawHeader {
     fn from(header: Header) -> Self {
         Self {
             version: header.version,
+            aux_pow: aux_pow_to_hex(&header),
             parents_by_level: header.parents_by_level.into(),
             hash_merkle_root: header.hash_merkle_root,
             accepted_id_merkle_root: header.accepted_id_merkle_root,
@@ -285,7 +315,8 @@ impl From<Header> for RpcRawHeader {
 
 impl Serializer for RpcRawHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        // Format version 2 adds the merged-mining `aux_pow` hex field at the end.
+        store!(u16, &2, writer)?;
 
         store!(u16, &self.version, writer)?;
         store!(Vec<Vec<Hash>>, &self.parents_by_level, writer)?;
@@ -299,6 +330,7 @@ impl Serializer for RpcRawHeader {
         store!(BlueWorkType, &self.blue_work, writer)?;
         store!(u64, &self.blue_score, writer)?;
         store!(Hash, &self.pruning_point, writer)?;
+        store!(String, &self.aux_pow, writer)?;
 
         Ok(())
     }
@@ -306,7 +338,7 @@ impl Serializer for RpcRawHeader {
 
 impl Deserializer for RpcRawHeader {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let format_version = load!(u16, reader)?;
 
         let version = load!(u16, reader)?;
         let parents_by_level = load!(Vec<Vec<Hash>>, reader)?;
@@ -320,8 +352,11 @@ impl Deserializer for RpcRawHeader {
         let blue_work = load!(BlueWorkType, reader)?;
         let blue_score = load!(u64, reader)?;
         let pruning_point = load!(Hash, reader)?;
+        // aux_pow is only present in format version >= 2.
+        let aux_pow = if format_version >= 2 { load!(String, reader)? } else { String::new() };
 
         Ok(Self {
+            aux_pow,
             version,
             parents_by_level,
             hash_merkle_root,

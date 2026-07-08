@@ -314,6 +314,8 @@ impl TryCastFromJs for Header {
                         .get_value("pruningPoint")?
                         .try_into_owned()
                         .map_err(|err| Error::convert("pruningPoint", err))?,
+                    // The WASM/client header model does not carry the merged-mining witness.
+                    aux_pow: None,
                 };
 
                 Ok(header.into())

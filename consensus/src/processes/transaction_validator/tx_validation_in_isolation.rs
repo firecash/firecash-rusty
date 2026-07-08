@@ -50,6 +50,13 @@ impl TransactionValidator {
         if bundle.actions.is_empty() {
             return Err(TxRuleError::InvalidShieldedTransaction("shielded bundle has no actions"));
         }
+        // Anti-DoS: a shielded tx has zero storage mass, so cap per-tx proof-
+        // verification work by bounding actions per bundle. `from_bytes` already
+        // enforces this at the wire level; re-assert it here as an explicit,
+        // descriptive consensus rule (defense in depth).
+        if bundle.actions.len() > kaspa_shielded_core::bundle::MAX_ACTIONS_PER_BUNDLE {
+            return Err(TxRuleError::InvalidShieldedTransaction("shielded bundle exceeds the maximum number of actions"));
+        }
         Ok(())
     }
 

@@ -1,0 +1,41 @@
+[package]
+name = "firecash-walletd"
+description = "FireCash local wallet daemon: a non-custodial, localhost-only REST wallet over the shielded (Orchard) pool. Wraps kaspa-shielded-core (keygen, note-scan, real Halo 2 shielded spend, message sign/verify) and drives a kaspad (FireCash) node over gRPC. Keys never leave the machine."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "firecash-walletd"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Address parse/format for the wallet's own shielded address + the recipient.
+kaspa-addresses.workspace = true
+# The version-2 shielded transaction shape + tx id.
+kaspa-consensus-core.workspace = true
+# Shared logger init.
+kaspa-core.workspace = true
+# gRPC transport to a running kaspad (FireCash) node.
+kaspa-grpc-client.workspace = true
+kaspa-rpc-core.workspace = true
+# The shielded engine: WalletDb (scan/witness/balance), the real Halo 2 payment
+# builder (circuit feature), coinbase-note reconstruction, and message sign/verify.
+kaspa-shielded-core = { workspace = true, features = ["circuit"] }
+# Canonical shielded-tx shape + its sighash context.
+kaspa-shielded-wallet.workspace = true
+
+axum = "0.7"
+tower-http = { version = "0.5.2", features = ["cors"] }
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "time", "sync"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+log.workspace = true
+clap.workspace = true
+# CSPRNG for fresh wallet seeds + message signing.
+rand.workspace = true

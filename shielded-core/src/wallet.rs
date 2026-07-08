@@ -3,7 +3,7 @@
 //!
 //! This is what *produces* a shielded transaction: it derives keys, builds an
 //! Orchard bundle, creates the Halo 2 proof, and signs the binding + spend-auth
-//! signatures over the kasprivate sighash — emitting a [`ShieldedBundle`] in our
+//! signatures over the firecash sighash — emitting a [`ShieldedBundle`] in our
 //! canonical wire format, ready to carry in a transaction payload and be
 //! accepted by the consensus verifier.
 //!
@@ -380,6 +380,70 @@ pub mod build {
         Ok(wire.to_bytes())
     }
 
+    /// End-to-end wallet payment spending one or more **arbitrary** owned notes
+    /// (PLAN §2.10): spend every `(note, merkle_path)` in `inputs`, pay `amount` to
+    /// `recipient_addr`, return the remainder minus `fee` as change to the sender,
+    /// and leave `fee` as the public value balance. Returns the shielded-bundle wire
+    /// bytes ready to drop into a version-2 transaction `payload`.
+    ///
+    /// All inputs must root to the **same finalized anchor** — the caller (a
+    /// [`crate::walletdb::WalletDb`]) supplies live witnesses taken at one tree
+    /// state, so this holds. Every spend is authorized by the sender's single spend
+    /// authority. Builds its own `ProvingKey`; heavy (a real Halo 2 proof whose cost
+    /// grows with the number of inputs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_wallet_payment(
+        owner_seed: [u8; 32],
+        inputs: Vec<(Note, MerklePath)>,
+        recipient_addr: [u8; 43],
+        amount: u64,
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+    ) -> Result<Vec<u8>, BuildError> {
+        let (first_note, first_path) = inputs.first().ok_or(BuildError::Empty)?;
+        let keys = ShieldedKeys::from_seed(owner_seed).ok_or(BuildError::Empty)?;
+        let recipient =
+            Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
+        let change_addr = keys.address();
+
+        let total_in: u64 = inputs.iter().map(|(n, _)| n.value().inner()).sum();
+        let change = total_in.checked_sub(amount).and_then(|v| v.checked_sub(fee)).ok_or(BuildError::Empty)?;
+
+        // The shared anchor: all supplied witnesses were taken at one tree state.
+        let anchor = first_path.root(ExtractedNoteCommitment::from(first_note.commitment()));
+        let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+        for (note, merkle_path) in inputs {
+            builder.add_spend(keys.fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        }
+        builder
+            .add_output(None, recipient, NoteValue::from_raw(amount), [0u8; 512])
+            .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        builder
+            .add_output(None, change_addr, NoteValue::from_raw(change), [0u8; 512])
+            .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+
+        let pk = ProvingKey::build();
+        let mut rng = rand::rngs::OsRng;
+        let (unauth, _meta) =
+            builder.build::<i64>(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
+        let proven = unauth.create_proof(&pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+
+        let effects = to_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
+        let msg = sighash(&effects, network_domain, tx_context);
+        let ask = SpendAuthorizingKey::from(&keys.sk);
+        let authorized: Bundle<Authorized, i64> =
+            proven.apply_signatures(&mut rng, msg, &[ask]).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+
+        Ok(to_wire(
+            &authorized,
+            |a| <[u8; 64]>::from(a.authorization()),
+            authorized.authorization().proof().as_ref().to_vec(),
+            <[u8; 64]>::from(authorized.authorization().binding_signature()),
+        )
+        .to_bytes())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -402,7 +466,7 @@ pub mod build {
         fn wallet_spend_bundle_verifies() {
             let pk = ProvingKey::build();
             let keys = ShieldedKeys::from_seed([5u8; 32]).expect("valid seed");
-            let ctx = b"kasprivate-spend";
+            let ctx = b"firecash-spend";
 
             // A note worth 10_000 owned by the wallet.
             let rho = Option::<Rho>::from(Rho::from_bytes(&canon(1))).unwrap();
@@ -432,7 +496,7 @@ pub mod build {
         fn wallet_built_bundle_verifies() {
             let pk = ProvingKey::build();
             let keys = ShieldedKeys::from_seed([3u8; 32]).expect("valid seed");
-            let ctx = b"kasprivate-wallet-roundtrip";
+            let ctx = b"firecash-wallet-roundtrip";
             let net = [0x22u8; 32];
 
             let wire = build_output_only_bundle(&pk, keys.address(), 1_000, &net, ctx, rand::rngs::OsRng).expect("build");

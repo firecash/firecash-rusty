@@ -3,7 +3,7 @@
 //! this crate into one end-to-end private-payment loop:
 //!
 //! - **keys / address**: an Orchard key set derived from a 32-byte seed, exposed
-//!   as a `kasprivate:` receiving [`kaspa_addresses::Address`]
+//!   as a `firecash:` receiving [`kaspa_addresses::Address`]
 //!   ([`crate::wallet::Version::ShieldedOrchard`]);
 //! - **receive**: [`crate::walletdb::WalletDb`] walks the accepted-block
 //!   commitment stream, discovers this account's coinbase + received notes, and
@@ -57,7 +57,7 @@ impl ShieldedAccount {
     }
 
     /// This account's human-facing shielded receiving address under `prefix`
-    /// (e.g. [`Prefix::Mainnet`] → `kasprivate:…`). A payer encodes a
+    /// (e.g. [`Prefix::Mainnet`] → `firecash:…`). A payer encodes a
     /// shielded output to these bytes; the coinbase reward recipient uses the same
     /// 43-byte payload.
     pub fn receiving_address(&self, prefix: Prefix) -> Address {
@@ -87,7 +87,7 @@ impl ShieldedAccount {
 /// Why a payment could not be constructed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaymentError {
-    /// The recipient is not a canonical shielded (`kasprivate:` / ShieldedOrchard)
+    /// The recipient is not a canonical shielded (`firecash:` / ShieldedOrchard)
     /// address.
     BadRecipient,
     /// No single tracked note holds at least `amount + fee`. (This facade spends a
@@ -106,7 +106,7 @@ pub enum PaymentError {
 impl ShieldedAccount {
     /// Build a real, proven shielded **payment**: spend one tracked note worth at
     /// least `amount + fee`, send `amount` to `recipient` (a shielded
-    /// `kasprivate:` address), return the change to this account, and leave `fee`
+    /// `firecash:` address), return the change to this account, and leave `fee`
     /// as the public value balance for the miner. Returns the shielded-bundle wire
     /// bytes to carry in a version-2 transaction's `payload`.
     ///
@@ -143,7 +143,7 @@ impl ShieldedAccount {
             .ok_or(PaymentError::InsufficientFunds)?
             .clone();
 
-        let merkle_path = selected.merkle_path().ok_or(PaymentError::NoWitness)?;
+        let merkle_path = self.db.witness_path(selected.position).ok_or(PaymentError::NoWitness)?;
         let keys = ShieldedKeys::from_seed(self.seed).ok_or(PaymentError::BadRecipient)?;
         let change_addr = keys.address();
 
@@ -174,14 +174,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn receiving_address_is_a_shielded_kasprivate_address() {
+    fn receiving_address_is_a_shielded_firecash_address() {
         let acct = ShieldedAccount::from_seed([11u8; 32]).unwrap();
         let addr = acct.receiving_address(Prefix::Mainnet);
         assert_eq!(addr.version, Version::ShieldedOrchard);
         assert_eq!(addr.payload.as_slice().len(), 43);
-        // Round-trips through the string form under the kasprivate HRP.
+        // Round-trips through the string form under the firecash HRP.
         let s: String = (&addr).into();
-        assert!(s.starts_with("kasprivate:"), "got {s}");
+        assert!(s.starts_with("firecash:"), "got {s}");
         let decoded: Address = s.try_into().unwrap();
         assert_eq!(decoded, addr);
         // And the recipient bytes decode back to exactly the 43-byte payload.
@@ -207,7 +207,7 @@ mod tests {
 
 /// The complete private-payment loop with live crypto (circuit feature), driven
 /// entirely through the wallet facade: Alice mines a shielded coinbase note,
-/// discovers it by scanning, pays Bob at his `kasprivate:` address with a real
+/// discovers it by scanning, pays Bob at his `firecash:` address with a real
 /// Halo 2 proof, the consensus verifier + §2.4 transition accept it, and both
 /// wallets scan the resulting bundle — Bob receives the amount, Alice keeps the
 /// change. This is the end-to-end "a person can send private money" proof.
@@ -221,7 +221,7 @@ mod circuit_tests {
     #[test]
     fn full_private_payment_between_two_wallets() {
         let net = [0x9au8; 32];
-        let ctx: &[u8] = b"kasprivate-payment-context";
+        let ctx: &[u8] = b"firecash-payment-context";
 
         let mut alice = ShieldedAccount::from_seed([1u8; 32]).unwrap();
         let mut bob = ShieldedAccount::from_seed([2u8; 32]).unwrap();

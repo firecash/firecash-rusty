@@ -1,7 +1,7 @@
-//! kasprivate shielded wallet glue (PLAN §2.10, blocker #2).
+//! firecash shielded wallet glue (PLAN §2.10, blocker #2).
 //!
 //! [`kaspa_shielded_core::ShieldedAccount`] is a self-contained private wallet —
-//! keys, a `kasprivate:` address, note discovery, and proven payments — but it
+//! keys, a `firecash:` address, note discovery, and proven payments — but it
 //! speaks in shielded primitives, not in the chain's transactions. This crate is
 //! the thin, **consensus-coupled** layer that connects the account to real blocks
 //! and transactions:

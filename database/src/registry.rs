@@ -82,7 +82,7 @@ pub enum DatabaseStorePrefixes {
     SmtSyncFlag = 75,
     SmtSeqCommitMeta = 76,
 
-    // ---- Shielded pool (kasprivate) ----
+    // ---- Shielded pool (firecash) ----
     /// Append-only set of spent nullifiers (PLAN §2.2).
     ShieldedNullifiers = 80,
     /// Persisted frontier of the global note-commitment tree (PLAN §2.9).
@@ -93,6 +93,10 @@ pub enum DatabaseStorePrefixes {
     ShieldedSupply = 83,
     /// Per-chain-block record of nullifiers added, for reorg revert (D10).
     ShieldedNullifierDiffs = 84,
+    /// Per-chain-block MuHash accumulator over the spent-nullifier set, so the
+    /// shielded state root can commit to double-spend prevention for fast/pruned
+    /// sync without replaying from genesis (PLAN §2.2, §2.10).
+    ShieldedNullifierMuHash = 85,
 
     // ---- Separator ----
     /// Reserved as a separator

@@ -36,6 +36,9 @@ message RpcBlockHeader {
   uint64 blueScore = 13;
   string pruningPoint = 14;
   string hash = 15;
+  // Optional merged-mining (AuxPoW) witness, hex of the borsh-encoded AuxPow. Empty
+  // for natively-mined blocks. Carried on the submit path; not part of the block hash.
+  string auxPow = 16;
 }
 
 message RpcBlockLevelParents {

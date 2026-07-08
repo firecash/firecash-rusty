@@ -12,25 +12,62 @@ use crate::{constants, model::stores::ghostdag::GhostdagData};
 
 const LENGTH_OF_BLUE_SCORE: usize = size_of::<u64>();
 const LENGTH_OF_SUBSIDY: usize = size_of::<u64>();
+const LENGTH_OF_SHIELDED_COMMITMENT: usize = 32;
 const LENGTH_OF_SCRIPT_PUB_KEY_VERSION: usize = size_of::<u16>();
 const LENGTH_OF_SCRIPT_PUB_KEY_LENGTH: usize = size_of::<u8>();
 
-const MIN_PAYLOAD_LENGTH: usize =
-    LENGTH_OF_BLUE_SCORE + LENGTH_OF_SUBSIDY + LENGTH_OF_SCRIPT_PUB_KEY_VERSION + LENGTH_OF_SCRIPT_PUB_KEY_LENGTH;
+const MIN_PAYLOAD_LENGTH: usize = LENGTH_OF_BLUE_SCORE
+    + LENGTH_OF_SUBSIDY
+    + LENGTH_OF_SHIELDED_COMMITMENT
+    + LENGTH_OF_SCRIPT_PUB_KEY_VERSION
+    + LENGTH_OF_SCRIPT_PUB_KEY_LENGTH;
 
 // We define a year as 365.25 days and a month as 365.25 / 12 = 30.4375
 // SECONDS_PER_MONTH = 30.4375 * 24 * 60 * 60
 const SECONDS_PER_MONTH: u64 = 2629800;
 
-// kasprivate monetary policy: the block subsidy uses Kaspa's *exact* `SUBSIDY_BY_MONTH_TABLE`
-// reward values, but halves every 3 months instead of every 12. Kaspa's table encodes a smooth
-// decay with `LEGACY_MONTHS_PER_HALVING` (=12) monthly steps per halving; we traverse it
-// `LEGACY_MONTHS_PER_HALVING / SUBSIDY_HALVING_INTERVAL_MONTHS` = 4× faster so a full halving
-// takes 3 months. Net effect: identical per-block reward *values* as Kaspa on the same curve
-// shape, reached 4× sooner (so the total emitted supply is ≈ 1/4 of Kaspa's for a given BPS).
+// firecash monetary policy: the block subsidy follows the shape of Kaspa's `SUBSIDY_BY_MONTH_TABLE`
+// but with two firecash-specific transforms:
+//   1. It halves every 3 months instead of every 12. Kaspa's table encodes a smooth decay with
+//      `LEGACY_MONTHS_PER_HALVING` (=12) monthly steps per halving; we traverse it
+//      `LEGACY_MONTHS_PER_HALVING / SUBSIDY_HALVING_INTERVAL_MONTHS` = 4× faster so a full halving
+//      takes 3 months.
+//   2. Every table value is scaled by `REWARD_SCALE_NUM / REWARD_SCALE_DEN` (then divided by BPS),
+//      setting the initial 10-BPS reward to 6 FC/block (44 FC × 3/22 = 6 FC) instead of 44.
+// Once the curve decays below the tail floor, a two-step tail subsidy is paid forever: the curve
+// crosses 0.6 FC around month 10, so `TAIL_SUBSIDY_INITIAL_SOMPI` (0.6 FC) is paid up to real month
+// `TAIL_STEP_DOWN_MONTH` (=24), after which it steps down to `TAIL_SUBSIDY_FINAL_SOMPI` (0.3 FC) and
+// that floor is paid forever. See the tail-constant docs below.
 const SUBSIDY_HALVING_INTERVAL_MONTHS: u64 = 3;
 // The number of monthly table steps that constitute one halving in Kaspa's original table.
 const LEGACY_MONTHS_PER_HALVING: u64 = 12;
+
+// firecash reward scale (see monetary-policy note above): each Kaspa table value is multiplied by
+// REWARD_SCALE_NUM/REWARD_SCALE_DEN before the BPS division. 3/22 sets the initial 10-BPS subsidy to
+// 6 FC/block (44 FC × 3/22).
+const REWARD_SCALE_NUM: u64 = 3;
+const REWARD_SCALE_DEN: u64 = 22;
+
+// Convert a raw Kaspa 1-BPS monthly-table value into the firecash per-block subsidy for `bps`:
+// apply the reward scale, then divide by BPS. u128 intermediate avoids overflow.
+#[inline]
+fn scaled_subsidy(table_value: u64, bps: u64) -> u64 {
+    ((table_value.div_ceil(bps) as u128) * REWARD_SCALE_NUM as u128 / REWARD_SCALE_DEN as u128) as u64
+}
+
+// Two-step perpetual tail emission (firecash): once the deflationary curve decays below the tail
+// floor, every rewarded block keeps paying a fixed tail subsidy forever, funding long-term miner
+// security after the main emission curve is effectively exhausted. The tail steps down once:
+//   * `TAIL_SUBSIDY_INITIAL_SOMPI` = 0.6 FC/block, paid until real month `TAIL_STEP_DOWN_MONTH`.
+//     The 6 FC/3-month-halving curve crosses 0.6 FC around month 10, so this floor governs the
+//     reward from ≈month 10 through month 24. At 10 BPS: 6 FC/s ≈ 189M FC/year.
+//   * `TAIL_SUBSIDY_FINAL_SOMPI` = 0.3 FC/block, paid forever from month `TAIL_STEP_DOWN_MONTH` on.
+//     At 10 BPS: 3 FC/s ≈ 95M FC/year (the perpetual long-run inflation floor).
+// Both are absolute per-rewarded-block amounts, independent of BPS.
+const TAIL_SUBSIDY_INITIAL_SOMPI: u64 = 60_000_000;
+const TAIL_SUBSIDY_FINAL_SOMPI: u64 = 30_000_000;
+// Real (calendar) month at which the tail steps down from the initial floor to the final floor.
+const TAIL_STEP_DOWN_MONTH: u64 = 24;
 
 pub const SUBSIDY_BY_MONTH_TABLE_SIZE: usize = 426;
 pub type SubsidyByMonthTable = [u64; SUBSIDY_BY_MONTH_TABLE_SIZE];
@@ -81,13 +118,13 @@ impl CoinbaseManager {
         bps_history: ForkedParam<u64>,
         toccata_activation: ForkActivation,
     ) -> Self {
-        // Precomputed subsidy by month table for the actual block per second rate
-        // Here values are rounded up so that we keep the same number of rewarding months as in the original 1 BPS table.
-        // In a 10 BPS network, the induced increase in total rewards is 51 KAS (see tests::calc_high_bps_total_rewards_delta())
+        // Precomputed subsidy by month table for the actual block per second rate.
+        // Values are rounded up per BPS (keeping the same number of rewarding months as the original
+        // 1 BPS table) and then scaled by the firecash reward scale (see `scaled_subsidy`).
         let subsidy_by_month_table_before: SubsidyByMonthTable =
-            core::array::from_fn(|i| SUBSIDY_BY_MONTH_TABLE[i].div_ceil(bps_history.before()));
+            core::array::from_fn(|i| scaled_subsidy(SUBSIDY_BY_MONTH_TABLE[i], bps_history.before()));
         let subsidy_by_month_table_after: SubsidyByMonthTable =
-            core::array::from_fn(|i| SUBSIDY_BY_MONTH_TABLE[i].div_ceil(bps_history.after()));
+            core::array::from_fn(|i| scaled_subsidy(SUBSIDY_BY_MONTH_TABLE[i], bps_history.after()));
         Self {
             coinbase_payload_script_public_key_max_len,
             max_coinbase_payload_len,
@@ -114,6 +151,7 @@ impl CoinbaseManager {
         ghostdag_data: &GhostdagData,
         mergeset_rewards: &BlockHashMap<BlockRewardData>,
         mergeset_non_daa: &BlockHashSet,
+        shielded_commitment: [u8; 32],
     ) -> CoinbaseResult<CoinbaseTransactionTemplate> {
         let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() + 1); // + 1 for possible red reward
 
@@ -146,7 +184,8 @@ impl CoinbaseManager {
 
         // Build the current block's payload
         let subsidy = self.calc_block_subsidy(daa_score);
-        let payload = self.serialize_coinbase_payload(&CoinbaseData { blue_score: ghostdag_data.blue_score, subsidy, miner_data })?;
+        let payload =
+            self.serialize_coinbase_payload(&CoinbaseData { blue_score: ghostdag_data.blue_score, subsidy, shielded_commitment, miner_data })?;
 
         let tx_version =
             if self.toccata_activation.is_active(daa_score) { constants::TX_VERSION_TOCCATA } else { constants::TX_VERSION };
@@ -167,6 +206,7 @@ impl CoinbaseManager {
         }
         let payload: Vec<u8> = data.blue_score.to_le_bytes().iter().copied()                    // Blue score                   (u64)
             .chain(data.subsidy.to_le_bytes().iter().copied())                                  // Subsidy                      (u64)
+            .chain(data.shielded_commitment.iter().copied())                                    // Shielded state root          (32)
             .chain(data.miner_data.script_public_key.version().to_le_bytes().iter().copied())   // Script public key version    (u16)
             .chain((script_pub_key_len as u8).to_le_bytes().iter().copied())                    // Script public key length     (u8)
             .chain(data.miner_data.script_public_key.script().iter().copied())                  // Script public key            
@@ -185,9 +225,10 @@ impl CoinbaseManager {
             ));
         }
 
-        // Keep only blue score and subsidy. Note that truncate does not modify capacity, so
-        // the usual case where the payloads are the same size will not trigger a reallocation
-        payload.truncate(LENGTH_OF_BLUE_SCORE + LENGTH_OF_SUBSIDY);
+        // Keep blue score, subsidy and the shielded commitment (all independent of miner data).
+        // Note that truncate does not modify capacity, so the usual case where the payloads are
+        // the same size will not trigger a reallocation
+        payload.truncate(LENGTH_OF_BLUE_SCORE + LENGTH_OF_SUBSIDY + LENGTH_OF_SHIELDED_COMMITMENT);
         payload.extend(
             miner_data.script_public_key.version().to_le_bytes().iter().copied() // Script public key version (u16)
                 .chain((script_pub_key_len as u8).to_le_bytes().iter().copied()) // Script public key length  (u8)
@@ -211,6 +252,7 @@ impl CoinbaseManager {
 
         let blue_score = u64::from_le_bytes(parser.take(LENGTH_OF_BLUE_SCORE).try_into().unwrap());
         let subsidy = u64::from_le_bytes(parser.take(LENGTH_OF_SUBSIDY).try_into().unwrap());
+        let shielded_commitment: [u8; 32] = parser.take(LENGTH_OF_SHIELDED_COMMITMENT).try_into().unwrap();
         let script_pub_key_version = u16::from_le_bytes(parser.take(LENGTH_OF_SCRIPT_PUB_KEY_VERSION).try_into().unwrap());
         let script_pub_key_len = u8::from_le_bytes(parser.take(LENGTH_OF_SCRIPT_PUB_KEY_LENGTH).try_into().unwrap());
 
@@ -232,7 +274,7 @@ impl CoinbaseManager {
             ScriptPublicKey::new(script_pub_key_version, ScriptVec::from_slice(parser.take(script_pub_key_len as usize)));
         let extra_data = parser.remaining;
 
-        Ok(CoinbaseData { blue_score, subsidy, miner_data: MinerData { script_public_key, extra_data } })
+        Ok(CoinbaseData { blue_score, subsidy, shielded_commitment, miner_data: MinerData { script_public_key, extra_data } })
     }
 
     pub fn calc_block_subsidy(&self, daa_score: u64) -> u64 {
@@ -240,6 +282,28 @@ impl CoinbaseManager {
             return self.pre_deflationary_phase_base_subsidy;
         }
 
+        // Perpetual tail: once the deflationary curve decays below the tail floor, every rewarded
+        // block keeps paying the (time-dependent) tail subsidy forever (see the const docs).
+        self.curve_subsidy(daa_score).max(self.tail_subsidy(daa_score))
+    }
+
+    /// The two-step perpetual tail floor for a given DAA score: `TAIL_SUBSIDY_INITIAL_SOMPI`
+    /// (0.6 FC) up to real month `TAIL_STEP_DOWN_MONTH`, then `TAIL_SUBSIDY_FINAL_SOMPI` (0.3 FC)
+    /// forever. Assumes `daa_score >= deflationary_phase_daa_score`.
+    fn tail_subsidy(&self, daa_score: u64) -> u64 {
+        // `subsidy_month` returns the table index, which advances `LEGACY_MONTHS_PER_HALVING /
+        // SUBSIDY_HALVING_INTERVAL_MONTHS` (=4)× faster than real calendar months; convert back.
+        let real_month = self.subsidy_month(daa_score) * SUBSIDY_HALVING_INTERVAL_MONTHS / LEGACY_MONTHS_PER_HALVING;
+        if real_month < TAIL_STEP_DOWN_MONTH {
+            TAIL_SUBSIDY_INITIAL_SOMPI
+        } else {
+            TAIL_SUBSIDY_FINAL_SOMPI
+        }
+    }
+
+    /// The deflationary-curve subsidy *without* the perpetual tail floor. Decays to 0 once the
+    /// 426-entry monthly table is exhausted. Assumes `daa_score >= deflationary_phase_daa_score`.
+    fn curve_subsidy(&self, daa_score: u64) -> u64 {
         let subsidy_month = self.subsidy_month(daa_score) as usize;
         let subsidy_table = if self.bps_history.activation().is_active(daa_score) {
             &self.subsidy_by_month_table_after
@@ -286,11 +350,10 @@ impl CoinbaseManager {
             / (SECONDS_PER_MONTH as u128 * SUBSIDY_HALVING_INTERVAL_MONTHS as u128)) as u64;
         assert!(table_index <= usize::MAX as u64);
         let table_index: usize = table_index as usize;
-        if table_index >= SUBSIDY_BY_MONTH_TABLE.len() {
-            *SUBSIDY_BY_MONTH_TABLE.last().unwrap()
-        } else {
-            SUBSIDY_BY_MONTH_TABLE[table_index]
-        }
+        // 1-BPS curve value with the firecash reward scale applied (no tail floor; used for tests).
+        let table_value =
+            if table_index >= SUBSIDY_BY_MONTH_TABLE.len() { *SUBSIDY_BY_MONTH_TABLE.last().unwrap() } else { SUBSIDY_BY_MONTH_TABLE[table_index] };
+        scaled_subsidy(table_value, 1)
     }
 }
 
@@ -338,13 +401,14 @@ mod tests {
         let pre_deflationary_rewards = legacy_cbm.pre_deflationary_phase_base_subsidy * legacy_cbm.deflationary_phase_daa_score;
         let total_rewards: u64 = pre_deflationary_rewards + SUBSIDY_BY_MONTH_TABLE.iter().map(|x| x * SECONDS_PER_MONTH).sum::<u64>();
         let testnet_11_bps = SIMNET_PARAMS.bps();
+        // Reference per-block reward for each month = firecash-scaled, BPS-rounded table value.
         let total_high_bps_rewards_rounded_up: u64 = pre_deflationary_rewards
-            + SUBSIDY_BY_MONTH_TABLE.iter().map(|x| (x.div_ceil(testnet_11_bps) * testnet_11_bps) * SECONDS_PER_MONTH).sum::<u64>();
+            + SUBSIDY_BY_MONTH_TABLE.iter().map(|x| scaled_subsidy(*x, testnet_11_bps) * testnet_11_bps * SECONDS_PER_MONTH).sum::<u64>();
 
         let cbm = create_manager(&SIMNET_PARAMS);
         let total_high_bps_rewards: u64 = pre_deflationary_rewards
             + cbm.subsidy_by_month_table_before.iter().map(|x| x * SECONDS_PER_MONTH * cbm.bps().before()).sum::<u64>();
-        assert_eq!(total_high_bps_rewards_rounded_up, total_high_bps_rewards, "subsidy adjusted to bps must be rounded up");
+        assert_eq!(total_high_bps_rewards_rounded_up, total_high_bps_rewards, "scaled subsidy adjusted to bps must match the precomputed table");
 
         let delta = total_high_bps_rewards as i64 - total_rewards as i64;
 
@@ -357,14 +421,14 @@ mod tests {
     fn subsidy_by_month_table_test() {
         let cbm = create_legacy_manager();
         cbm.subsidy_by_month_table_before.iter().enumerate().for_each(|(i, x)| {
-            assert_eq!(SUBSIDY_BY_MONTH_TABLE[i], *x, "for 1 BPS, const table and precomputed values must match");
+            assert_eq!(scaled_subsidy(SUBSIDY_BY_MONTH_TABLE[i], 1), *x, "for 1 BPS, scaled const table and precomputed values must match");
         });
 
         for network_id in NetworkId::iter() {
             let cbm = create_manager(&network_id.into());
             cbm.subsidy_by_month_table_before.iter().enumerate().for_each(|(i, x)| {
                 assert_eq!(
-                    SUBSIDY_BY_MONTH_TABLE[i].div_ceil(cbm.bps().before()),
+                    scaled_subsidy(SUBSIDY_BY_MONTH_TABLE[i], cbm.bps().before()),
                     *x,
                     "{}: locally computed and precomputed values must match",
                     network_id
@@ -372,7 +436,7 @@ mod tests {
             });
             cbm.subsidy_by_month_table_after.iter().enumerate().for_each(|(i, x)| {
                 assert_eq!(
-                    SUBSIDY_BY_MONTH_TABLE[i].div_ceil(cbm.bps().after()),
+                    scaled_subsidy(SUBSIDY_BY_MONTH_TABLE[i], cbm.bps().after()),
                     *x,
                     "{}: locally computed and precomputed values must match",
                     network_id
@@ -424,9 +488,11 @@ mod tests {
         let mut current = 0;
         let mut total = 0;
         let mut epoch = 0u64;
-        let mut prev = cbm.calc_block_subsidy(0);
+        // Use the tail-free curve subsidy for finite-emission accounting: with the perpetual tail
+        // floor `calc_block_subsidy` never reaches 0, so this loop would not terminate.
+        let mut prev = cbm.curve_subsidy(0);
         loop {
-            let subsidy = cbm.calc_block_subsidy(current);
+            let subsidy = cbm.curve_subsidy(current);
             // Pre activation we expect the legacy calc (1bps)
             if current < activation {
                 assert_eq!(cbm.legacy_calc_block_subsidy(current), subsidy);
@@ -451,7 +517,7 @@ mod tests {
         const PRE_DEFLATIONARY_PHASE_BASE_SUBSIDY: u64 = 50000000000;
         const DEFLATIONARY_PHASE_INITIAL_SUBSIDY: u64 = 44000000000;
         const SECONDS_PER_MONTH: u64 = 2629800;
-        // kasprivate halves every 3 months (see SUBSIDY_HALVING_INTERVAL_MONTHS).
+        // firecash halves every 3 months (see SUBSIDY_HALVING_INTERVAL_MONTHS).
         const SECONDS_PER_HALVING: u64 = SECONDS_PER_MONTH * 3;
 
         for network_id in NetworkId::iter() {
@@ -464,7 +530,8 @@ mod tests {
             let bps = params.bps_history().before();
 
             let pre_deflationary_phase_base_subsidy = PRE_DEFLATIONARY_PHASE_BASE_SUBSIDY / bps;
-            let deflationary_phase_initial_subsidy = DEFLATIONARY_PHASE_INITIAL_SUBSIDY / bps;
+            // Initial deflationary subsidy carries the firecash reward scale (see `scaled_subsidy`).
+            let deflationary_phase_initial_subsidy = scaled_subsidy(DEFLATIONARY_PHASE_INITIAL_SUBSIDY, bps);
             let blocks_per_halving = SECONDS_PER_HALVING * bps;
 
             struct Test {
@@ -504,17 +571,21 @@ mod tests {
                     expected: deflationary_phase_initial_subsidy / 32,
                 },
                 Test {
+                    // Far past the tail crossover (32 halvings = month 96): the curve value here is
+                    // a tiny fraction of a sompi after scaling, so the perpetual tail floor is what
+                    // actually gets paid — here the final 0.3 FC floor (applied via the
+                    // `.max(cbm.tail_subsidy(..))` below, which is past `TAIL_STEP_DOWN_MONTH`).
                     name: "after 32 halvings",
                     daa_score: params.deflationary_phase_daa_score + 32 * blocks_per_halving,
-                    expected: (DEFLATIONARY_PHASE_INITIAL_SUBSIDY / 2_u64.pow(32)).div_ceil(bps),
+                    expected: scaled_subsidy(DEFLATIONARY_PHASE_INITIAL_SUBSIDY / 2_u64.pow(32), bps),
                 },
                 Test {
                     name: "just before subsidy depleted",
                     daa_score: params.deflationary_phase_daa_score + 35 * blocks_per_halving,
-                    expected: 1,
+                    expected: scaled_subsidy(1, bps),
                 },
                 Test {
-                    name: "after subsidy depleted",
+                    name: "after subsidy depleted (curve → 0, tail takes over)",
                     daa_score: params.deflationary_phase_daa_score + 36 * blocks_per_halving,
                     expected: 0,
                 },
@@ -529,8 +600,20 @@ mod tests {
             }
 
             for t in tests {
-                assert_eq!(cbm.calc_block_subsidy(t.daa_score), t.expected, "{} test '{}' failed", network_id, t.name);
+                // The live subsidy is floored at the two-step perpetual tail; once the curve decays
+                // below the tail floor (the deep-halving cases, and even "after 5 halvings" where the
+                // scaled curve is already under 0.6 FC) the tail is what actually gets paid. The floor
+                // itself is time-dependent (0.6 FC before month 24, 0.3 FC after). The tail (like
+                // `subsidy_month`) is only defined once the deflationary phase has started; before it,
+                // the flat pre-deflationary base subsidy is paid and no tail floor applies.
+                let expected_live = if t.daa_score < params.deflationary_phase_daa_score {
+                    t.expected
+                } else {
+                    t.expected.max(cbm.tail_subsidy(t.daa_score))
+                };
+                assert_eq!(cbm.calc_block_subsidy(t.daa_score), expected_live, "{} test '{}' failed", network_id, t.name);
                 if bps == 1 {
+                    // legacy_calc_block_subsidy is the tail-free curve, so it matches the raw expectation.
                     assert_eq!(cbm.legacy_calc_block_subsidy(t.daa_score), t.expected, "{} test '{}' failed", network_id, t.name);
                 }
             }
@@ -546,6 +629,8 @@ mod tests {
         let data = CoinbaseData {
             blue_score: 56,
             subsidy: 44000000000,
+            // A non-trivial commitment so the round-trip actually exercises the 32 bytes.
+            shielded_commitment: core::array::from_fn(|i| i as u8 ^ 0xa5),
             miner_data: MinerData {
                 script_public_key: ScriptPublicKey::new(0, ScriptVec::from_slice(&script_data)),
                 extra_data: &extra_data as &[u8],
@@ -553,32 +638,11 @@ mod tests {
         };
 
         let payload = cbm.serialize_coinbase_payload(&data).unwrap();
+        // The commitment occupies exactly 32 bytes between subsidy and the script-pub-key version.
+        assert_eq!(&payload[LENGTH_OF_BLUE_SCORE + LENGTH_OF_SUBSIDY..][..32], &data.shielded_commitment);
         let deserialized_data = cbm.deserialize_coinbase_payload(&payload).unwrap();
 
         assert_eq!(data, deserialized_data);
-
-        // Test an actual mainnet payload
-        let payload_hex =
-            "b612c90100000000041a763e07000000000022202b32443ff740012157716d81216d09aebc39e5493c93a7181d92cb756c02c560ac302e31322e382f";
-        let mut payload = vec![0u8; payload_hex.len() / 2];
-        faster_hex::hex_decode(payload_hex.as_bytes(), &mut payload).unwrap();
-        let deserialized_data = cbm.deserialize_coinbase_payload(&payload).unwrap();
-
-        let expected_data = CoinbaseData {
-            blue_score: 29954742,
-            subsidy: 31112698372,
-            miner_data: MinerData {
-                script_public_key: ScriptPublicKey::new(
-                    0,
-                    scriptvec![
-                        32, 43, 50, 68, 63, 247, 64, 1, 33, 87, 113, 109, 129, 33, 109, 9, 174, 188, 57, 229, 73, 60, 147, 167, 24,
-                        29, 146, 203, 117, 108, 2, 197, 96, 172,
-                    ],
-                ),
-                extra_data: &[48u8, 46, 49, 50, 46, 56, 47] as &[u8],
-            },
-        };
-        assert_eq!(expected_data, deserialized_data);
     }
 
     #[test]
@@ -590,6 +654,7 @@ mod tests {
         let data = CoinbaseData {
             blue_score: 56345,
             subsidy: 44000000000,
+            shielded_commitment: [0x5c; 32],
             miner_data: MinerData {
                 script_public_key: ScriptPublicKey::new(0, ScriptVec::from_slice(&script_data)),
                 extra_data: &extra_data,
@@ -599,6 +664,8 @@ mod tests {
         let data2 = CoinbaseData {
             blue_score: data.blue_score,
             subsidy: data.subsidy,
+            // The commitment is not miner data, so `modify_coinbase_payload` must preserve it.
+            shielded_commitment: data.shielded_commitment,
             miner_data: MinerData {
                 // Modify only miner data
                 script_public_key: ScriptPublicKey::new(0, ScriptVec::from_slice(&[33u8, 255, 33])),
@@ -623,10 +690,12 @@ mod tests {
         let mergeset_rewards = Default::default();
         let mergeset_non_daa = Default::default();
 
-        let pre_activation =
-            cbm.expected_coinbase_transaction(99, miner_data.clone(), &ghostdag_data, &mergeset_rewards, &mergeset_non_daa).unwrap();
-        let post_activation =
-            cbm.expected_coinbase_transaction(100, miner_data, &ghostdag_data, &mergeset_rewards, &mergeset_non_daa).unwrap();
+        let pre_activation = cbm
+            .expected_coinbase_transaction(99, miner_data.clone(), &ghostdag_data, &mergeset_rewards, &mergeset_non_daa, [0u8; 32])
+            .unwrap();
+        let post_activation = cbm
+            .expected_coinbase_transaction(100, miner_data, &ghostdag_data, &mergeset_rewards, &mergeset_non_daa, [0u8; 32])
+            .unwrap();
 
         assert_eq!(pre_activation.tx.version, constants::TX_VERSION);
         assert_eq!(post_activation.tx.version, constants::TX_VERSION_TOCCATA);

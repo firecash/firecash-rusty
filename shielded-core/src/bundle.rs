@@ -41,6 +41,22 @@ pub mod sizes {
     pub const SIG: usize = 64;
 }
 
+/// Consensus upper bound on the number of Orchard actions a single shielded
+/// bundle may carry.
+///
+/// This is a hard anti-DoS limit, not a style choice. A shielded transaction
+/// carries no transparent inputs/outputs, so under KIP-9 it currently has
+/// **zero storage mass** (see `consensus/core/src/mass`): nothing at the mass
+/// layer bounds how much verification work one transaction can demand. Each
+/// action costs one (batched) Halo 2 proof-verification, the single most
+/// expensive operation on the validation path (PLAN §2.8). Without a cap, a
+/// single near-free transaction could force every node to verify an unbounded
+/// proof, and the aggregate over a block would be unbounded. Bounding actions
+/// per bundle bounds per-transaction verification cost; block capacity then
+/// bounds the rest. 512 is far above any honest bundle (a normal payment has
+/// 1–4 actions) while keeping worst-case per-tx proof work finite.
+pub const MAX_ACTIONS_PER_BUNDLE: usize = 512;
+
 /// A single Orchard action, as it appears on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionWire {
@@ -95,6 +111,9 @@ pub enum BundleDecodeError {
     LengthOverflow,
     /// Trailing bytes remained after decoding.
     TrailingBytes,
+    /// The bundle declared more actions than [`MAX_ACTIONS_PER_BUNDLE`]
+    /// (anti-DoS: rejected before any parse/verification work is done).
+    TooManyActions,
 }
 
 /// A minimal canonical byte writer (big-endian length prefixes).
@@ -201,7 +220,14 @@ impl ShieldedBundle {
         let binding_sig: [u8; sizes::SIG] =
             binding_sig_vec.as_slice().try_into().map_err(|_| BundleDecodeError::UnexpectedEof)?;
         let n_actions = r.u32()? as usize;
-        let mut actions = Vec::with_capacity(n_actions.min(1024));
+        // Anti-DoS: reject an oversized action count up front, before allocating
+        // or parsing (bounds per-transaction verification work; see
+        // MAX_ACTIONS_PER_BUNDLE). A shielded tx has zero storage mass, so this
+        // wire-format cap is what keeps proof-verification cost per tx finite.
+        if n_actions > MAX_ACTIONS_PER_BUNDLE {
+            return Err(BundleDecodeError::TooManyActions);
+        }
+        let mut actions = Vec::with_capacity(n_actions);
         for _ in 0..n_actions {
             actions.push(ActionWire {
                 nullifier: r.array::<{ sizes::FIELD }>()?,
@@ -289,7 +315,32 @@ mod tests {
         w.bytes(&[0u8; sizes::FIELD]);
         w.var(&[0u8; sizes::SIG]);
         w.u32(u32::MAX); // claims 4 billion actions
-        assert_eq!(ShieldedBundle::from_bytes(&w.buf), Err(BundleDecodeError::UnexpectedEof));
+        // Rejected by the anti-DoS action cap before any allocation/parse work.
+        assert_eq!(ShieldedBundle::from_bytes(&w.buf), Err(BundleDecodeError::TooManyActions));
+    }
+
+    #[test]
+    fn rejects_action_count_over_cap() {
+        // A count one past the cap is rejected up front; the cap itself decodes
+        // structurally (here it fails later on EOF since no action bytes follow).
+        let mut w = Writer::new();
+        w.u8(0);
+        w.i64(0);
+        w.bytes(&[0u8; sizes::FIELD]);
+        w.var(&[0u8; sizes::SIG]);
+        w.u32(MAX_ACTIONS_PER_BUNDLE as u32 + 1);
+        assert_eq!(ShieldedBundle::from_bytes(&w.buf), Err(BundleDecodeError::TooManyActions));
+
+        // A real bundle at exactly the cap round-trips (the cap is inclusive).
+        let at_cap = ShieldedBundle {
+            actions: (0..MAX_ACTIONS_PER_BUNDLE).map(|i| sample_action(i as u8)).collect(),
+            flags: 0b11,
+            value_balance: 0,
+            anchor: [0u8; sizes::FIELD],
+            proof: vec![],
+            binding_sig: [0u8; sizes::SIG],
+        };
+        assert_eq!(ShieldedBundle::from_bytes(&at_cap.to_bytes()).map(|b| b.actions.len()), Ok(MAX_ACTIONS_PER_BUNDLE));
     }
 
     #[test]

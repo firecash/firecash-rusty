@@ -1,6 +1,6 @@
 [package]
 name = "kaspa-shielded-core"
-description = "kasprivate shielded pool core: Orchard note-commitment tree, nullifier set, turnstile invariant"
+description = "firecash shielded pool core: Orchard note-commitment tree, nullifier set, turnstile invariant"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -15,7 +15,7 @@ default = []
 # Enables Halo 2 proof verification (the `verify` module's circuit path, single
 # + batch). Pulls halo2_proofs via orchard plus the batch/reconstruction deps;
 # kept opt-in so non-verifying consumers stay light.
-circuit = ["orchard/circuit", "dep:nonempty", "dep:rand"]
+circuit = ["orchard/circuit", "dep:nonempty"]
 
 [dependencies]
 # Orchard primitives (Halo 2 / Pasta). `circuit` (halo2_proofs) is enabled via
@@ -37,11 +37,13 @@ pasta_curves = "0.5"
 blake2b_simd = { workspace = true }
 # Bundle reconstruction (batch verification) — enabled by the `circuit` feature.
 nonempty = { version = "0.11", default-features = false, optional = true }
-rand = { workspace = true, optional = true }
+# RNG for RedPallas signing (message signatures + circuit proving). Non-optional:
+# `message` signing is available without the heavy `circuit` feature.
+rand = { workspace = true }
 # Note decryption for wallet scanning (the receive side). Must match the version
 # Orchard links so the OrchardDomain types agree.
 zcash_note_encryption = "0.4"
 # Human-facing shielded (Orchard) address encoding for the wallet facade
-# (Version::ShieldedOrchard, kasprivate: HRP). kaspa-addresses is a leaf crate, so
+# (Version::ShieldedOrchard, firecash: HRP). kaspa-addresses is a leaf crate, so
 # no dependency cycle with the consensus layer that depends on shielded-core.
 kaspa-addresses.workspace = true

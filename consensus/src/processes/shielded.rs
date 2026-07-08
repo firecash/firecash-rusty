@@ -28,10 +28,12 @@ use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
 use kaspa_shielded_core::turnstile::SupplyLedger;
 use rocksdb::WriteBatch;
 
+use kaspa_muhash::MuHash;
+
 use crate::model::stores::shielded::{
-    DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorsStore, DbShieldedSupplyStore, DbShieldedTreeStore,
-    NullifierDiffStoreReader, NullifierSetStore, NullifierSetStoreReader, ShieldedAnchorsStoreReader, ShieldedSupplyStoreReader,
-    ShieldedTreeStoreReader, SupplyTotals,
+    AnchorBlockStoreReader, DbAnchorBlockStore, DbNullifierDiffStore, DbNullifierSetStore, DbShieldedNullifierMuHashStore,
+    DbShieldedSupplyStore, DbShieldedTreeStore, NullifierDiffStoreReader, NullifierSetStore, NullifierSetStoreReader,
+    ShieldedNullifierMuHashStoreReader, ShieldedSupplyStoreReader, ShieldedTreeStoreReader, SupplyTotals,
 };
 
 /// A computed (not-yet-persisted) shielded transition for one chain block.
@@ -43,6 +45,9 @@ pub struct ComputedBlockShielded {
     pub frontier_state: FrontierState,
     /// The turnstile cumulative totals after this block.
     pub supply_totals: SupplyTotals,
+    /// The MuHash accumulator over the whole spent-nullifier set after this block
+    /// (its selected parent's accumulator with this block's new nullifiers added).
+    pub nullifier_muhash: MuHash,
     /// Conflict-resolution outcome: surviving txs, new nullifiers, new anchor.
     pub outcome: BlockShieldedOutcome,
 }
@@ -52,6 +57,24 @@ impl ComputedBlockShielded {
     pub fn anchor(&self) -> [u8; 32] {
         self.outcome.anchor.to_bytes()
     }
+
+    /// The finalized 32-byte root of the nullifier-set accumulator after this block.
+    pub fn nullifier_root(&self) -> [u8; 32] {
+        let mut m = self.nullifier_muhash.clone();
+        m.finalize().as_bytes().to_owned()
+    }
+
+    /// The canonical shielded state root after this block (PLAN §2.10): binds the
+    /// note-commitment tree root, the nullifier-set accumulator, and the turnstile
+    /// totals into one 32-byte commitment a block can attest to.
+    pub fn state_root(&self) -> [u8; 32] {
+        kaspa_shielded_core::commitment::shielded_state_root(
+            &self.anchor(),
+            &self.nullifier_root(),
+            self.supply_totals.cumulative_coinbase,
+            self.supply_totals.cumulative_fees,
+        )
+    }
 }
 
 /// Error advancing the shielded state.
@@ -59,9 +82,6 @@ impl ComputedBlockShielded {
 pub enum ShieldedManagerError {
     /// Invalid shielded state (turnstile / full tree) — the block must be rejected.
     State(ShieldedStateError),
-    /// A spend proved against an anchor not in the finalized window (PLAN §2.5) —
-    /// the block must be rejected.
-    UnfinalizedAnchor([u8; 32]),
     /// A shielded-coinbase reward output did not encode a valid coinbase note
     /// (recipient shorter than an Orchard address, or not a canonical address) —
     /// the block must be rejected.
@@ -137,19 +157,22 @@ pub struct ShieldedStateManager {
     nullifier_diffs: DbNullifierDiffStore,
     tree_store: DbShieldedTreeStore,
     supply_store: DbShieldedSupplyStore,
-    anchors_store: DbShieldedAnchorsStore,
+    nullifier_muhash: DbShieldedNullifierMuHashStore,
+    anchor_block: DbAnchorBlockStore,
 }
 
 impl ShieldedStateManager {
-    /// Construct over the consensus database. `anchor_depth` is the size of the
-    /// finalized-anchor window (PLAN §2.5).
-    pub fn new(db: Arc<DB>, cache_policy: CachePolicy, anchor_depth: u32) -> Self {
+    /// Construct over the consensus database. Anchor-finality (maturity + canonical
+    /// ancestry) is decided by the caller (virtual processor) using reachability and
+    /// `shielded_anchor_depth`; this manager only records the anchor→block index.
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
         Self {
             nullifiers: DbNullifierSetStore::new(Arc::clone(&db), cache_policy),
             nullifier_diffs: DbNullifierDiffStore::new(Arc::clone(&db), cache_policy),
             tree_store: DbShieldedTreeStore::new(Arc::clone(&db), cache_policy),
             supply_store: DbShieldedSupplyStore::new(Arc::clone(&db), cache_policy),
-            anchors_store: DbShieldedAnchorsStore::new(db, anchor_depth),
+            nullifier_muhash: DbShieldedNullifierMuHashStore::new(Arc::clone(&db), cache_policy),
+            anchor_block: DbAnchorBlockStore::new(db, cache_policy),
         }
     }
 
@@ -163,25 +186,13 @@ impl ShieldedStateManager {
         Ok(self.load_tree(block)?.anchor().to_bytes())
     }
 
-    /// Publish the finalized anchor — the anchor as of a reorg-safe,
-    /// finality-deep chain block — into the ring buffer that spends prove
-    /// against (PLAN §2.4 step 5, §2.5). Idempotent: only writes when the
-    /// finalized anchor actually advances.
-    pub fn publish_finalized_anchor(&mut self, finalized_block: Hash) -> StoreResult<()> {
-        let anchor = self.anchor_at(finalized_block)?;
-        let mut ring = self.anchors_store.get()?;
-        if ring.latest() != Some(&anchor) {
-            ring.push(anchor);
-            self.anchors_store.set(&ring)?;
-        }
-        Ok(())
-    }
-
-    /// Whether `anchor` is within the current finalized-anchor window, i.e. a
-    /// spend proving against it is acceptable (PLAN §2.5). Used by bundle
-    /// validation (task #8).
-    pub fn is_finalized_anchor(&self, anchor: &[u8; 32]) -> StoreResult<bool> {
-        Ok(self.anchors_store.get()?.contains(anchor))
+    /// The chain block whose shielded tree root equals `anchor`, if any block ever
+    /// produced it (PLAN §2.5). The caller decides finality by checking that this
+    /// block is a selected-chain ancestor of the spending block (reorg-safety) and
+    /// at least `shielded_anchor_depth` deep (maturity). `None` means the anchor is
+    /// not a real tree root of any block.
+    pub fn anchor_source_block(&self, anchor: &[u8; 32]) -> StoreResult<Option<Hash>> {
+        self.anchor_block.get(anchor)
     }
 
     fn load_tree(&self, block: Hash) -> StoreResult<GlobalTree> {
@@ -192,6 +203,27 @@ impl ShieldedStateManager {
     fn load_supply(&self, block: Hash) -> StoreResult<SupplyLedger> {
         let t = self.supply_store.get(block)?;
         Ok(SupplyLedger::from_totals(t.cumulative_coinbase, t.cumulative_fees))
+    }
+
+    fn load_nullifier_muhash(&self, block: Hash) -> StoreResult<MuHash> {
+        self.nullifier_muhash.get(block)
+    }
+
+    /// The canonical shielded state root (PLAN §2.10) as of a given chain block:
+    /// binds the note-commitment tree root, the nullifier-set accumulator, and the
+    /// turnstile totals. Used to attest a block's parent shielded state in the
+    /// coinbase (a PoW-anchored commitment chain for fast/pruned sync).
+    pub fn state_root_at(&self, block: Hash) -> StoreResult<[u8; 32]> {
+        let anchor = self.load_tree(block)?.anchor().to_bytes();
+        let mut m = self.load_nullifier_muhash(block)?;
+        let nullifier_root = m.finalize().as_bytes().to_owned();
+        let t = self.supply_store.get(block)?;
+        Ok(kaspa_shielded_core::commitment::shielded_state_root(
+            &anchor,
+            &nullifier_root,
+            t.cumulative_coinbase,
+            t.cumulative_fees,
+        ))
     }
 
     /// Validate and compute one chain block's shielded transition against its
@@ -205,15 +237,10 @@ impl ShieldedStateManager {
         coinbase: Option<&CoinbaseMint>,
         txs: &[ShieldedTx],
     ) -> Result<ComputedBlockShielded, ShieldedManagerError> {
-        // Anchor finality (PLAN §2.5): every *spending* bundle must prove against
-        // an anchor in the finalized window. Pure-output bundles (no nullifiers,
-        // e.g. coinbase-funded) carry the empty-tree anchor and are exempt.
-        for tx in txs {
-            if !tx.nullifiers.is_empty() && !self.is_finalized_anchor(&tx.anchor)? {
-                return Err(ShieldedManagerError::UnfinalizedAnchor(tx.anchor));
-            }
-        }
-
+        // Anchor finality (maturity + canonical ancestry, PLAN §2.5) is checked by
+        // the caller (virtual processor) before `compute`, since it needs
+        // reachability and the spending block's blue score. Here we only apply the
+        // transition against the selected parent's persisted state.
         let mut tree = self.load_tree(selected_parent)?;
         let mut supply = self.load_supply(selected_parent)?;
         let pending = MemNullifierSet::new();
@@ -221,12 +248,21 @@ impl ShieldedStateManager {
             let finalized = LayeredNullifierSet { store: &self.nullifiers, pending: &pending };
             apply_chain_block_to(&finalized, &mut tree, &mut supply, coinbase, txs)?
         };
+        // Advance the nullifier-set accumulator: the selected parent's snapshot
+        // plus this block's newly spent nullifiers. MuHash is order-independent, so
+        // this matches the set regardless of validation order and needs no separate
+        // reorg handling (a reorg recomputes from the selected parent's snapshot).
+        let mut nullifier_muhash = self.load_nullifier_muhash(selected_parent)?;
+        for nf in &outcome.new_nullifiers {
+            nullifier_muhash.add_element(nf);
+        }
         Ok(ComputedBlockShielded {
             frontier_state: tree.to_state(),
             supply_totals: SupplyTotals {
                 cumulative_coinbase: supply.cumulative_coinbase(),
                 cumulative_fees: supply.cumulative_fees(),
             },
+            nullifier_muhash,
             outcome,
         })
     }
@@ -238,6 +274,11 @@ impl ShieldedStateManager {
     pub fn persist(&self, batch: &mut WriteBatch, block: Hash, computed: &ComputedBlockShielded) -> StoreResult<()> {
         if computed.frontier_state.size > 0 {
             self.tree_store.set_batch(batch, block, computed.frontier_state.clone())?;
+            // Index this block's shielded tree root so spends can prove against it
+            // (anchor-finality is decided at validation time via reachability + depth).
+            // An anchor uniquely identifies (block, its history), so this is an
+            // append-only map that needs no reorg reverting.
+            self.anchor_block.set_batch(batch, computed.anchor(), block)?;
         }
         if computed.supply_totals.cumulative_coinbase > 0 || computed.supply_totals.cumulative_fees > 0 {
             self.supply_store.set_batch(batch, block, computed.supply_totals)?;
@@ -247,6 +288,13 @@ impl ShieldedStateManager {
             for nf in &computed.outcome.new_nullifiers {
                 self.nullifiers.insert_batch(batch, *nf)?;
             }
+        }
+        // Snapshot the nullifier accumulator for *every* block once it is non-empty
+        // (not only blocks that add nullifiers), so `state_root_at(block)` is
+        // readable at any block — mirroring the frontier/supply snapshots. The
+        // accumulator is add-only along a chain, so once non-empty it stays so.
+        if computed.nullifier_muhash.clone().finalize() != kaspa_muhash::EMPTY_MUHASH {
+            self.nullifier_muhash.set_batch(batch, block, computed.nullifier_muhash.clone())?;
         }
         Ok(())
     }
@@ -313,12 +361,11 @@ mod tests {
         Hash::from_bytes([n; 32])
     }
 
-    /// A manager with the genesis (empty) anchor published as finalized, so that
-    /// spending transactions referencing it pass the anchor-finality check.
-    fn manager_with_finalized_genesis(db: &Arc<DB>) -> ShieldedStateManager {
-        let mut mgr = ShieldedStateManager::new(Arc::clone(db), CachePolicy::Count(64), 100);
-        mgr.publish_finalized_anchor(h(0)).unwrap();
-        mgr
+    /// A fresh manager. Anchor-finality (maturity + canonical ancestry) is enforced
+    /// by the virtual processor via reachability, not by `compute`, so these unit
+    /// tests exercise the transition/turnstile/nullifier logic directly.
+    fn manager(db: &Arc<DB>) -> ShieldedStateManager {
+        ShieldedStateManager::new(Arc::clone(db), CachePolicy::Count(64))
     }
 
     /// Commit one block (compute → persist → write), mirroring the per-block
@@ -345,7 +392,7 @@ mod tests {
     #[test]
     fn per_block_commit_persists_and_resolves_double_spend() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let mgr = manager_with_finalized_genesis(&db);
+        let mgr = manager(&db);
         let (genesis, b1, b2) = (h(0), h(1), h(2));
 
         let c1 = commit_block(&mgr, &db, b1, genesis, Some(coinbase(50, 10)), vec![stx(&[1], &[100], 5)]);
@@ -357,7 +404,7 @@ mod tests {
         let tip_anchor = c2.anchor();
 
         // Fresh manager from the same DB: identical persisted anchor at the tip.
-        let mgr2 = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64), 100);
+        let mgr2 = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64));
         assert_eq!(mgr2.anchor_at(b2).unwrap(), tip_anchor);
         assert!(mgr2.nullifiers().contains(&nf(1)).unwrap());
 
@@ -366,12 +413,44 @@ mod tests {
         assert!(c3.outcome.accepted.is_empty(), "double-spend caught across sessions");
     }
 
+    /// The shielded state root (PLAN §2.10) is persisted per block, reproduces
+    /// exactly on a fresh manager, moves when a spend adds a nullifier, and its
+    /// nullifier-accumulator component is empty until the first spend.
+    #[test]
+    fn state_root_commits_and_reproduces() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+        let (b1, b2, b3) = (h(1), h(2), h(3));
+
+        // b1: coinbase only, no spend — nullifier accumulator is still empty.
+        let c1 = commit_block(&mgr, &db, b1, h(0), Some(coinbase(50, 0)), vec![]);
+        assert_eq!(c1.nullifier_root(), kaspa_muhash::EMPTY_MUHASH.as_bytes(), "no spend => empty accumulator");
+        // compute-time root == the root recomputed from persisted stores.
+        assert_eq!(c1.state_root(), mgr.state_root_at(b1).unwrap());
+
+        // b2: coinbase + a spend — the accumulator (and thus the state root) moves.
+        let c2 = commit_block(&mgr, &db, b2, b1, Some(coinbase(50, 10)), vec![stx(&[1], &[100], 5)]);
+        assert_ne!(c2.nullifier_root(), kaspa_muhash::EMPTY_MUHASH.as_bytes(), "spend populates accumulator");
+        assert_ne!(c2.state_root(), c1.state_root(), "state root must advance");
+        assert_eq!(c2.state_root(), mgr.state_root_at(b2).unwrap());
+
+        // A fresh manager over the same DB reproduces both roots bit-for-bit.
+        let mgr2 = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64));
+        assert_eq!(mgr2.state_root_at(b1).unwrap(), c1.state_root());
+        assert_eq!(mgr2.state_root_at(b2).unwrap(), c2.state_root());
+
+        // A no-spend child still carries the accumulator forward (readable at b3).
+        let c3 = commit_block(&mgr, &db, b3, b2, Some(coinbase(50, 0)), vec![]);
+        assert_eq!(c3.nullifier_root(), c2.nullifier_root(), "accumulator persists across a no-spend block");
+        assert_eq!(mgr.state_root_at(b3).unwrap(), c3.state_root());
+    }
+
     /// Reverting a block removes the nullifiers it added, so the same nullifier
     /// can be spent again on the new branch (reorg correctness).
     #[test]
     fn revert_removes_block_nullifiers() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let mgr = manager_with_finalized_genesis(&db);
+        let mgr = manager(&db);
         let b1 = h(1);
 
         commit_block(&mgr, &db, b1, h(0), Some(coinbase(10, 1)), vec![stx(&[1], &[100], 0)]);
@@ -393,7 +472,7 @@ mod tests {
     #[test]
     fn rejoin_re_adds_nullifiers_from_store() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let mgr = manager_with_finalized_genesis(&db);
+        let mgr = manager(&db);
         let b1 = h(1);
 
         commit_block(&mgr, &db, b1, h(0), Some(coinbase(10, 1)), vec![stx(&[1], &[100], 0)]);
@@ -419,7 +498,7 @@ mod tests {
     #[test]
     fn reorg_isolates_and_reverts_shielded_coinbase() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let mgr = manager_with_finalized_genesis(&db);
+        let mgr = manager(&db);
         let (genesis, branch_a, branch_b) = (h(0), h(1), h(2));
 
         // Branch A (from genesis): coinbase mints 100, a tx spends nf(1), fee 5.
@@ -457,26 +536,80 @@ mod tests {
     #[test]
     fn rejects_overspend() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let mgr = manager_with_finalized_genesis(&db);
+        let mgr = manager(&db);
         let res = mgr.compute(h(0), Some(&coinbase(10, 1)), &[stx(&[7], &[2], 11)]);
         assert!(matches!(res, Err(ShieldedManagerError::State(ShieldedStateError::Turnstile(_)))));
     }
 
-    /// A spend proving against an anchor that is not in the finalized window is
-    /// rejected (PLAN §2.5). A pure-output bundle (no nullifiers) is exempt.
+    /// THE make-or-break property (PLAN Phase 1) at the consensus-manager layer:
+    /// when a chain block **merges two parallel blocks** that each spend the same
+    /// shielded note, both of those spends land in that one chain block's accepted
+    /// set and are resolved in a **single** store-backed `compute` call (this is
+    /// exactly what the virtual processor does — `ctx.shielded_txs` gathers the
+    /// whole mergeset, then one `compute` runs). Exactly one spend must survive,
+    /// the nullifier must be recorded once, no value may be created, and — the
+    /// determinism requirement — two independent nodes must compute the identical
+    /// anchor from the identical accepted order.
     #[test]
-    fn rejects_unfinalized_anchor() {
+    fn parallel_mergeset_double_spend_resolved_in_one_compute() {
+        // Two independent "nodes", each with its own DB/manager, apply the identical
+        // accepted order: a coinbase (mints 100) then two conflicting spends of nf(1)
+        // — the first from merged block X, the second from merged block Y — plus one
+        // independent spend of nf(2). GHOSTDAG fixed the order [X's tx, Y's tx, other].
+        let build_tip = || {
+            let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+            let mgr = manager(&db);
+            // First, a coinbase-only block matures a note into the pool for nf(1)/nf(2)
+            // to have been "minted" against (turnstile needs the pool funded).
+            let c0 = commit_block(&mgr, &db, h(1), h(0), Some(coinbase(100, 10)), vec![]);
+            assert_eq!(c0.outcome.accepted.len(), 0);
+            // The merging chain block h(2): its accepted set carries BOTH conflicting
+            // spends of nf(1) (from the two parallel merged blocks) and an independent
+            // spend of nf(2), all resolved in this one compute call.
+            let computed = mgr
+                .compute(
+                    h(1),
+                    None,
+                    &[
+                        stx(&[1], &[100], 5), // X's spend of nf(1) — first in order, wins
+                        stx(&[1], &[200], 5), // Y's spend of nf(1) — dropped (double-spend)
+                        stx(&[2], &[300], 5), // independent spend — survives
+                    ],
+                )
+                .unwrap();
+            // Release all DB references before `_lt` drops (its Drop asserts the DB has
+            // no strong refs left); only the owned `computed` result escapes.
+            drop(mgr);
+            drop(db);
+            computed
+        };
+
+        let a = build_tip();
+        let b = build_tip();
+
+        // Exactly one of the conflicting spends survives; the independent one also does.
+        assert_eq!(a.outcome.accepted, vec![0, 2], "first spend of nf(1) wins, Y's is dropped, nf(2) survives");
+        // The double-spent nullifier is recorded exactly once (plus nf(2) once).
+        assert_eq!(a.outcome.new_nullifiers.len(), 2);
+        // No value created: pool = coinbase(100) − fees(5 for tx0 + 5 for tx2); Y's
+        // dropped tx contributes no fee.
+        assert_eq!(a.supply_totals.cumulative_coinbase - a.supply_totals.cumulative_fees, 100 - 10);
+        // Determinism: two independent nodes compute the identical anchor.
+        assert_eq!(a.anchor(), b.anchor(), "identical anchor across nodes from identical accepted order");
+    }
+
+    /// The anchor→block index records a block's tree root so a spend can later be
+    /// resolved to its source block (finality/canonicality is then decided by the
+    /// virtual processor via reachability + depth, tested at that layer).
+    #[test]
+    fn records_anchor_source_block() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        // Note: genesis anchor NOT published, so no anchor is finalized.
-        let mgr = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64), 100);
-
-        // A spending tx referencing the (unfinalized) empty anchor is rejected.
-        let spend = ShieldedTx { nullifiers: vec![nf(1)], commitments: vec![cmx(1)], fee: 0, anchor: empty_anchor() };
-        let res = mgr.compute(h(0), Some(&coinbase(10, 1)), &[spend]);
-        assert!(matches!(res, Err(ShieldedManagerError::UnfinalizedAnchor(_))));
-
-        // A pure-output bundle (no spends) is exempt from the anchor check.
-        let out_only = ShieldedTx { nullifiers: vec![], commitments: vec![cmx(2)], fee: 0, anchor: [0u8; 32] };
-        assert!(mgr.compute(h(0), Some(&coinbase(10, 1)), &[out_only]).is_ok());
+        let mgr = manager(&db);
+        // Commit a coinbase-only block; its non-empty tree root is indexed to h(1).
+        let computed = commit_block(&mgr, &db, h(1), h(0), Some(coinbase(10, 1)), vec![]);
+        let anchor = computed.anchor();
+        assert_eq!(mgr.anchor_source_block(&anchor).unwrap(), Some(h(1)));
+        // An anchor no block produced is unknown.
+        assert_eq!(mgr.anchor_source_block(&[0xabu8; 32]).unwrap(), None);
     }
 }

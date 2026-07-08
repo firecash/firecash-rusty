@@ -25,6 +25,7 @@ num.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+kaspa-merkle.workspace = true
 
 [[bench]]
 name = "bench"

@@ -1177,6 +1177,7 @@ async fn difficulty_test() {
             blue_work: 0.into(),
             blue_score: 0,
             pruning_point: 0.into(),
+            aux_pow: None,
         };
 
         // Stage 0

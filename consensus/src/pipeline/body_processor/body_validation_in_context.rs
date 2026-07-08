@@ -77,6 +77,20 @@ impl BlockBodyProcessor {
                     return Err(RuleError::WrongSubsidy(expected_subsidy, data.subsidy));
                 }
 
+                // Shielded networks (R2 halt guard): this block's declared payout is
+                // what every *later* block that merges it will pay — and mint into the
+                // Orchard pool as a coinbase note. If it were not a canonical Orchard
+                // address, that later mint would fail and, under the accepted-order
+                // model, would stall every merger of this block. Reject the bad block
+                // here — at body acceptance, on its own data — so it never enters the
+                // DAG. The genesis coinbase is exempt (it mints no note).
+                if self.shielded_coinbase
+                    && block.hash() != self.genesis.hash
+                    && !kaspa_shielded_core::coinbase::is_canonical_orchard_payout(data.miner_data.script_public_key.script())
+                {
+                    return Err(RuleError::BadShieldedCoinbasePayout);
+                }
+
                 Ok(())
             }
             Err(e) => Err(RuleError::BadCoinbasePayload(e)),
@@ -109,7 +123,12 @@ mod tests {
     async fn validate_body_in_context_test() {
         let config = ConfigBuilder::new(MAINNET_PARAMS)
             .skip_proof_of_work()
-            .edit_consensus_params(|p| p.deflationary_phase_daa_score = p.genesis.daa_score + 2)
+            .edit_consensus_params(|p| {
+                p.deflationary_phase_daa_score = p.genesis.daa_score + 2;
+                // This test exercises blue-score/subsidy/lock-time on plain (non-Orchard)
+                // coinbases, so opt out of the shielded payout-address requirement.
+                p.shielded_coinbase = false;
+            })
             .build();
         let consensus = TestConsensus::new(&config);
         let wait_handles = consensus.init();
@@ -131,7 +150,7 @@ mod tests {
             block.header.hash_merkle_root = calc_hash_merkle_root(block.transactions.iter());
 
             assert_match!(
-                consensus.validate_and_insert_block(block.clone().to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 50000000000);
+                consensus.validate_and_insert_block(block.clone().to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 5000000000);
 
             // The second time we send an invalid block we expect it to be a known invalid.
             assert_match!(
@@ -169,7 +188,10 @@ mod tests {
             let mut block = consensus.build_block_with_parents_and_transactions(7.into(), vec![6.into()], vec![]);
             block.transactions[0].payload[8..16].copy_from_slice(&(5_u64).to_le_bytes());
             block.header.hash_merkle_root = calc_hash_merkle_root(block.transactions.iter());
-            assert_match!(consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 44000000000);
+            // firecash divides Kaspa's emission table by BPS (=10): the deflationary
+            // initial subsidy is 44_000_000_000/10 = 4_400_000_000 per block (the value
+            // observed live in the mainnet coinbase).
+            assert_match!(consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 4400000000);
         }
 
         {
@@ -205,6 +227,27 @@ mod tests {
             check_for_lock_time_and_sequence(&consensus, valid_block_child.header.hash, 15.into(), tip_daa_score + 1, u64::MAX, true)
                 .await;
         }
+
+        consensus.shutdown(wait_handles);
+    }
+
+    /// R2 halt guard: on a shielded network, a block whose declared coinbase payout
+    /// is not a canonical Orchard address must be rejected at body acceptance — so it
+    /// never enters the DAG, where a *later* block that merges (and must pay) it would
+    /// fail to mint the reward note and stall every merger of it.
+    #[tokio::test]
+    async fn shielded_network_rejects_non_orchard_coinbase_payout() {
+        let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+        assert!(config.shielded_coinbase, "mainnet is shielded-by-default");
+        let consensus = TestConsensus::new(&config);
+        let wait_handles = consensus.init();
+
+        // A default test block carries a placeholder (non-Orchard) coinbase payout.
+        let block = consensus.build_block_with_parents_and_transactions(1.into(), vec![config.genesis.hash], vec![]);
+        assert_match!(
+            consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await,
+            Err(RuleError::BadShieldedCoinbasePayout)
+        );
 
         consensus.shutdown(wait_handles);
     }

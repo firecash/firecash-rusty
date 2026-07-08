@@ -1,8 +1,8 @@
-//! `kasprivate-miner` — a standalone CPU miner for the kasprivate network
+//! `firecash-miner` — a standalone CPU miner for the firecash network
 //! (blocker #4). It talks the standard `get_block_template` / `submit_block` RPC to
-//! a `kaspad` node, searches the nonce space with the shared FishHashPlus PoW
+//! a `kaspad` node, searches the nonce space with the shared kHeavyHash PoW
 //! ([`kaspa_pow::State`], the very code the node verifies with), and submits solved
-//! blocks. The mining reward is paid to a `kasprivate:` shielded address, so a
+//! blocks. The mining reward is paid to a `firecash:` shielded address, so a
 //! bootstrapped chain is private-by-default from its first mined block.
 //!
 //! This is intentionally a CPU miner: on a fresh, low-difficulty genesis chain a
@@ -10,6 +10,7 @@
 //! kernel is a later optimization; the search logic and the node acceptance
 //! contract are identical either way (see [`solver`]).
 
+mod merged;
 mod solver;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,18 +21,17 @@ use clap::Parser;
 use kaspa_addresses::Address;
 use kaspa_consensus_core::header::Header;
 use kaspa_grpc_client::GrpcClient;
-use kaspa_hashes::FishHashContext;
 use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode};
 
 /// CLI arguments.
 #[derive(Parser, Debug)]
-#[command(name = "kasprivate-miner", about = "Standalone CPU miner for the kasprivate network (FishHashPlus PoW)")]
+#[command(name = "firecash-miner", about = "Standalone CPU miner for the firecash network (kHeavyHash PoW)")]
 struct Args {
     /// kaspad gRPC endpoint (host:port).
     #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
     rpc_server: String,
 
-    /// The `kasprivate:` shielded address the block reward is paid to.
+    /// The `firecash:` shielded address the block reward is paid to.
     #[arg(short = 'a', long)]
     mining_address: String,
 
@@ -39,15 +39,27 @@ struct Args {
     #[arg(short = 't', long, default_value_t = 0)]
     threads: usize,
 
-    /// Build the full ~4.6GB FishHash dataset for the fast memory-hard path.
-    /// Without it, the shared light cache is used (slower per hash, no big alloc).
-    #[arg(long, default_value_t = false)]
-    full_dataset: bool,
-
     /// Seconds to mine one template before refetching a fresh one (so the miner
     /// follows new tips instead of wasting work on a stale parent set).
     #[arg(long, default_value_t = 5)]
     refresh_secs: u64,
+
+    /// Skip proof-of-work: submit each template immediately with nonce 0 instead of
+    /// grinding a valid hash. Only useful against a node running with
+    /// `skip_proof_of_work` (devnet/simnet override), where any nonce is accepted —
+    /// lets a local chain grow thousands of blocks quickly for testing (e.g. to reach
+    /// shielded-spend maturity). Rejected as invalid PoW on a normal node.
+    #[arg(long, default_value_t = false)]
+    no_pow: bool,
+
+    /// Merged-mining (AuxPoW) mode: instead of grinding the FireCash header's own
+    /// nonce, prove proof-of-work via a parent kHeavyHash block that commits to the
+    /// FireCash block hash (Option-2 dual acceptance). Only accepted once merged
+    /// mining has activated on the node (see `merged_mining_activation`). This is the
+    /// engine the pool reuses to feed ASIC hashrate; here it self-mines a synthetic
+    /// parent for testing.
+    #[arg(long, default_value_t = false)]
+    merged: bool,
 }
 
 #[tokio::main]
@@ -63,16 +75,6 @@ async fn main() {
         }
     };
     let threads = if args.threads == 0 { num_cpus::get() } else { args.threads };
-
-    // The full dataset (if requested) is built once, up front; the light path lazily
-    // builds only the ~75MB verification cache on first hash.
-    let full_ctx: Option<Arc<FishHashContext>> = if args.full_dataset {
-        log::info!("building full FishHash dataset (~4.6GB, one-time)...");
-        Some(Arc::new(FishHashContext::new(true, None)))
-    } else {
-        log::info!("using the light FishHash cache (pass --full-dataset for the fast path)");
-        None
-    };
 
     let client = connect(&args.rpc_server).await;
     log::info!("mining to {} with {threads} threads, refreshing template every {}s", mining_address, args.refresh_secs);
@@ -102,6 +104,37 @@ async fn main() {
             }
         };
 
+        // Merged-mining mode: prove PoW via an AuxPoW parent instead of a native nonce.
+        if args.merged {
+            let stop = Arc::new(AtomicBool::new(false));
+            let deadline = {
+                let stop = stop.clone();
+                let secs = args.refresh_secs;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    stop.store(true, Ordering::Relaxed);
+                })
+            };
+            let built = {
+                let header = header.clone();
+                let stop = stop.clone();
+                tokio::task::spawn_blocking(move || merged::build_aux_pow(&header, threads, &stop)).await.expect("aux worker panicked")
+            };
+            deadline.abort();
+            let Some((fc_header, aux)) = built else { continue };
+            // Attach the aux witness and re-encode as a raw header (hex-encodes the
+            // AuxPow into the submit payload). H_fc is unaffected by the aux data.
+            let block_hash = fc_header.hash;
+            let fc_with_aux = fc_header.with_aux_pow(aux);
+            raw_block.header = (&fc_with_aux).into();
+            match client.submit_block(raw_block, false).await {
+                Ok(resp) if resp.report.is_success() => log::info!("AUX BLOCK ACCEPTED  hash={block_hash}"),
+                Ok(resp) => log::warn!("aux block rejected: {:?}  (hash={block_hash})", resp.report),
+                Err(e) => log::warn!("submit_block (aux) failed: {e}"),
+            }
+            continue;
+        }
+
         // Mine this template for up to `refresh_secs`, then abandon it for a fresh one.
         let stop = Arc::new(AtomicBool::new(false));
         let deadline = {
@@ -113,15 +146,22 @@ async fn main() {
             })
         };
 
-        let nonce = {
-            let header = header.clone();
-            let full_ctx = full_ctx.clone();
-            let stop = stop.clone();
-            tokio::task::spawn_blocking(move || solver::mine_header(&header, full_ctx, threads, &stop))
-                .await
-                .expect("mining worker panicked")
+        let nonce = if args.no_pow {
+            // No-PoW fast path: submit immediately with nonce 0. Only valid against a
+            // node with skip_proof_of_work; used to grow a test chain quickly.
+            deadline.abort();
+            Some(0u64)
+        } else {
+            let n = {
+                let header = header.clone();
+                let stop = stop.clone();
+                tokio::task::spawn_blocking(move || solver::mine_header(&header, threads, &stop))
+                    .await
+                    .expect("mining worker panicked")
+            };
+            deadline.abort();
+            n
         };
-        deadline.abort();
 
         let Some(nonce) = nonce else {
             // Template expired without a solution; loop to fetch a fresh one.

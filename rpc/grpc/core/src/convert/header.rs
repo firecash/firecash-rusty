@@ -23,6 +23,7 @@ from!(item: &kaspa_rpc_core::RpcHeader, protowire::RpcBlockHeader, {
         blue_score: item.blue_score,
         pruning_point: item.pruning_point.to_string(),
         hash: item.hash.to_string(),
+        aux_pow: String::default(), // RpcHeader (query path) does not carry the aux witness
     }
 });
 
@@ -41,6 +42,7 @@ from!(item: &kaspa_rpc_core::RpcRawHeader, protowire::RpcBlockHeader, {
         blue_work: item.blue_work.to_rpc_hex(),
         blue_score: item.blue_score,
         pruning_point: item.pruning_point.to_string(),
+        aux_pow: item.aux_pow.clone(),
     }
 });
 
@@ -84,6 +86,7 @@ try_from!(item: &protowire::RpcBlockHeader, kaspa_rpc_core::RpcRawHeader, {
         blue_work: kaspa_rpc_core::RpcBlueWorkType::from_rpc_hex(&item.blue_work)?,
         blue_score: item.blue_score,
         pruning_point: RpcHash::from_str(&item.pruning_point)?,
+        aux_pow: item.aux_pow.clone(),
     }
 });
 

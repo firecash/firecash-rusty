@@ -190,6 +190,11 @@ pub struct BlockrateParams {
     pub finality_depth: u64,
     pub pruning_depth: u64,
     pub coinbase_maturity: u64,
+    /// Shielded-spend anchor maturity in blue-score units (PLAN §2.5): a mined
+    /// shielded note is spendable once its minting block is this deep below the
+    /// sink. Set to ~10 minutes of blocks (`600 * BPS`), independent of
+    /// `finality_depth`, so spends do not have to wait the full finality window.
+    pub shielded_anchor_depth: u64,
 }
 
 impl BlockrateParams {
@@ -205,6 +210,8 @@ impl BlockrateParams {
             finality_depth: Bps::<BPS>::finality_depth(),
             pruning_depth: Bps::<BPS>::pruning_depth(),
             coinbase_maturity: Bps::<BPS>::coinbase_maturity(),
+            // ~10 minutes of blocks: shielded-spend maturity (PLAN §2.5).
+            shielded_anchor_depth: 600 * BPS,
         }
     }
 
@@ -212,6 +219,16 @@ impl BlockrateParams {
         if self.max_block_parents < max_block_parents {
             self.max_block_parents = max_block_parents;
         }
+        self
+    }
+
+    /// Override the finality depth (and hence the shielded finalized-anchor window,
+    /// PLAN §2.5). Used by non-mainnet networks that need spends to reference a
+    /// finalized anchor within a short chain — a full 12-hour (432000-block)
+    /// finality makes an in-session shielded spend infeasible. Leaves every other
+    /// blockrate param untouched, mirroring the `finality_depth = N` test override.
+    pub const fn with_finality_depth(mut self, finality_depth: u64) -> Self {
+        self.finality_depth = finality_depth;
         self
     }
 }
@@ -267,6 +284,11 @@ pub struct OverrideParams {
     pub crescendo_activation: Option<ForkActivation>,
 
     pub toccata_activation: Option<ForkActivation>,
+
+    /// Merged-mining (AuxPoW) activation DAA score. Before this score only native
+    /// kHeavyHash PoW is accepted; at/after it a block may satisfy PoW via a valid
+    /// AuxPoW proof (Option-2 dual acceptance).
+    pub merged_mining_activation: Option<ForkActivation>,
 }
 
 impl From<Params> for OverrideParams {
@@ -299,6 +321,7 @@ impl From<Params> for OverrideParams {
             blockrate: Some(p.blockrate),
             crescendo_activation: Some(p.crescendo_activation),
             toccata_activation: Some(p.toccata_activation),
+            merged_mining_activation: Some(p.merged_mining_activation),
         }
     }
 }
@@ -333,7 +356,7 @@ pub struct Params {
     pub coinbase_payload_script_public_key_max_len: u8,
     pub max_coinbase_payload_len: usize,
 
-    /// kasprivate: when true, the coinbase creates **no transparent outputs**; the
+    /// firecash: when true, the coinbase creates **no transparent outputs**; the
     /// block reward (subsidy + fees per rewarded block) enters the mandatory
     /// shielded pool as coinbase notes, minted in the virtual processor (PLAN
     /// §2.7). The miner's shielded (Orchard) address is carried in the reward's
@@ -376,13 +399,18 @@ pub struct Params {
 
     pub toccata_activation: ForkActivation,
 
-    /// kasprivate launch difficulty schedule — number of blocks (blue-score units) at the
+    /// Merged-mining (AuxPoW) activation DAA score. Before this score a block must
+    /// clear the native kHeavyHash PoW; at/after it a block may instead carry a valid
+    /// AuxPoW proof whose parent kHeavyHash clears our target (Option-2 dual acceptance).
+    pub merged_mining_activation: ForkActivation,
+
+    /// firecash launch difficulty schedule — number of blocks (blue-score units) at the
     /// start of the chain during which difficulty is **pinned** to the genesis target
     /// (super-easy) so the chain can be bootstrap-mined on CPU. `0` (together with
     /// `difficulty_ramp_blocks == 0`) disables the schedule.
     pub low_difficulty_start_blocks: u64,
 
-    /// kasprivate launch difficulty schedule — number of blocks (blue-score units) after the
+    /// firecash launch difficulty schedule — number of blocks (blue-score units) after the
     /// low-difficulty start window over which the difficulty *ceiling* tightens geometrically from the
     /// genesis target toward real difficulty. After this ramp the ceiling is lifted and the
     /// pure DAA governs, so post-launch blocks are **not** easily mined. `0` disables the
@@ -533,6 +561,12 @@ impl Params {
         self.blockrate.finality_depth
     }
 
+    /// Shielded-spend anchor maturity in blue-score units (PLAN §2.5): how deep a
+    /// mined shielded note must be before it can be spent (~10 min at 10 BPS).
+    pub fn shielded_anchor_depth(&self) -> u64 {
+        self.blockrate.shielded_anchor_depth
+    }
+
     pub fn pruning_depth(&self) -> u64 {
         self.blockrate.pruning_depth
     }
@@ -647,6 +681,7 @@ impl Params {
 
             crescendo_activation: overrides.crescendo_activation.unwrap_or(self.crescendo_activation),
             toccata_activation: overrides.toccata_activation.unwrap_or(self.toccata_activation),
+            merged_mining_activation: overrides.merged_mining_activation.unwrap_or(self.merged_mining_activation),
 
             // Consensus-critical launch schedule; not exposed as a CLI override.
             low_difficulty_start_blocks: self.low_difficulty_start_blocks,
@@ -696,26 +731,11 @@ impl From<NetworkId> for Params {
 }
 
 pub const MAINNET_PARAMS: Params = Params {
-    dns_seeders: &[
-        // This DNS seeder is run by Denis Mashkevich
-        "mainnet-dnsseed-1.kaspanet.org",
-        // This DNS seeder is run by Denis Mashkevich
-        "mainnet-dnsseed-2.kaspanet.org",
-        // This DNS seeder is run by Georges Künzli
-        "seeder1.kaspad.net",
-        // This DNS seeder is run by Georges Künzli
-        "seeder2.kaspad.net",
-        // This DNS seeder is run by Georges Künzli
-        "seeder3.kaspad.net",
-        // This DNS seeder is run by Georges Künzli
-        "seeder4.kaspad.net",
-        // This DNS seeder is run by Tim
-        "kaspadns.kaspacalc.net",
-        // This DNS seeder is run by supertypo
-        "n-mainnet.kaspa.ws",
-        // This DNS seeder is run by -gerri-
-        "dnsseeder-kaspa-mainnet.x-con.at",
-    ],
+    // firecash is a distinct network with its own genesis; it MUST NOT advertise or
+    // dial Kaspa's DNS seeders (doing so would waste connections on genesis-mismatch
+    // rejects and leak our nodes into Kaspa's peer graph). Until firecash seeders are
+    // deployed (task #28), mainnet bootstraps via explicit --connect/--addpeer.
+    dns_seeders: &[],
     net: NetworkId::new(NetworkType::Mainnet),
     genesis: GENESIS,
     timestamp_deviation_tolerance: TIMESTAMP_DEVIATION_TOLERANCE,
@@ -726,7 +746,7 @@ pub const MAINNET_PARAMS: Params = Params {
     min_difficulty_window_size: MIN_DIFFICULTY_WINDOW_SIZE,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
-    // kasprivate is private-by-default: the mainnet coinbase creates no transparent
+    // firecash is private-by-default: the mainnet coinbase creates no transparent
     // outputs — the reward enters the mandatory shielded pool as coinbase notes (PLAN §2.7).
     // The miner's Orchard address is carried in the reward's 43-byte script_public_key.
     shielded_coinbase: true,
@@ -750,36 +770,43 @@ pub const MAINNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
 
-    // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
-    // switches to the deflationary period. This number is calculated as follows:
-    // We define a year as 365.25 days
-    // Half a year in seconds = 365.25 / 2 * 24 * 60 * 60 = 15778800
-    // The network was down for three days shortly after launch
-    // Three days in seconds = 3 * 24 * 60 * 60 = 259200
-    deflationary_phase_daa_score: 15778800 - 259200,
-    pre_deflationary_phase_base_subsidy: 50000000000,
+    // firecash is a fresh 10-BPS-from-genesis chain (no 1→10 Crescendo history),
+    // so emission uses the 10-BPS schedule from block 0. `deflationary_phase_daa_score
+    // = 0` means the smooth halving decay (3-month half-life, see coinbase.rs) applies
+    // immediately — no flat pre-deflationary plateau — matching the published emission
+    // curve and the tested DEVNET config. The pre-deflationary base subsidy is unused
+    // when this is 0, but is kept BPS-correct (÷BPS) for consistency; leaving it at the
+    // raw 1-BPS value would overissue 10× if the plateau were ever re-enabled.
+    deflationary_phase_daa_score: 0,
+    pre_deflationary_phase_base_subsidy: TenBps::pre_deflationary_phase_base_subsidy(),
     skip_proof_of_work: false,
     max_block_level: 225,
     pruning_proof_m: 1000,
 
     blockrate: BlockrateParams::new::<10>(),
 
-    pre_crescendo_target_time_per_block: 1000,
+    // 10 BPS from genesis: the "pre-Crescendo" block time equals the real one, and
+    // Crescendo is active from block 0, so the BPS history is a constant 10 (the
+    // subsidy table divides by 10 throughout — no 1-BPS legacy segment).
+    pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
 
-    // Roughly 2025-05-05 1500 UTC
-    crescendo_activation: ForkActivation::new(110_165_000),
+    crescendo_activation: ForkActivation::always(),
 
     // Roughly 2026-06-30 1615 UTC
     toccata_activation: ForkActivation::new(474_165_565),
+    // TEST VALUE: merged mining active from genesis (DAA 0) so an aux block can be
+    // produced and accepted immediately in a live demo. Was 432_000 (12h test);
+    // REVERT to 12_096_000 = day 14 for a real launch.
+    merged_mining_activation: ForkActivation::always(),
 
-    // kasprivate launch difficulty schedule (blue-score units, 10 BPS):
-    //  - first 50_000 blocks: difficulty pinned to the (super-easy) genesis target → CPU-mineable low-difficulty start.
-    //  - next 864_000 blocks (≈ 1 day at the 10 BPS target rate): the difficulty *ceiling*
-    //    tightens geometrically toward real difficulty; the pure DAA takes over the moment the
-    //    ceiling drops below actual network difficulty, so there is no post-start difficulty
-    //    cliff and post-launch blocks are not easily mined.
+    // firecash launch difficulty schedule (blue-score units, 10 BPS):
+    //  - first 50_000 blocks (~1.4 h): difficulty pinned to the (super-easy) genesis target → CPU-mineable low-difficulty start.
+    //  - next 200_000 blocks: the difficulty *ceiling* tightens geometrically toward real difficulty;
+    //    the pure DAA takes over the moment the ceiling drops below actual network difficulty, so
+    //    there is no post-start difficulty cliff and post-launch blocks are not easily mined.
+    //  - launch window ends at blue score 250_000 (~6.9 h at the 10 BPS target rate).
     low_difficulty_start_blocks: 50_000,
-    difficulty_ramp_blocks: 864_000,
+    difficulty_ramp_blocks: 200_000,
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -842,6 +869,8 @@ pub const TESTNET_PARAMS: Params = Params {
 
     // ~16:00 UTC, May 18, 2026
     toccata_activation: ForkActivation::new(467_579_632),
+    // On testnet, merged mining is available from genesis for testing.
+    merged_mining_activation: ForkActivation::always(),
 
     // Launch difficulty schedule disabled on testnet.
     low_difficulty_start_blocks: 0,
@@ -892,6 +921,7 @@ pub const SIMNET_PARAMS: Params = Params {
 
     crescendo_activation: ForkActivation::always(),
     toccata_activation: ForkActivation::always(),
+    merged_mining_activation: ForkActivation::always(),
 
     // Launch difficulty schedule disabled on simnet.
     low_difficulty_start_blocks: 0,
@@ -910,7 +940,11 @@ pub const DEVNET_PARAMS: Params = Params {
     min_difficulty_window_size: MIN_DIFFICULTY_WINDOW_SIZE,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
-    shielded_coinbase: false,
+    // firecash devnet is private-by-default like mainnet: the coinbase mints its
+    // reward into the shielded pool, so there is a note to spend privately. A live
+    // shielded payment over RPC (blocker #2) is provable here because the note
+    // matures after `shielded_anchor_depth` (~10 min), not the full finality window.
+    shielded_coinbase: true,
 
     max_tx_inputs: 1000,
     max_tx_outputs: 1000,
@@ -935,16 +969,23 @@ pub const DEVNET_PARAMS: Params = Params {
     max_block_level: 250,
     pruning_proof_m: 1000,
 
+    // Full chain finality (like mainnet). Shielded-spend maturity is governed
+    // separately by `shielded_anchor_depth` (~10 min), so a freshly-minted note is
+    // spendable in minutes without weakening finality/pruning.
     blockrate: BlockrateParams::new::<10>(),
 
     pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
 
     crescendo_activation: ForkActivation::always(),
     toccata_activation: ForkActivation::never(),
+    merged_mining_activation: ForkActivation::always(),
 
-    // Launch difficulty schedule disabled on devnet.
-    low_difficulty_start_blocks: 0,
-    difficulty_ramp_blocks: 0,
+    // Pin difficulty to the (easy) genesis target for the first 50k blocks so the
+    // short devnet demo chain stays CPU-mineable throughout (mirrors mainnet's launch
+    // schedule); the ramp then tightens toward real difficulty exactly as on mainnet.
+    // Launch window ends at blue score 250_000 (50k easy + 200k ramp), same as mainnet.
+    low_difficulty_start_blocks: 50_000,
+    difficulty_ramp_blocks: 200_000,
 };
 
 #[cfg(test)]

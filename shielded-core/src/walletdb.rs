@@ -46,39 +46,27 @@ use crate::coinbase::{coinbase_note_commitment, CoinbaseNoteDesc};
 use crate::tree::TREE_DEPTH;
 use crate::wallet::scan::scan_bundle;
 
-/// A note the wallet owns and can spend, together with the live witness that
-/// proves its membership at the current tip of the global tree.
+/// A note the wallet owns and can spend. The membership witness is **not** held
+/// live per note (that made scanning O(N²) — every leaf advanced every owned
+/// note's witness). Instead the wallet keeps the full commitment stream once and
+/// builds a witness on demand, only for the notes a spend actually selects
+/// ([`WalletDb::witness_path`]).
 #[derive(Clone)]
 pub struct OwnedNote {
     /// The spendable Orchard note.
     pub note: Note,
     /// The note's leaf position in the global note-commitment tree.
     pub position: u64,
-    /// Live membership witness, advanced as later notes are appended.
-    witness: IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>,
+    /// The note's nullifier (derived from the note and the wallet's full viewing
+    /// key). When this nullifier appears on-chain, the note has been spent and is
+    /// dropped from the wallet's unspent set.
+    nullifier: [u8; 32],
 }
 
 impl OwnedNote {
     /// The note's value in the base unit.
     pub fn value(&self) -> u64 {
         self.note.value().inner()
-    }
-
-    /// The current membership witness as an Orchard [`MerklePath`], ready to hand
-    /// to [`crate::wallet::build::build_spend_bundle`]. The path roots to the
-    /// current tip anchor (equal to [`Self::anchor`]); the wallet must spend it
-    /// against a **finalized** anchor (PLAN §2.5), so it should build the path
-    /// from a tip it knows the node has finalized.
-    pub fn merkle_path(&self) -> Option<MerklePath> {
-        let path = self.witness.path()?;
-        let auth: [MerkleHashOrchard; TREE_DEPTH as usize] = path.path_elems().try_into().ok()?;
-        let position = u64::from(path.position()) as u32;
-        Some(MerklePath::from_parts(position, auth))
-    }
-
-    /// The anchor (global-tree root) this note's witness currently roots to.
-    pub fn anchor(&self) -> [u8; 32] {
-        self.witness.root().to_bytes()
     }
 }
 
@@ -88,12 +76,20 @@ impl OwnedNote {
 pub struct WalletDb {
     /// Incoming viewing key — recovers shielded-tx outputs sent to this wallet.
     ivk: IncomingViewingKey,
+    /// Full viewing key — derives each owned note's nullifier for spent-detection.
+    fvk: FullViewingKey,
     /// This wallet's raw external address — matches coinbase recipients.
     my_address: [u8; 43],
-    /// A full mirror of the global tree, needed to seed each new witness at the
-    /// moment its note becomes the most-recent leaf.
+    /// A running mirror of the global tree, used only to report the current tip
+    /// [`anchor`](Self::anchor) cheaply (one append per leaf).
     tree: CommitmentTree<MerkleHashOrchard, TREE_DEPTH>,
-    /// Owned, unspent notes with their live witnesses.
+    /// The full note-commitment stream in append order. Retaining it lets the
+    /// wallet build a membership witness for any owned position **on demand**
+    /// (see [`Self::witness_path`]) instead of advancing a per-note witness on
+    /// every append — the difference between an O(N) and an O(N²) scan. At 32
+    /// bytes/leaf this is ~1 MB per million notes, cheap next to 625M hashes.
+    leaves: Vec<MerkleHashOrchard>,
+    /// Owned, unspent notes (position + note only; witnesses are built lazily).
     notes: Vec<OwnedNote>,
     /// Number of leaves ingested so far (the next leaf's position).
     size: u64,
@@ -107,7 +103,7 @@ impl WalletDb {
         let fvk = FullViewingKey::from(&sk);
         let ivk = fvk.to_ivk(Scope::External);
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
-        Some(Self { ivk, my_address, tree: CommitmentTree::empty(), notes: Vec::new(), size: 0 })
+        Some(Self { ivk, fvk, my_address, tree: CommitmentTree::empty(), leaves: Vec::new(), notes: Vec::new(), size: 0 })
     }
 
     /// The wallet's owned, unspent notes.
@@ -157,6 +153,11 @@ impl WalletDb {
         for bundle in txs {
             let received = scan_bundle(&self.ivk, bundle);
             for (i, action) in bundle.actions.iter().enumerate() {
+                // Each action reveals the nullifier of the note it spends. If that is
+                // one of ours, the note is now spent — drop it from the unspent set so
+                // balance and spend-selection never count or re-offer it.
+                self.notes.retain(|n| n.nullifier != action.nullifier);
+
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&action.cmx))
                 else {
                     continue;
@@ -175,24 +176,50 @@ impl WalletDb {
         self.notes.retain(|n| n.position != position);
     }
 
-    /// Append one leaf to the mirrored tree, advancing every existing witness and
-    /// — if the leaf is a note we own — seeding a fresh witness for it.
+    /// Append one leaf to the wallet's view: record it in the commitment stream,
+    /// advance the tip mirror, and — if it is a note we own — remember it (no
+    /// witness is built here; that is deferred to [`Self::witness_path`]). This is
+    /// O(1) amortised per leaf, so a full scan is O(N), not O(N²).
     fn append_leaf(&mut self, cmx: ExtractedNoteCommitment, owned: Option<Note>) {
         let leaf = MerkleHashOrchard::from_cmx(&cmx);
-        // Every already-tracked note gains this leaf as a future sibling. `append`
-        // only errors when the tree is full (2^32 leaves) — unreachable in practice.
-        for on in &mut self.notes {
-            let _ = on.witness.append(leaf);
-        }
+        self.leaves.push(leaf);
+        // `append` only errors when the tree is full (2^32 leaves) — unreachable.
         let _ = self.tree.append(leaf);
         if let Some(note) = owned {
-            // The tree's most-recent leaf is now this note, so `from_tree`
-            // witnesses exactly it.
-            let witness = IncrementalWitness::from_tree(self.tree.clone())
-                .expect("tree is non-empty immediately after appending a leaf");
-            self.notes.push(OwnedNote { note, position: self.size, witness });
+            let nullifier = note.nullifier(&self.fvk).to_bytes();
+            self.notes.push(OwnedNote { note, position: self.size, nullifier });
         }
         self.size += 1;
+    }
+
+    /// Build a membership witness for the owned note at `position`, as an Orchard
+    /// [`MerklePath`] rooting to the **current tip** [`anchor`](Self::anchor),
+    /// ready for [`crate::wallet::build::build_spend_bundle`]. The wallet must
+    /// spend against a *finalized* anchor (PLAN §2.5), so it should call this on a
+    /// [`WalletDb`] ingested only up to a tip it knows the node has finalized.
+    ///
+    /// Cost is O(N) in the number of leaves (one witness reconstruction from the
+    /// cached stream), paid only for the few notes a spend selects — versus the
+    /// old model that paid O(N) per leaf, for every owned note, on every scan.
+    pub fn witness_path(&self, position: u64) -> Option<MerklePath> {
+        let position = position as usize;
+        if position >= self.leaves.len() {
+            return None;
+        }
+        // Rebuild the tree up to and including the target leaf, so `from_tree`
+        // witnesses exactly it, then replay the later leaves to advance the
+        // witness to the current tip.
+        let mut tree = CommitmentTree::empty();
+        for leaf in &self.leaves[..=position] {
+            let _ = tree.append(*leaf);
+        }
+        let mut witness = IncrementalWitness::<MerkleHashOrchard, TREE_DEPTH>::from_tree(tree)?;
+        for leaf in &self.leaves[position + 1..] {
+            witness.append(*leaf).ok()?;
+        }
+        let path = witness.path()?;
+        let auth: [MerkleHashOrchard; TREE_DEPTH as usize] = path.path_elems().try_into().ok()?;
+        Some(MerklePath::from_parts(u64::from(path.position()) as u32, auth))
     }
 
     /// Reconstruct a coinbase note if it was paid to this wallet. A coinbase note
@@ -283,8 +310,8 @@ mod tests {
         // current tip.
         let owned = &db.notes()[0];
         assert_eq!(owned.value(), 2_000);
-        assert_eq!(owned.anchor(), state.anchor().to_bytes(), "owned note witness roots to the current anchor");
-        assert!(owned.merkle_path().is_some(), "a spendable Orchard path is available");
+        let path = db.witness_path(owned.position).expect("a spendable Orchard path is available");
+        assert_eq!(u64::from(path.position()), owned.position, "path is for the owned leaf");
     }
 }
 
@@ -302,9 +329,10 @@ mod tests {
 #[cfg(all(test, feature = "circuit"))]
 mod circuit_tests {
     use super::*;
+    use crate::bundle::ShieldedBundle;
     use crate::state::{CoinbaseMint, CoinbaseNote, ShieldedState, ShieldedTx};
     use crate::verify::{sighash, verify_bundle};
-    use crate::wallet::build::{build_spend_bundle, ShieldedKeys};
+    use crate::wallet::build::{build_spend_bundle, build_wallet_payment, ShieldedKeys};
     use crate::wallet::scan::address_bytes_from_seed;
     use orchard::circuit::ProvingKey;
 
@@ -317,7 +345,7 @@ mod circuit_tests {
         let pk = ProvingKey::build();
         let miner = [21u8; 32];
         let net = [0x5au8; 32];
-        let ctx = b"kasprivate-walletdb-e2e";
+        let ctx = b"firecash-walletdb-e2e";
 
         let mut state = ShieldedState::new();
         let mut db = WalletDb::from_seed(miner).unwrap();
@@ -339,11 +367,11 @@ mod circuit_tests {
         let owned = db.notes()[0].clone();
         assert_eq!(owned.position, 1, "owned note is the second leaf (behind a decoy)");
         assert_eq!(owned.value(), 10_000);
-        assert_eq!(owned.anchor(), anchor1.to_bytes(), "wallet witness roots to the consensus anchor");
+        assert_eq!(db.anchor(), anchor1.to_bytes(), "wallet mirror roots to the consensus anchor");
 
         // The wallet builds a real spend from its OWN witness (position 1 path).
         let keys = ShieldedKeys::from_seed(miner).unwrap();
-        let merkle_path = owned.merkle_path().expect("wallet has a live witness path");
+        let merkle_path = db.witness_path(owned.position).expect("wallet builds a witness path on demand");
         let recipient = ShieldedKeys::from_seed([42u8; 32]).unwrap().address();
         let output_value = 7_000u64;
         let wire = build_spend_bundle(
@@ -378,5 +406,54 @@ mod circuit_tests {
         // Replaying the same nullifier is dropped (double-spend guard).
         let replay = state.apply_chain_block(None, &[stx]).unwrap();
         assert!(replay.accepted.is_empty(), "reused nullifier -> dropped");
+    }
+
+    /// A multi-note wallet payment: the wallet spends TWO owned notes to cover an
+    /// amount larger than either, and after the spend is seen on-chain it drops both
+    /// spent notes (by nullifier) and instead tracks the change note it recovered by
+    /// trial decryption. Exercises `build_wallet_payment` (multi-input) end to end
+    /// plus `WalletDb` spent-detection and change discovery.
+    #[test]
+    fn wallet_multi_note_spend_drops_inputs_and_keeps_change() {
+        let miner = [31u8; 32];
+        let net = [0x5au8; 32];
+        let ctx = b"firecash-walletdb-multi";
+
+        let mut db = WalletDb::from_seed(miner).unwrap();
+        let mut state = ShieldedState::new();
+
+        // Block 1 mints two notes to us (positions 0 and 1), each worth 4_000.
+        let n0 = cb(address_bytes_from_seed(miner).unwrap(), b"blk1||0", 4_000);
+        let n1 = cb(address_bytes_from_seed(miner).unwrap(), b"blk1||1", 4_000);
+        let mint = CoinbaseMint::new(vec![
+            CoinbaseNote { value: n0.1, commitment: coinbase_note_commitment(&n0.0, n0.1).unwrap() },
+            CoinbaseNote { value: n1.1, commitment: coinbase_note_commitment(&n1.0, n1.1).unwrap() },
+        ]);
+        state.apply_chain_block(Some(&mint), &[]).unwrap();
+        db.ingest_block(&[n0, n1], &[]);
+        assert_eq!(db.notes().len(), 2, "two owned notes discovered");
+        assert_eq!(db.balance(), 8_000);
+
+        // Pay 5_000 (fee 1_000) — needs BOTH notes; 2_000 change returns to us.
+        let sel: Vec<_> = db.notes().iter().map(|o| (o.note.clone(), o.position)).collect();
+        let inputs: Vec<_> = sel.into_iter().map(|(note, pos)| (note, db.witness_path(pos).unwrap())).collect();
+        let recipient = address_bytes_from_seed([42u8; 32]).unwrap();
+        let payload = build_wallet_payment(miner, inputs, recipient, 5_000, 1_000, &net, ctx).expect("multi-note payment builds");
+        let wire = ShieldedBundle::from_bytes(&payload).expect("payload decodes to a bundle");
+
+        // Two real spends that actually verify against the shared anchor.
+        let msg = sighash(&wire, &net, ctx);
+        verify_bundle(&wire, &msg).expect("multi-note spend verifies");
+        assert_eq!(wire.value_balance, 1_000, "public fee = 8_000 in − 5_000 pay − 2_000 change");
+
+        // On-chain it is accepted (both nullifiers inserted), then the wallet ingests it.
+        let stx = ShieldedTx::from_bundle(&wire).unwrap();
+        assert_eq!(state.apply_chain_block(None, &[stx]).unwrap().accepted, vec![0], "multi-note spend accepted");
+        db.ingest_block(&[], &[&wire]);
+
+        // Both inputs are now spent and dropped; the wallet holds only the change note.
+        assert!(!db.notes().iter().any(|n| n.position == 0 || n.position == 1), "spent input notes dropped by nullifier");
+        assert_eq!(db.notes().len(), 1, "only the recovered change note remains");
+        assert_eq!(db.balance(), 2_000, "balance == change after the multi-note spend");
     }
 }

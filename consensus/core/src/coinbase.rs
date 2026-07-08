@@ -17,6 +17,13 @@ impl<T: AsRef<[u8]>> MinerData<T> {
 pub struct CoinbaseData<T: AsRef<[u8]> = Vec<u8>> {
     pub blue_score: u64,
     pub subsidy: u64,
+    /// The shielded state root (PLAN §2.10) as of this block's selected parent —
+    /// the note-commitment tree root, the nullifier-set accumulator, and the
+    /// turnstile totals bound into 32 bytes. Because the coinbase is committed by
+    /// the header's `hash_merkle_root` (and thus by proof-of-work), this forms a
+    /// PoW-anchored chain of shielded state roots that a fast/pruned node can
+    /// verify a checkpoint against without replaying from genesis.
+    pub shielded_commitment: [u8; 32],
     pub miner_data: MinerData<T>,
 }
 

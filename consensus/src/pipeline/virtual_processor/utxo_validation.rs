@@ -35,7 +35,7 @@ use kaspa_consensus_core::{
         utxo_view::{UtxoView, UtxoViewComposition},
     },
 };
-use kaspa_core::{info, trace};
+use kaspa_core::{debug, info, trace};
 use kaspa_hashes::Hash;
 use kaspa_muhash::MuHash;
 use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
@@ -91,9 +91,6 @@ pub(super) struct UtxoProcessingContext<'a> {
     /// (PLAN §2.4). Collected during UTXO processing; consumed by the shielded
     /// state transition in verification/commit.
     pub shielded_txs: Vec<ShieldedTx>,
-    /// Set if any accepted shielded transaction carried a malformed bundle; the
-    /// block is rejected during verification.
-    pub shielded_invalid: bool,
     /// The validated shielded transition for this block, computed during
     /// verification and persisted at commit.
     pub shielded_computed: Option<ComputedBlockShielded>,
@@ -113,7 +110,6 @@ impl<'a> UtxoProcessingContext<'a> {
             mergeset_acceptance_data: Vec::with_capacity(mergeset_size),
             pruning_sample_from_pov: Default::default(),
             shielded_txs: Vec::new(),
-            shielded_invalid: false,
             shielded_computed: None,
         }
     }
@@ -190,12 +186,14 @@ impl VirtualStateProcessor {
                 // Collect shielded bundles in accepted order (PLAN §2.4). The cheap
                 // version gate means transparent transactions cost nothing here.
                 if validated_tx.version() == TX_VERSION_SHIELDED {
-                    match ShieldedBundle::from_bytes(&validated_tx.tx().payload)
-                        .ok()
-                        .and_then(|b| ShieldedTx::from_bundle(&b).ok())
+                    // A shielded tx only reaches here after Full validation (which parses
+                    // and verifies its bundle), so `from_bundle` should always succeed. If
+                    // it somehow does not, we DROP that transaction rather than disqualify
+                    // the merging block: a single unusable merged tx must never be able to
+                    // halt the chain (see the accepted-order drop principle, PLAN §2.4).
+                    if let Some(stx) = ShieldedBundle::from_bytes(&validated_tx.tx().payload).ok().and_then(|b| ShieldedTx::from_bundle(&b).ok())
                     {
-                        Some(stx) => ctx.shielded_txs.push(stx),
-                        None => ctx.shielded_invalid = true,
+                        ctx.shielded_txs.push(stx);
                     }
                 }
             }
@@ -309,16 +307,26 @@ impl VirtualStateProcessor {
             return Err(InvalidTransactionsInUtxoContext(txs.len() - 1 - validated_transactions.len(), txs.len() - 1));
         }
 
-        // Shielded state transition (PLAN §2.4): validate nullifier conflicts and
-        // the turnstile against the selected parent's persisted shielded state, and
-        // compute the new state for commit. This is a no-op for blocks with no
+        // Shielded state transition (PLAN §2.4). This is a no-op for blocks with no
         // shielded activity.
-        if ctx.shielded_invalid {
-            return Err(InvalidShieldedState(header.hash, "malformed shielded bundle".to_string()));
-        }
+        //
+        // LIVENESS PRINCIPLE (the fix): a shielded transaction that is invalid *in
+        // accepted-order context* is DROPPED, never a reason to disqualify the block
+        // that merges it — exactly as a transparent (or shielded nullifier)
+        // double-spend is dropped, not fatal. The offending tx is immutably embedded
+        // in an already-mined merged block, so hard-rejecting the merging block makes
+        // that block un-mergeable and halts the whole selected chain (observed live:
+        // one spend against a stale anchor froze the virtual chain). Dropping the
+        // spend leaves no trace (no nullifier, no note, no fee); the sender simply
+        // re-sends against a fresh anchor. Only genuinely block-level invariants
+        // (the block's own malformed coinbase, or a turnstile/tree-full violation
+        // that by PLAN §2.6 must halt-not-inflate) disqualify the block.
+
         // On a shielded-coinbase network the block reward enters the pool as
         // coinbase notes derived from the coinbase transaction (PLAN §2.7); the
         // matching outputs are diverted from the UTXO set in `calculate_utxo_state`.
+        // This is the block's OWN coinbase, so a malformed one correctly disqualifies
+        // it (a competing block with a valid coinbase wins) — it cannot halt the chain.
         let coinbase_mint = if self.shielded_coinbase {
             match crate::processes::shielded::build_coinbase_mint(&txs[0]) {
                 Ok(mint) => Some(mint),
@@ -327,13 +335,30 @@ impl VirtualStateProcessor {
         } else {
             None
         };
+
+        // Anchor-finality (PLAN §2.5): a *spending* shielded bundle must prove against
+        // a matured, canonical anchor relative to this block (an anchor whose source
+        // block is not a selected-chain ancestor of the selected parent — e.g. from a
+        // >shielded_anchor_depth reorg — is not final, closing the shallow-anchor
+        // value-creation vector). Pure-output bundles (no nullifiers) are exempt.
+        //
+        // A spend that fails this is DROPPED (retained-out), not fatal: dropping is
+        // strictly safe (the spend is never applied, so no value is created and no
+        // double-spend is possible) and preserves liveness.
+        let block_blue_score = ctx.ghostdag_data.blue_score;
+        let selected_parent = ctx.selected_parent();
+        let before = ctx.shielded_txs.len();
+        ctx.shielded_txs
+            .retain(|stx| stx.nullifiers.is_empty() || self.is_shielded_anchor_final(&stx.anchor, selected_parent, block_blue_score));
+        let dropped = before - ctx.shielded_txs.len();
+        if dropped > 0 {
+            debug!("shielded: dropped {dropped} spend(s) against a non-final/abandoned anchor while merging into {}", header.hash);
+        }
+
         match self.shielded_state_manager.compute(ctx.selected_parent(), coinbase_mint.as_ref(), &ctx.shielded_txs) {
             Ok(computed) => ctx.shielded_computed = Some(computed),
             Err(crate::processes::shielded::ShieldedManagerError::State(e)) => {
                 return Err(InvalidShieldedState(header.hash, format!("{e:?}")));
-            }
-            Err(crate::processes::shielded::ShieldedManagerError::UnfinalizedAnchor(a)) => {
-                return Err(InvalidShieldedState(header.hash, format!("spend references unfinalized anchor {a:02x?}")));
             }
             Err(e @ crate::processes::shielded::ShieldedManagerError::MalformedCoinbaseNote(_)) => {
                 // Not produced by `compute` (only by `build_coinbase_mint` above),
@@ -370,9 +395,13 @@ impl VirtualStateProcessor {
     ) -> BlockProcessResult<()> {
         // Extract only miner data from the provided coinbase
         let miner_data = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data;
+        // The coinbase must commit to the shielded state root of this block's selected parent
+        // (PLAN §2.10). Rebuilding the expected coinbase with that root means a wrong or missing
+        // commitment fails the tx-hash comparison below as `BadCoinbaseTransaction`.
+        let shielded_commitment = self.shielded_state_manager.state_root_at(ghostdag_data.selected_parent).unwrap();
         let expected_coinbase = self
             .coinbase_manager
-            .expected_coinbase_transaction(daa_score, miner_data, ghostdag_data, mergeset_rewards, mergeset_non_daa)
+            .expected_coinbase_transaction(daa_score, miner_data, ghostdag_data, mergeset_rewards, mergeset_non_daa, shielded_commitment)
             .unwrap()
             .tx;
         if hashing::tx::hash(coinbase) != hashing::tx::hash(&expected_coinbase) { Err(BadCoinbaseTransaction) } else { Ok(()) }
