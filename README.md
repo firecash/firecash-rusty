@@ -70,43 +70,38 @@ cargo build --release
 First build downloads and compiles all dependencies (RocksDB, Halo 2, etc.) and takes
 ~10–20 min; later builds are incremental. Run the test suite with `cargo test --release`.
 
-## Run — a synced, peered network
+## Run a node & join the network
 
-> **Important:** on mainnet a node reports `is_synced` **only when it has ≥1 peer**
-> (`has_sufficient_peer_connectivity` + a recent tip). A single isolated node can never be
-> "synced", which is why `--enable-unsynced-mining` exists — it's a **bootstrap crutch**,
-> not how you run a real chain. A real launch = **at least two peered nodes.**
+Grab the binaries from the latest [Release](https://github.com/firecash/firecash-rusty/releases)
+(or build from source, below), then run a node that syncs from the FireCash seed nodes:
 
-**Node A — bootstrapper** (first node of a brand-new chain; the crutch is only needed until
-a second node peers):
 ```bash
-./kaspad --appdir=./fc-node --rpclisten=127.0.0.1:16110 --utxoindex --enable-unsynced-mining
-# bootstrap the chain with some blocks:
-./firecash-miner -s 127.0.0.1:16110 -a firecash:<addr> -t 4
+./kaspad --appdir=./fc-node --rpclisten=127.0.0.1:16110 --utxoindex \
+  --connect=185.147.157.125:16111 --connect=160.187.211.153:16111
 ```
+Your node does an initial block download from the network and then follows the tip. It only
+needs outbound access to the seed nodes' **p2p port 16111**; its own RPC (16110) stays local.
 
-**Node B (and every other node)** — connect to A's p2p (16111); it IBD-syncs the chain.
-No crutch flag:
-```bash
-./kaspad --appdir=./fc-node --rpclisten=127.0.0.1:16110 --connect=<NODE_A_IP>:16111 --utxoindex
-```
+## Mine
 
-**Once ≥2 nodes are peered**, both report `is_synced=true`. Now restart Node A **without**
-`--enable-unsynced-mining` — it mines because it is genuinely synced:
-```bash
-./kaspad --appdir=./fc-node --rpclisten=127.0.0.1:16110 --utxoindex --addpeer=<NODE_B_IP>:16111
-./firecash-miner -s 127.0.0.1:16110 -a firecash:<addr> -t 4      # add --merged for AuxPoW
-```
+- **Pool (recommended — works with ASICs):** point your miner or KS-series ASIC at the
+  FireCash stratum pool at **mining-pool.firecash.info**. No node required.
+- **Solo:** with your synced node running, mine to your `firecash:` shielded address:
+  ```bash
+  ./firecash-miner -s 127.0.0.1:16110 -a firecash:<your-address> -t 4
+  ```
 
-**Wallet daemon & explorer API** (run one per server, pointing at that server's local node):
-```bash
-./firecash-walletd --network mainnet --rpc-server 127.0.0.1:16110 --wallet-dir ./fc-wallets --listen 127.0.0.1:8501
-./firecash-api     --rpc-server 127.0.0.1:16110 --listen 127.0.0.1:8500
-```
+## Wallet
 
-The node gRPC (16110) and all daemons bind **127.0.0.1 only**; p2p (16111) is the only port
-that must be reachable between nodes. Front the daemons with nginx + TLS for anything public.
-Prebuilt Linux x86-64 binaries are attached to the GitHub Release.
+- **Web wallet:** https://wallet.firecash.info
+- **Self-hosted:**
+  ```bash
+  ./firecash-walletd --network mainnet --rpc-server 127.0.0.1:16110 --wallet-dir ./fc-wallets --listen 127.0.0.1:8501
+  ```
+
+## Explorer
+
+https://explorer.firecash.info
 
 ## Configuration
 
