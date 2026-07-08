@@ -42,6 +42,16 @@ the wallet daemon, and the explorer API.
 Companion repos: **firecash-pool** (stratum bridge — ASIC mining), **firecash-explorer**
 (SPA), **firecash-wallet** (web wallet SPA), **firecash-website**.
 
+## Requirements
+
+- **Prebuilt binaries (GitHub Release):** Linux x86-64. The default `.tar.gz` is built on
+  Ubuntu 24.04 and needs **glibc ≥ 2.38**. On older systems (Ubuntu 22.04 = glibc 2.35,
+  Debian 12, CentOS/Rocky, …) it errors with `GLIBC_2.38 not found` — use the **static
+  (musl) build** attached to the release (runs on any Linux, no glibc needed), or build
+  from source.
+- **Build from source (any recent Linux):** the Rust toolchain (rustup) plus these system
+  packages — see below.
+
 ## Build from source
 
 Tested on **Ubuntu 24.04 (x86-64)**.
