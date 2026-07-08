@@ -70,26 +70,43 @@ cargo build --release
 First build downloads and compiles all dependencies (RocksDB, Halo 2, etc.) and takes
 ~10–20 min; later builds are incremental. Run the test suite with `cargo test --release`.
 
-## Run (fresh chain)
+## Run — a synced, peered network
 
+> **Important:** on mainnet a node reports `is_synced` **only when it has ≥1 peer**
+> (`has_sufficient_peer_connectivity` + a recent tip). A single isolated node can never be
+> "synced", which is why `--enable-unsynced-mining` exists — it's a **bootstrap crutch**,
+> not how you run a real chain. A real launch = **at least two peered nodes.**
+
+**Node A — bootstrapper** (first node of a brand-new chain; the crutch is only needed until
+a second node peers):
 ```bash
-# 1) node
-./target/release/kaspad --appdir=./fc-mainnet --rpclisten=127.0.0.1:16110 --utxoindex --enable-unsynced-mining
-
-# 2) miner — mine to a firecash: shielded address (native)
-./target/release/firecash-miner -s 127.0.0.1:16110 -a firecash:<addr> -t 4
-#    merged-mining: add --merged   (block is accepted via its AuxPoW proof)
-
-# 3) wallet daemon
-./target/release/firecash-walletd --network mainnet --rpc-server 127.0.0.1:16110 --wallet-dir ./fc-wallets --listen 127.0.0.1:8501
-
-# 4) explorer API
-./target/release/firecash-api --rpc-server 127.0.0.1:16110 --listen 127.0.0.1:8500
+./kaspad --appdir=./fc-node --rpclisten=127.0.0.1:16110 --utxoindex --enable-unsynced-mining
+# bootstrap the chain with some blocks:
+./firecash-miner -s 127.0.0.1:16110 -a firecash:<addr> -t 4
 ```
 
-The node gRPC and all daemons bind **127.0.0.1 only** — front them with nginx + TLS for
-anything public. Prebuilt Linux x86-64 binaries are attached to the GitHub Release, so a
-new server can run without compiling.
+**Node B (and every other node)** — connect to A's p2p (16111); it IBD-syncs the chain.
+No crutch flag:
+```bash
+./kaspad --appdir=./fc-node --rpclisten=127.0.0.1:16110 --connect=<NODE_A_IP>:16111 --utxoindex
+```
+
+**Once ≥2 nodes are peered**, both report `is_synced=true`. Now restart Node A **without**
+`--enable-unsynced-mining` — it mines because it is genuinely synced:
+```bash
+./kaspad --appdir=./fc-node --rpclisten=127.0.0.1:16110 --utxoindex --addpeer=<NODE_B_IP>:16111
+./firecash-miner -s 127.0.0.1:16110 -a firecash:<addr> -t 4      # add --merged for AuxPoW
+```
+
+**Wallet daemon & explorer API** (run one per server, pointing at that server's local node):
+```bash
+./firecash-walletd --network mainnet --rpc-server 127.0.0.1:16110 --wallet-dir ./fc-wallets --listen 127.0.0.1:8501
+./firecash-api     --rpc-server 127.0.0.1:16110 --listen 127.0.0.1:8500
+```
+
+The node gRPC (16110) and all daemons bind **127.0.0.1 only**; p2p (16111) is the only port
+that must be reachable between nodes. Front the daemons with nginx + TLS for anything public.
+Prebuilt Linux x86-64 binaries are attached to the GitHub Release.
 
 ## Configuration
 
