@@ -186,6 +186,14 @@ impl ShieldedStateManager {
         Ok(self.load_tree(block)?.anchor().to_bytes())
     }
 
+    /// The global note-commitment tree **frontier** as of a given chain block — the
+    /// checkpoint a light wallet fast-syncs from (`WalletDb::from_frontier`): it scans
+    /// only blocks after this block, yet still witnesses its notes against the live
+    /// tip. Returns the empty-tree frontier for blocks with no shielded state.
+    pub fn frontier_at(&self, block: Hash) -> StoreResult<FrontierState> {
+        self.tree_store.get(block)
+    }
+
     /// The chain block whose shielded tree root equals `anchor`, if any block ever
     /// produced it (PLAN §2.5). The caller decides finality by checking that this
     /// block is a selected-chain ancestor of the spending block (reorg-safety) and

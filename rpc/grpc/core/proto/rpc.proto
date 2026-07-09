@@ -237,6 +237,19 @@ message GetSinkResponseMessage {
   RPCError error = 1000;
 }
 
+// GetShieldedTreeStateRequestMessage requests the shielded note-commitment tree
+// frontier at a finality-safe checkpoint, letting a light wallet fast-sync.
+message GetShieldedTreeStateRequestMessage {}
+
+message GetShieldedTreeStateResponseMessage {
+  string blockHash = 1;                 // the checkpoint block (hex hash)
+  uint64 daaScore = 2;
+  uint64 size = 3;                      // leaves summarised by the frontier
+  string leaf = 4;                      // last frontier leaf (hex); zero hash when size == 0
+  repeated string ommers = 5;           // frontier ommers (hex)
+  RPCError error = 1000;
+}
+
 // GetMempoolEntryRequestMessage requests information about a specific transaction
 // in the mempool.
 message GetMempoolEntryRequestMessage {

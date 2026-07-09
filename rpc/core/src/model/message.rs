@@ -444,6 +444,65 @@ impl Deserializer for GetSinkResponse {
     }
 }
 
+/// Request the shielded note-commitment tree **frontier** at a finality-safe
+/// checkpoint block, so a light wallet can fast-sync (start from the checkpoint and
+/// scan only later blocks) instead of scanning the whole chain.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetShieldedTreeStateRequest {}
+
+impl Serializer for GetShieldedTreeStateRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetShieldedTreeStateRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self {})
+    }
+}
+
+/// The shielded tree frontier at `block_hash` (a finalized checkpoint): `size` leaves
+/// summarised by `leaf` + `ommers`. `size == 0` means the empty tree (`leaf` is then
+/// the zero hash and `ommers` is empty). A wallet reconstructs the frontier from
+/// these parts, starts its tree there, and scans `block_hash` → tip.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetShieldedTreeStateResponse {
+    pub block_hash: RpcHash,
+    pub daa_score: u64,
+    pub size: u64,
+    pub leaf: RpcHash,
+    pub ommers: Vec<RpcHash>,
+}
+
+impl Serializer for GetShieldedTreeStateResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcHash, &self.block_hash, writer)?;
+        store!(u64, &self.daa_score, writer)?;
+        store!(u64, &self.size, writer)?;
+        store!(RpcHash, &self.leaf, writer)?;
+        store!(Vec<RpcHash>, &self.ommers, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetShieldedTreeStateResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let block_hash = load!(RpcHash, reader)?;
+        let daa_score = load!(u64, reader)?;
+        let size = load!(u64, reader)?;
+        let leaf = load!(RpcHash, reader)?;
+        let ommers = load!(Vec<RpcHash>, reader)?;
+        Ok(Self { block_hash, daa_score, size, leaf, ommers })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetMempoolEntryRequest {

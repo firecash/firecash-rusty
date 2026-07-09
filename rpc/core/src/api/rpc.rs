@@ -154,6 +154,22 @@ pub trait RpcApi: Sync + Send + AnySync {
     }
     async fn get_sink_call(&self, connection: Option<&DynRpcConnection>, request: GetSinkRequest) -> RpcResult<GetSinkResponse>;
 
+    /// Get the shielded note-commitment tree frontier at a fast-sync checkpoint block,
+    /// so a light wallet can start there and scan only later blocks. Defaults to an
+    /// error for RPC clients that don't implement it (e.g. wRPC); the gRPC client and
+    /// the node service provide it.
+    async fn get_shielded_tree_state(&self) -> RpcResult<GetShieldedTreeStateResponse> {
+        self.get_shielded_tree_state_call(None, GetShieldedTreeStateRequest {}).await
+    }
+    async fn get_shielded_tree_state_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetShieldedTreeStateRequest,
+    ) -> RpcResult<GetShieldedTreeStateResponse> {
+        let _ = (connection, request);
+        Err(crate::RpcError::General("get_shielded_tree_state is not implemented for this RPC client".to_string()))
+    }
+
     /// Requests information about a specific transaction in the mempool.
     async fn get_mempool_entry(
         &self,

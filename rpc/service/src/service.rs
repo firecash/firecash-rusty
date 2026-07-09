@@ -712,6 +712,22 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetSinkResponse::new(self.consensus_manager.consensus().unguarded_session().async_get_sink().await))
     }
 
+    async fn get_shielded_tree_state_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _: GetShieldedTreeStateRequest,
+    ) -> RpcResult<GetShieldedTreeStateResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        // Checkpoint at the pruning point: it is final (never reorgs) and its frontier
+        // snapshot is retained, so a wallet can safely start there and scan forward.
+        let block_hash = session.async_pruning_point().await;
+        let daa_score = session.async_get_header(block_hash).await?.daa_score;
+        let (size, leaf, ommers) = session.async_get_shielded_tree_frontier(block_hash).await?;
+        let leaf = RpcHash::from_bytes(leaf.unwrap_or_default());
+        let ommers = ommers.into_iter().map(RpcHash::from_bytes).collect();
+        Ok(GetShieldedTreeStateResponse { block_hash, daa_score, size, leaf, ommers })
+    }
+
     async fn get_sink_blue_score_call(
         &self,
         _connection: Option<&DynRpcConnection>,

@@ -44,11 +44,10 @@ Companion repos: **firecash-pool** (stratum bridge — ASIC mining), **firecash-
 
 ## Requirements
 
-- **Prebuilt binaries (GitHub Release):** Linux x86-64. The default `.tar.gz` is built on
-  Ubuntu 24.04 and needs **glibc ≥ 2.38**. On older systems (Ubuntu 22.04 = glibc 2.35,
-  Debian 12, CentOS/Rocky, …) it errors with `GLIBC_2.38 not found` — use the **static
-  (musl) build** attached to the release (runs on any Linux, no glibc needed), or build
-  from source.
+- **Prebuilt binaries (GitHub Release):** Linux x86-64. Built on Ubuntu 24.04, so they need
+  **glibc ≥ 2.38**. They run on Ubuntu 24.04+ and other current distros. On older systems
+  (Ubuntu 22.04 = glibc 2.35, Debian 12, …) they error with `GLIBC_2.38 not found` — on those,
+  build from source (below), which works on any recent Linux.
 - **Build from source (any recent Linux):** the Rust toolchain (rustup) plus these system
   packages — see below.
 

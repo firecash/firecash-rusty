@@ -144,6 +144,8 @@ pub enum RpcApiOps {
     GetBlockRewardInfo = 152,
     /// Get Seq-Commit Lane Proof
     GetSeqCommitLaneProof = 153,
+    /// Get the shielded note-commitment tree frontier at a fast-sync checkpoint
+    GetShieldedTreeState = 154,
 }
 
 impl RpcApiOps {

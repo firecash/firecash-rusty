@@ -50,6 +50,7 @@ impl Factory {
                 Shutdown,
                 GetPeerAddresses,
                 GetSink,
+                GetShieldedTreeState,
                 GetMempoolEntry,
                 GetMempoolEntries,
                 GetConnectedPeerInfo,

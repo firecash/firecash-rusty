@@ -658,6 +658,14 @@ impl ConsensusApi for Consensus {
         BlockValidationFutures { block_task: Box::pin(block_task), virtual_state_task: Box::pin(virtual_state_task) }
     }
 
+    fn get_shielded_tree_frontier(&self, block: Hash) -> ConsensusResult<(u64, Option<[u8; 32]>, Vec<[u8; 32]>)> {
+        let fs = self
+            .virtual_processor
+            .shielded_frontier_at(block)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("shielded frontier for {block}: {e}")))?;
+        Ok((fs.size, fs.leaf, fs.ommers))
+    }
+
     fn validate_and_insert_trusted_block(&self, tb: TrustedBlock) -> BlockValidationFutures {
         let (block_task, virtual_state_task) = self.validate_and_insert_block_impl(BlockTask::Trusted { block: tb.block });
         BlockValidationFutures { block_task: Box::pin(block_task), virtual_state_task: Box::pin(virtual_state_task) }

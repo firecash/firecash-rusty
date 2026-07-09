@@ -357,6 +357,15 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// The shielded note-commitment tree **frontier** as of `block`, as raw parts
+    /// `(size, last_leaf, ommers)`. This is the fast-sync checkpoint a light wallet
+    /// starts from: it reconstructs the frontier, then scans only blocks after
+    /// `block`, yet still witnesses its notes against the live tip. Raw parts (rather
+    /// than a `kaspa-shielded-core` type) keep that crate off this API boundary.
+    fn get_shielded_tree_frontier(&self, _block: Hash) -> ConsensusResult<(u64, Option<[u8; 32]>, Vec<[u8; 32]>)> {
+        unimplemented!()
+    }
+
     /// Open a live canonical-lane stream for the pruning point. The returned
     /// iterator yields every canonical lane once, holds its own owned
     /// pruning-lock guard internally so data stays pinned for its full

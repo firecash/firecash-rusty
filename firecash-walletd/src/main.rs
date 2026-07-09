@@ -45,6 +45,7 @@ use kaspa_shielded_core::coinbase::derive_coinbase_note_desc;
 use kaspa_shielded_core::message::{sign_message, verify_message, FVK_LEN, SIG_LEN};
 use kaspa_shielded_core::orchard_recipient_bytes;
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
+use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::wallet::build::build_wallet_payment;
 use kaspa_shielded_core::walletdb::WalletDb;
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
@@ -178,6 +179,74 @@ fn save_seed(dir: &str, token: &str, network: &str, seed: &[u8; 32], birthday: u
 }
 
 // ---------------------------------------------------------------------------
+// Scan checkpoint: persist the scanned commitment stream + owned notes + cursor
+// so a restart resumes instead of rescanning the chain from the wallet birthday.
+// ---------------------------------------------------------------------------
+
+/// Sidecar file holding a token's scan checkpoint (next to its `.json` seed file).
+fn scan_path(dir: &str, token: &str) -> String {
+    format!("{dir}/{token}.scan")
+}
+
+const SCAN_MAGIC: &[u8; 4] = b"FCWS";
+const SCAN_VERSION: u8 = 1;
+/// magic(4) + version(1) + genesis(32) + low(32) + scanned(8).
+const SCAN_HEADER_LEN: usize = 77;
+/// Rewrite the checkpoint after this many newly-scanned blocks (and once a wallet
+/// first reaches the tip). Bounds work lost on a crash without writing the growing
+/// blob on every tiny sync pass; a restart re-scans at most this many cheap blocks.
+const CHECKPOINT_EVERY: usize = 5000;
+
+/// Persist a wallet's scan checkpoint atomically (write-tmp + rename). `genesis` is
+/// the pruning-point hash the scan is anchored to; a moved pruning point invalidates
+/// the checkpoint on load (the note-commitment tree would no longer line up), forcing
+/// a clean rescan.
+fn save_checkpoint(
+    dir: &str,
+    token: &str,
+    genesis: &RpcHash,
+    low: &RpcHash,
+    scanned: u64,
+    db: &WalletDb,
+) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(SCAN_HEADER_LEN + db.leaf_count() * 32);
+    buf.extend_from_slice(SCAN_MAGIC);
+    buf.push(SCAN_VERSION);
+    buf.extend_from_slice(&genesis.as_bytes());
+    buf.extend_from_slice(&low.as_bytes());
+    buf.extend_from_slice(&scanned.to_le_bytes());
+    buf.extend_from_slice(&db.to_checkpoint());
+    let path = scan_path(dir, token);
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, &buf)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, &path)
+}
+
+/// Load a wallet's scan checkpoint if present and still valid for `current_genesis`.
+/// Returns the reconstructed `(db, low_cursor, scanned)`, or `None` on any
+/// absence / corruption / version or pruning-point mismatch — the caller then falls
+/// back to a birthday scan, so a stale checkpoint can never yield a wrong tree.
+fn load_checkpoint(dir: &str, token: &str, seed: [u8; 32], current_genesis: &RpcHash) -> Option<(WalletDb, RpcHash, usize)> {
+    let buf = std::fs::read(scan_path(dir, token)).ok()?;
+    if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || buf[4] != SCAN_VERSION {
+        return None;
+    }
+    let saved_genesis = RpcHash::from_bytes(buf[5..37].try_into().ok()?);
+    if saved_genesis != *current_genesis {
+        return None; // chain pruned/relaunched past our anchor → rescan
+    }
+    let low = RpcHash::from_bytes(buf[37..69].try_into().ok()?);
+    let scanned = u64::from_le_bytes(buf[69..77].try_into().ok()?) as usize;
+    let db = WalletDb::from_checkpoint(seed, &buf[SCAN_HEADER_LEN..])?;
+    Some((db, low, scanned))
+}
+
+// ---------------------------------------------------------------------------
 // In-memory wallet + incremental sync
 // ---------------------------------------------------------------------------
 
@@ -192,6 +261,9 @@ struct WalletEntry {
     chain_len: u64,
     updated_unix: u64,
     error: Option<String>,
+    /// `scanned` at the last persisted checkpoint — the sync loop rewrites the
+    /// checkpoint once enough new blocks accrue past this.
+    saved_scanned: usize,
 }
 
 impl WalletEntry {
@@ -209,7 +281,27 @@ impl WalletEntry {
             chain_len: 0,
             updated_unix: 0,
             error: None,
+            saved_scanned: base_scanned,
         })
+    }
+
+    /// Rebuild an entry from a persisted checkpoint: the commitment stream, owned
+    /// notes, cursor and progress are restored, so the background sync resumes from
+    /// `low` with no rescan. `saved_scanned == scanned` so the next checkpoint write
+    /// waits for genuinely new blocks.
+    fn from_checkpoint(seed: [u8; 32], db: WalletDb, genesis: RpcHash, low: RpcHash, scanned: usize) -> Self {
+        Self {
+            seed,
+            db,
+            genesis,
+            low,
+            caught_up: false,
+            scanned,
+            chain_len: 0,
+            updated_unix: 0,
+            error: None,
+            saved_scanned: scanned,
+        }
     }
 
     /// Advance this wallet by up to `PAGES_PER_CHUNK` pages of new blocks.
@@ -350,6 +442,26 @@ impl AppState {
         Some(String::from(&Address::new(self.prefix, Version::ShieldedOrchard, &raw)))
     }
 
+    /// Build a **fast-sync** wallet entry from the node's pruning-point frontier
+    /// (`GetShieldedTreeState`): the wallet's note-commitment tree starts at that
+    /// finalized checkpoint and it scans only later blocks. Since the node prunes
+    /// pre-checkpoint blocks anyway, this is both the *correct* start (right absolute
+    /// leaf positions once pruning is active) and the *fast* one — sync is O(blocks
+    /// since the pruning point), not O(chain). Returns `None` if the node lacks the
+    /// RPC or a frontier yet, so the caller falls back to a full pruning-point scan.
+    async fn fast_sync_entry(&self, seed: [u8; 32]) -> Option<WalletEntry> {
+        let cp = self.client.get_shielded_tree_state().await.ok()?;
+        let fs = FrontierState {
+            size: cp.size,
+            leaf: (cp.size > 0).then(|| cp.leaf.as_bytes()),
+            ommers: cp.ommers.iter().map(|h| h.as_bytes()).collect(),
+        };
+        let db = WalletDb::from_frontier(seed, &fs)?;
+        // Cursor at the checkpoint block (sync_chunk skips it); progress is proxied by
+        // the checkpoint DAA score so status shows "near tip", not "scanning from 0".
+        Some(WalletEntry::from_checkpoint(seed, db, cp.block_hash, cp.block_hash, cp.daa_score as usize))
+    }
+
     /// Fetch a loaded wallet for a token, loading it from disk on first use.
     async fn get_wallet(&self, token: &str) -> Option<Wallet> {
         {
@@ -360,8 +472,20 @@ impl AppState {
         }
         let (seed, birthday) = load_wallet_meta(&self.wallet_dir, token)?;
         let genesis = self.client.get_block_dag_info().await.ok()?.pruning_point_hash;
-        let (low, base) = resolve_start(&self.client, genesis, birthday).await;
-        let entry = WalletEntry::new(seed, genesis, low, base)?;
+        // Resume from a persisted checkpoint when one is present and still anchored to
+        // the current pruning point; otherwise do the (birthday-bounded) chain scan.
+        let entry = match load_checkpoint(&self.wallet_dir, token, seed, &genesis) {
+            Some((db, low, scanned)) => WalletEntry::from_checkpoint(seed, db, genesis, low, scanned),
+            // No persisted checkpoint: fast-sync from the node's pruning-point frontier,
+            // falling back to a full pruning-point-onward scan only if that RPC fails.
+            None => match self.fast_sync_entry(seed).await {
+                Some(e) => e,
+                None => {
+                    let (low, base) = resolve_start(&self.client, genesis, birthday).await;
+                    WalletEntry::new(seed, genesis, low, base)?
+                }
+            },
+        };
         let w = Arc::new(Mutex::new(entry));
         self.wallets.lock().await.insert(token.to_string(), w.clone());
         Some(w)
@@ -374,22 +498,33 @@ impl AppState {
 
 async fn sync_loop(state: Arc<AppState>) {
     loop {
-        let wallets: Vec<Wallet> = { state.wallets.lock().await.values().cloned().collect() };
+        let wallets: Vec<(String, Wallet)> =
+            { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
         let mut any_behind = false;
         if !wallets.is_empty() {
             let chain_len = state.client.get_block_dag_info().await.map(|d| d.virtual_daa_score).unwrap_or(0);
-            for w in wallets {
+            for (token, w) in wallets {
                 let mut e = w.lock().await;
                 e.chain_len = chain_len;
-                if !e.caught_up {
-                    e.sync_chunk(&state.client).await;
-                } else {
-                    // Cheap tip catch-up: one more chunk resumes from `low`.
-                    e.caught_up = false;
-                    e.sync_chunk(&state.client).await;
-                }
+                // Advance one chunk from `low` (also serves as the cheap tip catch-up
+                // once already synced).
+                let was_caught_up = e.caught_up;
+                e.caught_up = false;
+                e.sync_chunk(&state.client).await;
                 if !e.caught_up {
                     any_behind = true;
+                }
+                // Persist a checkpoint once enough new blocks accrue, or the first time
+                // this wallet reaches the tip, so a restart resumes here instead of
+                // rescanning from birthday.
+                let advanced = e.scanned.saturating_sub(e.saved_scanned);
+                let just_caught_up = e.caught_up && !was_caught_up;
+                if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0)) {
+                    if let Err(err) = save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db) {
+                        eprintln!("checkpoint write failed for {token}: {err}");
+                    } else {
+                        e.saved_scanned = e.scanned;
+                    }
                 }
             }
         }
@@ -564,15 +699,24 @@ async fn load_new_wallet(
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     save_seed(&state.wallet_dir, token, &state.network, &seed, birthday)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
+    // Drop any prior scan checkpoint: a (re)imported seed must rescan from its own
+    // birthday, not resume a different wallet's stream.
+    let _ = std::fs::remove_file(scan_path(&state.wallet_dir, token));
     let genesis = state
         .client
         .get_block_dag_info()
         .await
         .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("get_block_dag_info failed: {e}")))?
         .pruning_point_hash;
-    let (low, base) = resolve_start(&state.client, genesis, birthday).await;
-    let entry =
-        WalletEntry::new(seed, genesis, low, base).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?;
+    // Fast-sync from the node's pruning-point frontier (correct + O(blocks since
+    // pruning)); fall back to a full pruning-point scan only if that RPC is absent.
+    let entry = match state.fast_sync_entry(seed).await {
+        Some(e) => e,
+        None => {
+            let (low, base) = resolve_start(&state.client, genesis, birthday).await;
+            WalletEntry::new(seed, genesis, low, base).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?
+        }
+    };
     state.wallets.lock().await.insert(token.to_string(), Arc::new(Mutex::new(entry)));
     Ok(())
 }

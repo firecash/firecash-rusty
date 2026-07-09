@@ -31,7 +31,7 @@
 //! feature. The produced `(note, merkle_path)` is then handed to
 //! [`crate::wallet::build::build_spend_bundle`] to actually spend.
 
-use incrementalmerkletree::frontier::CommitmentTree;
+use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
 use incrementalmerkletree::witness::IncrementalWitness;
 use orchard::{
     keys::{FullViewingKey, IncomingViewingKey, Scope, SpendingKey},
@@ -43,7 +43,7 @@ use orchard::{
 
 use crate::bundle::ShieldedBundle;
 use crate::coinbase::{coinbase_note_commitment, CoinbaseNoteDesc};
-use crate::tree::TREE_DEPTH;
+use crate::tree::{FrontierState, GlobalTree, TREE_DEPTH};
 use crate::wallet::scan::scan_bundle;
 
 /// A note the wallet owns and can spend. The membership witness is **not** held
@@ -81,17 +81,30 @@ pub struct WalletDb {
     /// This wallet's raw external address — matches coinbase recipients.
     my_address: [u8; 43],
     /// A running mirror of the global tree, used only to report the current tip
-    /// [`anchor`](Self::anchor) cheaply (one append per leaf).
+    /// [`anchor`](Self::anchor) cheaply (one append per leaf). Initialised from
+    /// [`base_frontier`](Self::base_frontier), so it already reflects everything up
+    /// to the fast-sync checkpoint before any leaf is ingested.
     tree: CommitmentTree<MerkleHashOrchard, TREE_DEPTH>,
-    /// The full note-commitment stream in append order. Retaining it lets the
-    /// wallet build a membership witness for any owned position **on demand**
-    /// (see [`Self::witness_path`]) instead of advancing a per-note witness on
-    /// every append — the difference between an O(N) and an O(N²) scan. At 32
+    /// The checkpoint frontier the wallet's stream starts from — empty for a
+    /// genesis/position-0 (full-scan) start, or a node-supplied frontier when the
+    /// wallet fast-syncs ([`Self::from_frontier`]). Its ommers are exactly the
+    /// left-hand authentication path, so the wallet can witness any note appended
+    /// after the checkpoint **without** holding a single pre-checkpoint leaf.
+    base_frontier: Frontier<MerkleHashOrchard, TREE_DEPTH>,
+    /// Absolute position of the wallet's first *stored* leaf: the number of leaves
+    /// already summarised by `base_frontier`. 0 for a full-scan wallet. Owned-note
+    /// positions and `size` are absolute (this base + an index into `leaves`).
+    base_size: u64,
+    /// The note-commitment stream **after** `base_size`, in append order. Retaining
+    /// it lets the wallet build a membership witness for any owned position **on
+    /// demand** (see [`Self::witness_path`]) instead of advancing a per-note witness
+    /// on every append — the difference between an O(N) and an O(N²) scan. At 32
     /// bytes/leaf this is ~1 MB per million notes, cheap next to 625M hashes.
     leaves: Vec<MerkleHashOrchard>,
-    /// Owned, unspent notes (position + note only; witnesses are built lazily).
+    /// Owned, unspent notes (absolute position + note only; witnesses are built lazily).
     notes: Vec<OwnedNote>,
-    /// Number of leaves ingested so far (the next leaf's position).
+    /// Number of leaves ingested so far, absolute (`base_size + leaves.len()`) — the
+    /// next leaf's position.
     size: u64,
 }
 
@@ -103,12 +116,49 @@ impl WalletDb {
         let fvk = FullViewingKey::from(&sk);
         let ivk = fvk.to_ivk(Scope::External);
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
-        Some(Self { ivk, fvk, my_address, tree: CommitmentTree::empty(), leaves: Vec::new(), notes: Vec::new(), size: 0 })
+        Some(Self {
+            ivk,
+            fvk,
+            my_address,
+            tree: CommitmentTree::empty(),
+            base_frontier: Frontier::empty(),
+            base_size: 0,
+            leaves: Vec::new(),
+            notes: Vec::new(),
+            size: 0,
+        })
+    }
+
+    /// Build a wallet that **fast-syncs** from a checkpoint frontier: the tree starts
+    /// at the checkpoint's leaf count, and only leaves appended *after* the checkpoint
+    /// are scanned and stored — so sync cost is O(blocks since the checkpoint), not
+    /// O(whole chain). Owned notes therefore live at absolute positions ≥ the
+    /// checkpoint size; a wallet that may hold notes *older* than the checkpoint must
+    /// instead full-scan via [`Self::from_seed`]. Returns `None` on a bad seed or an
+    /// internally inconsistent frontier.
+    ///
+    /// `checkpoint` is a node-supplied [`FrontierState`] for a finalized block; the
+    /// wallet then scans that block → tip. Witnesses built afterwards root to the
+    /// live tip anchor exactly as a full-scan wallet's do (the checkpoint frontier
+    /// supplies every left sibling the witness needs).
+    pub fn from_frontier(seed: [u8; 32], checkpoint: &FrontierState) -> Option<Self> {
+        let mut db = Self::from_seed(seed)?;
+        let gt = GlobalTree::from_state(checkpoint).ok()?;
+        db.base_frontier = gt.frontier().clone();
+        db.base_size = gt.size();
+        db.tree = CommitmentTree::from_frontier(&db.base_frontier);
+        db.size = db.base_size;
+        Some(db)
     }
 
     /// The wallet's owned, unspent notes.
     pub fn notes(&self) -> &[OwnedNote] {
         &self.notes
+    }
+
+    /// Number of leaves in the cached commitment stream (== notes ingested so far).
+    pub fn leaf_count(&self) -> usize {
+        self.leaves.len()
     }
 
     /// Total spendable value the wallet currently tracks.
@@ -202,19 +252,21 @@ impl WalletDb {
     /// cached stream), paid only for the few notes a spend selects — versus the
     /// old model that paid O(N) per leaf, for every owned note, on every scan.
     pub fn witness_path(&self, position: u64) -> Option<MerklePath> {
-        let position = position as usize;
-        if position >= self.leaves.len() {
+        // `position` is absolute; the wallet only stores leaves after `base_size`.
+        let rel = position.checked_sub(self.base_size)? as usize;
+        if rel >= self.leaves.len() {
             return None;
         }
-        // Rebuild the tree up to and including the target leaf, so `from_tree`
-        // witnesses exactly it, then replay the later leaves to advance the
-        // witness to the current tip.
-        let mut tree = CommitmentTree::empty();
-        for leaf in &self.leaves[..=position] {
-            let _ = tree.append(*leaf);
+        // Rebuild the tree from the checkpoint frontier up to and including the
+        // target leaf, so `from_tree` witnesses exactly it, then replay the later
+        // leaves to advance the witness to the current tip. For a full-scan wallet
+        // the base frontier is empty, so this reduces to rebuilding from genesis.
+        let mut tree = CommitmentTree::from_frontier(&self.base_frontier);
+        for leaf in &self.leaves[..=rel] {
+            tree.append(*leaf).ok()?;
         }
         let mut witness = IncrementalWitness::<MerkleHashOrchard, TREE_DEPTH>::from_tree(tree)?;
-        for leaf in &self.leaves[position + 1..] {
+        for leaf in &self.leaves[rel + 1..] {
             witness.append(*leaf).ok()?;
         }
         let path = witness.path()?;
@@ -234,6 +286,145 @@ impl WalletDb {
         let rho = Option::<Rho>::from(Rho::from_bytes(&desc.rho))?;
         let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(desc.rseed, &rho))?;
         Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed))
+    }
+
+    /// Serialize the wallet's **scanned state** — the fast-sync base frontier, the
+    /// post-checkpoint commitment stream, and the owned notes — into a compact,
+    /// versioned blob. This is a checkpoint a caller (e.g. `firecash-walletd`)
+    /// persists so a restart resumes from here instead of re-scanning. No secrets are
+    /// written: the viewing keys and address are re-derived from the seed on load, so
+    /// only public chain-derived state lives in the blob. The mirror `tree` is omitted
+    /// — it is rebuilt from the base frontier + `leaves` on load.
+    ///
+    /// Layout (little-endian): `[version:u8][base_size:u64]
+    /// [base:0 | 1 (base_leaf:32)(n_ommers:u64)(ommer:32)*] [size:u64]
+    /// [n_leaves:u64](leaf:32)* [n_notes:u64]
+    /// (position:u64, nullifier:32, recipient:43, value:u64, rho:32, rseed:32)*`.
+    pub fn to_checkpoint(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64 + self.leaves.len() * 32 + self.notes.len() * 123);
+        out.push(CHECKPOINT_VERSION);
+        // Fast-sync base: absolute base size, then the base frontier (empty ⇒ tag 0).
+        out.extend_from_slice(&self.base_size.to_le_bytes());
+        match self.base_frontier.value() {
+            None => out.push(0),
+            Some(nef) => {
+                out.push(1);
+                out.extend_from_slice(&nef.leaf().to_bytes());
+                out.extend_from_slice(&(nef.ommers().len() as u64).to_le_bytes());
+                for o in nef.ommers() {
+                    out.extend_from_slice(&o.to_bytes());
+                }
+            }
+        }
+        out.extend_from_slice(&self.size.to_le_bytes());
+        out.extend_from_slice(&(self.leaves.len() as u64).to_le_bytes());
+        for leaf in &self.leaves {
+            out.extend_from_slice(&leaf.to_bytes());
+        }
+        out.extend_from_slice(&(self.notes.len() as u64).to_le_bytes());
+        for n in &self.notes {
+            out.extend_from_slice(&n.position.to_le_bytes());
+            out.extend_from_slice(&n.nullifier);
+            out.extend_from_slice(&n.note.recipient().to_raw_address_bytes());
+            out.extend_from_slice(&n.note.value().inner().to_le_bytes());
+            out.extend_from_slice(&n.note.rho().to_bytes());
+            out.extend_from_slice(n.note.rseed().as_bytes());
+        }
+        out
+    }
+
+    /// Rebuild a wallet from its `seed` plus a checkpoint blob previously produced by
+    /// [`Self::to_checkpoint`]. Returns `None` if the seed is not a valid Orchard key,
+    /// or the blob is malformed / a different version / has trailing bytes — in which
+    /// case the caller should discard it and fall back to a full rescan. The tip
+    /// mirror `tree` is reconstructed from the base frontier + `leaves` (O(N) hashing,
+    /// no network and no trial-decryption — far cheaper than re-fetching the chain).
+    pub fn from_checkpoint(seed: [u8; 32], bytes: &[u8]) -> Option<Self> {
+        let mut db = Self::from_seed(seed)?;
+        let mut r = Cursor { buf: bytes, pos: 0 };
+        if r.u8()? != CHECKPOINT_VERSION {
+            return None;
+        }
+        let base_size = r.u64()?;
+        let base_frontier = match r.u8()? {
+            0 => Frontier::empty(),
+            1 => {
+                let leaf = r.arr::<32>()?;
+                let n_ommers = r.u64()? as usize;
+                let mut ommers = Vec::with_capacity(n_ommers);
+                for _ in 0..n_ommers {
+                    ommers.push(r.arr::<32>()?);
+                }
+                // Reuse the node-side frontier reconstruction (validates consistency).
+                let fs = FrontierState { size: base_size, leaf: Some(leaf), ommers };
+                GlobalTree::from_state(&fs).ok()?.frontier().clone()
+            }
+            _ => return None,
+        };
+        db.base_frontier = base_frontier;
+        db.base_size = base_size;
+        db.tree = CommitmentTree::from_frontier(&db.base_frontier);
+
+        let size = r.u64()?;
+        let n_leaves = r.u64()? as usize;
+        db.leaves.reserve(n_leaves);
+        for _ in 0..n_leaves {
+            let leaf = Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&r.arr()?))?;
+            // `append` only errors on a full (2^32-leaf) tree — unreachable here.
+            let _ = db.tree.append(leaf);
+            db.leaves.push(leaf);
+        }
+        let n_notes = r.u64()? as usize;
+        for _ in 0..n_notes {
+            let position = r.u64()?;
+            let nullifier = r.arr::<32>()?;
+            let recipient = r.arr::<43>()?;
+            let value = r.u64()?;
+            let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
+            let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
+            let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed))?;
+            db.notes.push(OwnedNote { note, position, nullifier });
+        }
+        if !r.done() {
+            return None;
+        }
+        db.size = size;
+        Some(db)
+    }
+}
+
+/// Checkpoint format version. Bump on any layout change so an old blob is rejected
+/// (triggering a clean rescan) rather than silently misread. v2 added the fast-sync
+/// base frontier.
+const CHECKPOINT_VERSION: u8 = 2;
+
+/// A minimal forward byte-reader for [`WalletDb::from_checkpoint`]: every read is
+/// bounds-checked and returns `None` past the end, so a truncated or corrupt blob
+/// fails cleanly instead of panicking.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl Cursor<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let end = self.pos.checked_add(n)?;
+        let s = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(s)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn arr<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.take(N)?.try_into().ok()
+    }
+    fn done(&self) -> bool {
+        self.pos == self.buf.len()
     }
 }
 
@@ -312,6 +503,126 @@ mod tests {
         assert_eq!(owned.value(), 2_000);
         let path = db.witness_path(owned.position).expect("a spendable Orchard path is available");
         assert_eq!(u64::from(path.position()), owned.position, "path is for the owned leaf");
+    }
+
+    /// A checkpoint round-trips: reloading a wallet from `to_checkpoint` reproduces
+    /// balance, owned-note positions, the tip anchor, and — the strongest check —
+    /// the exact spend witness, all without re-scanning the chain. This is what lets
+    /// `firecash-walletd` resume after a restart instead of rescanning from birthday.
+    #[test]
+    fn checkpoint_roundtrips_state_and_witness() {
+        let mine = [5u8; 32];
+        let addr = address_of(mine);
+        let mut db = WalletDb::from_seed(mine).unwrap();
+
+        // A multi-block stream with our notes at non-zero positions behind decoys.
+        db.ingest_block(&[coinbase_for(address_of([1u8; 32]), b"b1||0", 1_000), coinbase_for(addr, b"b1||1", 2_000)], &[]);
+        db.ingest_block(&[coinbase_for(addr, b"b2||0", 4_000), coinbase_for(address_of([9u8; 32]), b"b2||1", 3_000)], &[]);
+
+        let blob = db.to_checkpoint();
+        let restored = WalletDb::from_checkpoint(mine, &blob).expect("checkpoint reloads");
+
+        assert_eq!(restored.balance(), db.balance(), "balance survives the round-trip");
+        assert_eq!(restored.balance(), 6_000);
+        assert_eq!(restored.notes().len(), db.notes().len(), "owned-note count matches");
+        assert_eq!(restored.anchor(), db.anchor(), "tip anchor is reconstructed from the leaf stream");
+        assert_eq!(restored.size, db.size, "leaf count matches");
+
+        // Each owned note reconstructs to the same position and an identical witness
+        // root — i.e. the reloaded wallet can still spend exactly as before.
+        for (a, b) in restored.notes().iter().zip(db.notes()) {
+            assert_eq!(a.position, b.position);
+            assert_eq!(a.value(), b.value());
+            let pa = restored.witness_path(a.position).expect("restored witness");
+            let pb = db.witness_path(b.position).expect("original witness");
+            let cmx_a = ExtractedNoteCommitment::from(a.note.commitment());
+            let cmx_b = ExtractedNoteCommitment::from(b.note.commitment());
+            assert_eq!(pa.root(cmx_a), pb.root(cmx_b), "restored spend witness roots to the same anchor");
+        }
+
+        // A corrupt / truncated blob is rejected (caller then does a clean rescan).
+        assert!(WalletDb::from_checkpoint(mine, &blob[..blob.len() - 1]).is_none(), "truncated blob rejected");
+        let mut bad = blob.clone();
+        bad[0] = 0xFF;
+        assert!(WalletDb::from_checkpoint(mine, &bad).is_none(), "wrong version rejected");
+    }
+
+    /// **Protocol fast-sync equivalence.** A wallet that starts from a node-supplied
+    /// checkpoint frontier and scans only the blocks *after* it produces exactly the
+    /// same balance, absolute note positions, tip anchor, and — critically — spend
+    /// witnesses as a wallet that full-scanned from genesis. This is what makes wallet
+    /// sync O(blocks since checkpoint) instead of O(chain) without weakening spends.
+    #[test]
+    fn fast_sync_from_frontier_matches_full_scan() {
+        use crate::tree::{ChainBlockSubtree, GlobalTree, NoteCommitmentTree};
+
+        let mine = [11u8; 32];
+        let addr = address_of(mine);
+
+        // Apply one coinbase-only block to the consensus tree and to each wallet given.
+        fn apply(gt: &mut GlobalTree, wallets: &mut [&mut WalletDb], blk: &[(CoinbaseNoteDesc, u64)]) {
+            let mut st = ChainBlockSubtree::new();
+            for (d, v) in blk {
+                st.push(coinbase_note_commitment(d, *v).unwrap());
+            }
+            gt.append_subtree(&st).unwrap();
+            for w in wallets {
+                w.ingest_block(blk, &[]);
+            }
+        }
+
+        let mut gt = GlobalTree::new();
+        let mut full = WalletDb::from_seed(mine).unwrap();
+
+        // Pre-checkpoint blocks: only strangers' notes, so the wallet owns nothing
+        // before the checkpoint (the precondition for a complete fast-sync).
+        let pre = [
+            vec![coinbase_for(address_of([1u8; 32]), b"p0||0", 100), coinbase_for(address_of([2u8; 32]), b"p0||1", 100)],
+            vec![coinbase_for(address_of([3u8; 32]), b"p1||0", 100)],
+        ];
+        for blk in &pre {
+            apply(&mut gt, &mut [&mut full], blk);
+        }
+
+        // Checkpoint the frontier here and start a fast-sync wallet from it.
+        let checkpoint = gt.to_state();
+        let mut fast = WalletDb::from_frontier(mine, &checkpoint).unwrap();
+        assert_eq!(fast.anchor(), full.anchor(), "fast-sync begins at the checkpoint anchor");
+        assert_eq!(fast.size, checkpoint.size, "fast-sync starts at the checkpoint leaf count");
+
+        // Post-checkpoint blocks: the wallet's own notes at non-zero absolute
+        // positions, behind decoys. Both wallets ingest these.
+        let post = [
+            vec![coinbase_for(address_of([4u8; 32]), b"q0||0", 100), coinbase_for(addr, b"q0||1", 2_000)],
+            vec![coinbase_for(addr, b"q1||0", 3_000), coinbase_for(address_of([5u8; 32]), b"q1||1", 100)],
+        ];
+        for blk in &post {
+            apply(&mut gt, &mut [&mut full, &mut fast], blk);
+        }
+
+        // Equivalence across every spend-relevant quantity.
+        assert_eq!(fast.balance(), full.balance(), "same balance");
+        assert_eq!(fast.balance(), 5_000);
+        assert_eq!(fast.anchor(), full.anchor(), "same tip anchor");
+        assert_eq!(fast.anchor(), gt.anchor().to_bytes(), "== consensus anchor");
+        assert_eq!(fast.notes().len(), full.notes().len());
+        for (a, b) in fast.notes().iter().zip(full.notes()) {
+            assert_eq!(a.position, b.position, "same absolute leaf position");
+            assert_eq!(a.value(), b.value());
+            let pa = fast.witness_path(a.position).expect("fast-sync witness");
+            let pb = full.witness_path(b.position).expect("full-scan witness");
+            let cmx = ExtractedNoteCommitment::from(a.note.commitment());
+            assert_eq!(pa.root(cmx), pb.root(cmx), "identical witness root at the tip");
+        }
+
+        // The fast-sync wallet's v2 checkpoint carries the base frontier, so it too
+        // reloads and can still witness.
+        let blob = fast.to_checkpoint();
+        let reloaded = WalletDb::from_checkpoint(mine, &blob).expect("v2 checkpoint reloads");
+        assert_eq!(reloaded.balance(), fast.balance());
+        assert_eq!(reloaded.anchor(), fast.anchor());
+        let n = &reloaded.notes()[0];
+        assert!(reloaded.witness_path(n.position).is_some(), "reloaded fast-sync wallet still witnesses");
     }
 }
 

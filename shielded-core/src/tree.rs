@@ -130,6 +130,19 @@ impl GlobalTree {
         }
         Ok(())
     }
+
+    /// The underlying append-only frontier. A light wallet fast-syncing from a
+    /// checkpoint reconstructs a witnessable [`CommitmentTree`] from this via
+    /// `CommitmentTree::from_frontier`, so it can witness notes appended after the
+    /// checkpoint without holding any pre-checkpoint leaves.
+    pub fn frontier(&self) -> &Frontier<MerkleHashOrchard, TREE_DEPTH> {
+        &self.frontier
+    }
+
+    /// Number of leaves appended so far (the next leaf's absolute position).
+    pub fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 impl Default for GlobalTree {

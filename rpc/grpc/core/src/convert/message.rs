@@ -215,6 +215,18 @@ from!(item: RpcResult<&kaspa_rpc_core::GetSinkResponse>, protowire::GetSinkRespo
     Self { sink: item.sink.to_string(), error: None }
 });
 
+from!(&kaspa_rpc_core::GetShieldedTreeStateRequest, protowire::GetShieldedTreeStateRequestMessage);
+from!(item: RpcResult<&kaspa_rpc_core::GetShieldedTreeStateResponse>, protowire::GetShieldedTreeStateResponseMessage, {
+    Self {
+        block_hash: item.block_hash.to_string(),
+        daa_score: item.daa_score,
+        size: item.size,
+        leaf: item.leaf.to_string(),
+        ommers: item.ommers.iter().map(|h| h.to_string()).collect(),
+        error: None,
+    }
+});
+
 from!(item: &kaspa_rpc_core::GetMempoolEntryRequest, protowire::GetMempoolEntryRequestMessage, {
     Self {
         tx_id: item.transaction_id.to_string(),
@@ -725,6 +737,17 @@ try_from!(item: &protowire::GetPeerAddressesResponseMessage, RpcResult<kaspa_rpc
 try_from!(&protowire::GetSinkRequestMessage, kaspa_rpc_core::GetSinkRequest);
 try_from!(item: &protowire::GetSinkResponseMessage, RpcResult<kaspa_rpc_core::GetSinkResponse>, {
     Self { sink: RpcHash::from_str(&item.sink)? }
+});
+
+try_from!(&protowire::GetShieldedTreeStateRequestMessage, kaspa_rpc_core::GetShieldedTreeStateRequest);
+try_from!(item: &protowire::GetShieldedTreeStateResponseMessage, RpcResult<kaspa_rpc_core::GetShieldedTreeStateResponse>, {
+    Self {
+        block_hash: RpcHash::from_str(&item.block_hash)?,
+        daa_score: item.daa_score,
+        size: item.size,
+        leaf: RpcHash::from_str(&item.leaf)?,
+        ommers: item.ommers.iter().map(|s| RpcHash::from_str(s)).collect::<Result<Vec<_>, _>>()?,
+    }
 });
 
 try_from!(item: &protowire::GetMempoolEntryRequestMessage, kaspa_rpc_core::GetMempoolEntryRequest, {

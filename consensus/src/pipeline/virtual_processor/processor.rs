@@ -309,6 +309,16 @@ impl VirtualStateProcessor {
         self.shielded_state_manager.anchor_at(block)
     }
 
+    /// The shielded note-commitment tree **frontier** as of a given chain block — the
+    /// fast-sync checkpoint a light wallet starts from (it then scans only later
+    /// blocks). Exposed for the `GetShieldedTreeState` RPC.
+    pub fn shielded_frontier_at(
+        &self,
+        block: kaspa_hashes::Hash,
+    ) -> Result<kaspa_shielded_core::tree::FrontierState, kaspa_database::prelude::StoreError> {
+        self.shielded_state_manager.frontier_at(block)
+    }
+
     /// The canonical shielded state root (PLAN §2.10) as of a given chain block —
     /// the value a child block's coinbase must commit to. Exposed for block
     /// construction (templates/tests) and sync verification.
