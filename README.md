@@ -1,5 +1,9 @@
 # FireCash — `firecash-rusty`
 
+> **⚠️ TESTNET — this is a live test network. Coins have no value, the chain may be
+> reset without notice, and consensus parameters can still change. Do not treat FC
+> as money.**
+
 **Private-by-default money at Kaspa speed.** FireCash is a fork of
 [rusty-kaspa](https://github.com/kaspanet/rusty-kaspa) that makes every balance and
 transfer **shielded by default** (Zcash **Orchard** notes, Halo 2 proofs — no trusted
