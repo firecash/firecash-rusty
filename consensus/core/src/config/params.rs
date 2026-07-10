@@ -770,25 +770,26 @@ pub const MAINNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
 
-    // firecash is a fresh 10-BPS-from-genesis chain (no 1→10 Crescendo history),
-    // so emission uses the 10-BPS schedule from block 0. `deflationary_phase_daa_score
+    // firecash is a fresh 1-BPS-from-genesis chain (no 1→10 Crescendo history),
+    // so emission uses the 1-BPS schedule from block 0. `deflationary_phase_daa_score
     // = 0` means the smooth halving decay (3-month half-life, see coinbase.rs) applies
     // immediately — no flat pre-deflationary plateau — matching the published emission
-    // curve and the tested DEVNET config. The pre-deflationary base subsidy is unused
-    // when this is 0, but is kept BPS-correct (÷BPS) for consistency; leaving it at the
-    // raw 1-BPS value would overissue 10× if the plateau were ever re-enabled.
+    // curve. The per-second emission (and total supply curve) is identical to the prior
+    // 10-BPS design: the subsidy curve and the perpetual tail both scale by ÷BPS, so at
+    // 1 BPS each block simply pays 10× more while blocks are produced 10× less often.
+    // The pre-deflationary base subsidy is unused when this is 0, but is kept BPS-correct.
     deflationary_phase_daa_score: 0,
-    pre_deflationary_phase_base_subsidy: TenBps::pre_deflationary_phase_base_subsidy(),
+    pre_deflationary_phase_base_subsidy: Bps::<1>::pre_deflationary_phase_base_subsidy(),
     skip_proof_of_work: false,
     max_block_level: 225,
     pruning_proof_m: 1000,
 
-    blockrate: BlockrateParams::new::<10>(),
+    blockrate: BlockrateParams::new::<1>(),
 
-    // 10 BPS from genesis: the "pre-Crescendo" block time equals the real one, and
-    // Crescendo is active from block 0, so the BPS history is a constant 10 (the
-    // subsidy table divides by 10 throughout — no 1-BPS legacy segment).
-    pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
+    // 1 BPS from genesis: the "pre-Crescendo" block time equals the real one, and
+    // Crescendo is active from block 0, so the BPS history is a constant 1 (the
+    // subsidy table divides by 1 throughout — no legacy segment).
+    pre_crescendo_target_time_per_block: Bps::<1>::target_time_per_block(),
 
     crescendo_activation: ForkActivation::always(),
 
@@ -799,14 +800,15 @@ pub const MAINNET_PARAMS: Params = Params {
     // REVERT to 12_096_000 = day 14 for a real launch.
     merged_mining_activation: ForkActivation::always(),
 
-    // firecash launch difficulty schedule (blue-score units, 10 BPS):
-    //  - first 50_000 blocks (~1.4 h): difficulty pinned to the (super-easy) genesis target → CPU-mineable low-difficulty start.
-    //  - next 200_000 blocks: the difficulty *ceiling* tightens geometrically toward real difficulty;
+    // firecash launch difficulty schedule (blue-score units, 1 BPS — block counts scaled ÷10 vs
+    // the prior 10-BPS values so the wall-clock windows are unchanged):
+    //  - first 5_000 blocks (~1.4 h): difficulty pinned to the (super-easy) genesis target → CPU-mineable low-difficulty start.
+    //  - next 20_000 blocks: the difficulty *ceiling* tightens geometrically toward real difficulty;
     //    the pure DAA takes over the moment the ceiling drops below actual network difficulty, so
     //    there is no post-start difficulty cliff and post-launch blocks are not easily mined.
-    //  - launch window ends at blue score 250_000 (~6.9 h at the 10 BPS target rate).
-    low_difficulty_start_blocks: 50_000,
-    difficulty_ramp_blocks: 200_000,
+    //  - launch window ends at blue score 25_000 (~6.9 h at the 1 BPS target rate).
+    low_difficulty_start_blocks: 5_000,
+    difficulty_ramp_blocks: 20_000,
 };
 
 pub const TESTNET_PARAMS: Params = Params {

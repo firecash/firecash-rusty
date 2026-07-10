@@ -33,11 +33,12 @@ const SECONDS_PER_MONTH: u64 = 2629800;
 //      `LEGACY_MONTHS_PER_HALVING / SUBSIDY_HALVING_INTERVAL_MONTHS` = 4× faster so a full halving
 //      takes 3 months.
 //   2. Every table value is scaled by `REWARD_SCALE_NUM / REWARD_SCALE_DEN` (then divided by BPS),
-//      setting the initial 10-BPS reward to 6 FC/block (44 FC × 3/22 = 6 FC) instead of 44.
+//      setting the initial reward to 6 FC/s (44 FC × 3/22): 6 FC/block at 10 BPS, 60 FC/block at 1 BPS.
 // Once the curve decays below the tail floor, a two-step tail subsidy is paid forever: the curve
-// crosses 0.6 FC around month 10, so `TAIL_SUBSIDY_INITIAL_SOMPI` (0.6 FC) is paid up to real month
-// `TAIL_STEP_DOWN_MONTH` (=24), after which it steps down to `TAIL_SUBSIDY_FINAL_SOMPI` (0.3 FC) and
-// that floor is paid forever. See the tail-constant docs below.
+// crosses the tail rate around month 10, so `TAIL_SUBSIDY_INITIAL_PER_SEC_SOMPI` (6 FC/s) is paid up
+// to real month `TAIL_STEP_DOWN_MONTH` (=24), after which it steps down to
+// `TAIL_SUBSIDY_FINAL_PER_SEC_SOMPI` (3 FC/s) and that floor is paid forever. See the tail-constant
+// docs below.
 const SUBSIDY_HALVING_INTERVAL_MONTHS: u64 = 3;
 // The number of monthly table steps that constitute one halving in Kaspa's original table.
 const LEGACY_MONTHS_PER_HALVING: u64 = 12;
@@ -57,15 +58,19 @@ fn scaled_subsidy(table_value: u64, bps: u64) -> u64 {
 
 // Two-step perpetual tail emission (firecash): once the deflationary curve decays below the tail
 // floor, every rewarded block keeps paying a fixed tail subsidy forever, funding long-term miner
-// security after the main emission curve is effectively exhausted. The tail steps down once:
-//   * `TAIL_SUBSIDY_INITIAL_SOMPI` = 0.6 FC/block, paid until real month `TAIL_STEP_DOWN_MONTH`.
-//     The 6 FC/3-month-halving curve crosses 0.6 FC around month 10, so this floor governs the
-//     reward from ≈month 10 through month 24. At 10 BPS: 6 FC/s ≈ 189M FC/year.
-//   * `TAIL_SUBSIDY_FINAL_SOMPI` = 0.3 FC/block, paid forever from month `TAIL_STEP_DOWN_MONTH` on.
-//     At 10 BPS: 3 FC/s ≈ 95M FC/year (the perpetual long-run inflation floor).
-// Both are absolute per-rewarded-block amounts, independent of BPS.
-const TAIL_SUBSIDY_INITIAL_SOMPI: u64 = 60_000_000;
-const TAIL_SUBSIDY_FINAL_SOMPI: u64 = 30_000_000;
+// security after the main emission curve is effectively exhausted. The tail steps down once.
+//
+// The tail is defined as an absolute per-SECOND emission rate and divided by BPS to obtain the
+// per-rewarded-block amount (mirroring how `scaled_subsidy` divides the curve by BPS). This makes
+// the wall-clock tail invariant to the network's BPS: at 10 BPS the per-block tail is 0.6/0.3 FC,
+// at 1 BPS it is 6/3 FC — 6 FC/s and 3 FC/s either way.
+//   * `TAIL_SUBSIDY_INITIAL_PER_SEC_SOMPI` = 6 FC/s, paid until real month `TAIL_STEP_DOWN_MONTH`.
+//     The curve crosses this floor around month 10, so it governs the reward ≈month 10..24.
+//     6 FC/s ≈ 189M FC/year.
+//   * `TAIL_SUBSIDY_FINAL_PER_SEC_SOMPI`   = 3 FC/s, paid forever from month `TAIL_STEP_DOWN_MONTH`.
+//     3 FC/s ≈ 95M FC/year (the perpetual long-run inflation floor).
+const TAIL_SUBSIDY_INITIAL_PER_SEC_SOMPI: u64 = 600_000_000;
+const TAIL_SUBSIDY_FINAL_PER_SEC_SOMPI: u64 = 300_000_000;
 // Real (calendar) month at which the tail steps down from the initial floor to the final floor.
 const TAIL_STEP_DOWN_MONTH: u64 = 24;
 
@@ -287,18 +292,22 @@ impl CoinbaseManager {
         self.curve_subsidy(daa_score).max(self.tail_subsidy(daa_score))
     }
 
-    /// The two-step perpetual tail floor for a given DAA score: `TAIL_SUBSIDY_INITIAL_SOMPI`
-    /// (0.6 FC) up to real month `TAIL_STEP_DOWN_MONTH`, then `TAIL_SUBSIDY_FINAL_SOMPI` (0.3 FC)
-    /// forever. Assumes `daa_score >= deflationary_phase_daa_score`.
+    /// The two-step perpetual tail floor for a given DAA score: `TAIL_SUBSIDY_INITIAL_PER_SEC_SOMPI`
+    /// (6 FC/s) up to real month `TAIL_STEP_DOWN_MONTH`, then `TAIL_SUBSIDY_FINAL_PER_SEC_SOMPI`
+    /// (3 FC/s) forever, each divided by BPS to a per-block amount. Assumes
+    /// `daa_score >= deflationary_phase_daa_score`.
     fn tail_subsidy(&self, daa_score: u64) -> u64 {
         // `subsidy_month` returns the table index, which advances `LEGACY_MONTHS_PER_HALVING /
         // SUBSIDY_HALVING_INTERVAL_MONTHS` (=4)× faster than real calendar months; convert back.
         let real_month = self.subsidy_month(daa_score) * SUBSIDY_HALVING_INTERVAL_MONTHS / LEGACY_MONTHS_PER_HALVING;
-        if real_month < TAIL_STEP_DOWN_MONTH {
-            TAIL_SUBSIDY_INITIAL_SOMPI
+        let per_sec = if real_month < TAIL_STEP_DOWN_MONTH {
+            TAIL_SUBSIDY_INITIAL_PER_SEC_SOMPI
         } else {
-            TAIL_SUBSIDY_FINAL_SOMPI
-        }
+            TAIL_SUBSIDY_FINAL_PER_SEC_SOMPI
+        };
+        // Per-rewarded-block tail = per-second rate / BPS. The tail region is always far past
+        // Crescendo activation, so the post-activation (current) BPS applies.
+        per_sec.div_ceil(self.bps_history.after())
     }
 
     /// The deflationary-curve subsidy *without* the perpetual tail floor. Decays to 0 once the
