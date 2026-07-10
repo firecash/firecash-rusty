@@ -39,3 +39,6 @@ log.workspace = true
 clap.workspace = true
 # CSPRNG for fresh wallet seeds + message signing.
 rand.workspace = true
+# Seed-file encryption at rest (XChaCha20-Poly1305 with an Argon2-derived key).
+argon2.workspace = true
+chacha20poly1305.workspace = true

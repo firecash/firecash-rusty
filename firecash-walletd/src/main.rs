@@ -31,10 +31,11 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     routing::{get, post},
     Json, Router,
 };
+use chacha20poly1305::{aead::Aead, KeyInit, Key, XChaCha20Poly1305, XNonce};
 use clap::Parser;
 use kaspa_addresses::{Address, Prefix, Version};
 use kaspa_consensus_core::tx::{Transaction, TX_VERSION_SHIELDED};
@@ -82,6 +83,22 @@ struct Cli {
     /// Permit binding a non-loopback address directly (prefer a TLS proxy instead).
     #[arg(long, default_value_t = false)]
     allow_remote: bool,
+    /// Browser origin allowed to call the wallet API via CORS (repeatable, e.g.
+    /// `--allow-origin https://wallet.firecash.info`). With none given, cross-origin
+    /// browser requests are refused (same-origin only) — this closes the drive-by
+    /// wallet-read/drain vector where any page a user visits could reach the daemon.
+    #[arg(long = "allow-origin")]
+    allow_origin: Vec<String>,
+    /// Permit the tokenless "default" wallet when no `X-Wallet-Token` header is sent.
+    /// Off by default: every request must carry a token, so another local process
+    /// can't read the default wallet. Enable only for a trusted single-user localhost.
+    #[arg(long, default_value_t = false)]
+    allow_default_token: bool,
+    /// Secret used to encrypt wallet seed files at rest (XChaCha20-Poly1305, Argon2
+    /// key). May also be set via the `FIRECASH_WALLET_SECRET` env var. If unset, seeds
+    /// are stored in plaintext (0600 on unix) and a warning is logged at startup.
+    #[arg(long)]
+    wallet_secret: Option<String>,
 }
 
 fn prefix_from(network: &str) -> Prefix {
@@ -124,11 +141,18 @@ fn sanitize_token(raw: &str) -> Option<String> {
     }
 }
 
-/// Pull the wallet token from the request; fall back to "default" (local single-user).
-fn token_from(headers: &HeaderMap) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+/// Pull the wallet token from the request. A token is required by default (401 when
+/// absent), so an unauthenticated caller can't reach any wallet. When
+/// `allow_default` is set the daemon falls back to the "default" wallet for the
+/// trusted single-user localhost case.
+fn token_from(
+    headers: &HeaderMap,
+    allow_default: bool,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     match headers.get("x-wallet-token").and_then(|v| v.to_str().ok()) {
         Some(raw) => sanitize_token(raw).ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid X-Wallet-Token")),
-        None => Ok("default".to_string()),
+        None if allow_default => Ok("default".to_string()),
+        None => Err(err(StatusCode::UNAUTHORIZED, "missing X-Wallet-Token")),
     }
 }
 
@@ -153,11 +177,60 @@ fn wallet_path(dir: &str, token: &str) -> String {
     format!("{dir}/{token}.json")
 }
 
-/// Load a wallet's (seed, birthday) from disk.
-fn load_wallet_meta(dir: &str, token: &str) -> Option<([u8; 32], u64)> {
+/// Encrypt a 32-byte seed under `secret` → `salt(16) || nonce(24) || ciphertext`.
+/// Key = Argon2 over `(secret, salt)`; the key is never written to the file.
+fn encrypt_seed(seed: &[u8; 32], secret: &str) -> Result<Vec<u8>, String> {
+    use rand::RngCore;
+    let mut salt = [0u8; 16];
+    let mut nonce = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let mut key = [0u8; 32];
+    argon2::Argon2::default()
+        .hash_password_into(secret.as_bytes(), &salt, &mut key)
+        .map_err(|e| format!("argon2: {e}"))?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    let ct = cipher.encrypt(XNonce::from_slice(&nonce), seed.as_slice()).map_err(|e| format!("encrypt: {e}"))?;
+    let mut blob = Vec::with_capacity(16 + 24 + ct.len());
+    blob.extend_from_slice(&salt);
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ct);
+    Ok(blob)
+}
+
+/// Inverse of [`encrypt_seed`]: recover the 32-byte seed from `blob` using `secret`.
+fn decrypt_seed(blob: &[u8], secret: &str) -> Result<[u8; 32], String> {
+    if blob.len() < 16 + 24 + 16 {
+        return Err("ciphertext too short".into());
+    }
+    let (salt, rest) = blob.split_at(16);
+    let (nonce, ct) = rest.split_at(24);
+    let mut key = [0u8; 32];
+    argon2::Argon2::default()
+        .hash_password_into(secret.as_bytes(), salt, &mut key)
+        .map_err(|e| format!("argon2: {e}"))?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    let pt = cipher.decrypt(XNonce::from_slice(nonce), ct).map_err(|_| "decrypt failed (wrong --wallet-secret?)".to_string())?;
+    <[u8; 32]>::try_from(pt.as_slice()).map_err(|_| "decrypted seed is not 32 bytes".to_string())
+}
+
+/// Load a wallet's (seed, birthday) from disk, decrypting the seed with `secret`
+/// when the file is encrypted.
+fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<([u8; 32], u64)> {
     let bytes = std::fs::read(wallet_path(dir, token)).ok()?;
     let wf: WalletFile = serde_json::from_slice(&bytes).ok()?;
-    let seed = unhex(&wf.seed_hex).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())?;
+    let seed = if wf.encrypted {
+        let blob = unhex(&wf.seed_hex)?;
+        let secret = secret.or_else(|| {
+            log::error!("wallet '{token}' is encrypted but no --wallet-secret / FIRECASH_WALLET_SECRET is set");
+            None
+        })?;
+        decrypt_seed(&blob, secret)
+            .map_err(|e| log::error!("cannot decrypt wallet '{token}': {e}"))
+            .ok()?
+    } else {
+        unhex(&wf.seed_hex).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())?
+    };
     Some((seed, wf.birthday))
 }
 
@@ -165,9 +238,23 @@ fn wallet_exists(dir: &str, token: &str) -> bool {
     std::path::Path::new(&wallet_path(dir, token)).exists()
 }
 
-fn save_seed(dir: &str, token: &str, network: &str, seed: &[u8; 32], birthday: u64) -> std::io::Result<()> {
+fn save_seed(
+    dir: &str,
+    token: &str,
+    network: &str,
+    seed: &[u8; 32],
+    birthday: u64,
+    secret: Option<&str>,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let wf = WalletFile { version: 1, network: network.to_string(), seed_hex: hex(seed), encrypted: false, birthday };
+    let (seed_hex, encrypted) = match secret {
+        Some(s) => {
+            let blob = encrypt_seed(seed, s).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            (hex(&blob), true)
+        }
+        None => (hex(seed), false),
+    };
+    let wf = WalletFile { version: 1, network: network.to_string(), seed_hex, encrypted, birthday };
     let path = wallet_path(dir, token);
     std::fs::write(&path, serde_json::to_vec_pretty(&wf).expect("serializes"))?;
     #[cfg(unix)]
@@ -434,6 +521,11 @@ struct AppState {
     prefix: Prefix,
     network: String,
     wallets: Mutex<HashMap<String, Wallet>>,
+    /// When true, a missing `X-Wallet-Token` maps to the "default" wallet (trusted
+    /// single-user localhost). Off by default → a token is required on every request.
+    allow_default_token: bool,
+    /// Secret for encrypting seed files at rest. `None` → seeds stored in plaintext.
+    wallet_secret: Option<String>,
 }
 
 impl AppState {
@@ -480,7 +572,7 @@ impl AppState {
                 return Some(w.clone());
             }
         }
-        let (seed, birthday) = load_wallet_meta(&self.wallet_dir, token)?;
+        let (seed, birthday) = load_wallet_meta(&self.wallet_dir, token, self.wallet_secret.as_deref())?;
         let genesis = self.client.get_block_dag_info().await.ok()?.pruning_point_hash;
         // Resume from a persisted checkpoint when one is present and still anchored to
         // the current pruning point; otherwise do the (birthday-bounded) chain scan.
@@ -590,7 +682,7 @@ struct StatusResp {
 }
 
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<StatusResp> {
-    let token = token_from(&headers).ok();
+    let token = token_from(&headers, state.allow_default_token).ok();
     let (node_connected, daa_score) = match state.client.get_block_dag_info().await {
         Ok(d) => (true, d.virtual_daa_score),
         Err(_) => (false, 0),
@@ -642,7 +734,7 @@ async fn wallet_create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<CreateResp>, (StatusCode, Json<serde_json::Value>)> {
-    let token = token_from(&headers)?;
+    let token = token_from(&headers, state.allow_default_token)?;
     if wallet_exists(&state.wallet_dir, &token) {
         return Err(err(StatusCode::CONFLICT, "a wallet already exists for this token; import replaces it"));
     }
@@ -680,7 +772,7 @@ async fn wallet_import(
     headers: HeaderMap,
     Json(req): Json<ImportReq>,
 ) -> Result<Json<CreateResp>, (StatusCode, Json<serde_json::Value>)> {
-    let token = token_from(&headers)?;
+    let token = token_from(&headers, state.allow_default_token)?;
     let bytes = unhex(&req.seed_hex).ok_or_else(|| err(StatusCode::BAD_REQUEST, "seed_hex is not valid hex"))?;
     if bytes.len() != 32 {
         return Err(err(StatusCode::BAD_REQUEST, "seed must be exactly 32 bytes (64 hex chars)"));
@@ -707,7 +799,7 @@ async fn load_new_wallet(
     seed: [u8; 32],
     birthday: u64,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    save_seed(&state.wallet_dir, token, &state.network, &seed, birthday)
+    save_seed(&state.wallet_dir, token, &state.network, &seed, birthday, state.wallet_secret.as_deref())
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
     // Drop any prior scan checkpoint: a (re)imported seed must rescan from its own
     // birthday, not resume a different wallet's stream.
@@ -740,7 +832,7 @@ async fn wallet_address(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<AddressResp>, (StatusCode, Json<serde_json::Value>)> {
-    let token = token_from(&headers)?;
+    let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
     let address = state.address_for(&e.seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?;
@@ -762,7 +854,7 @@ async fn wallet_reveal(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<RevealResp>, (StatusCode, Json<serde_json::Value>)> {
-    let token = token_from(&headers)?;
+    let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
     let address = state.address_for(&e.seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?;
@@ -785,7 +877,7 @@ async fn wallet_balance(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<BalanceResp>, (StatusCode, Json<serde_json::Value>)> {
-    let token = token_from(&headers)?;
+    let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
     let notes = e.db.notes().iter().map(|n| NoteInfo { position: n.position, value: n.value() }).collect();
@@ -821,7 +913,7 @@ async fn wallet_send(
     headers: HeaderMap,
     Json(req): Json<SendReq>,
 ) -> Result<Json<SendResp>, (StatusCode, Json<serde_json::Value>)> {
-    let token = token_from(&headers)?;
+    let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let seed = { w.lock().await.seed };
 
@@ -908,7 +1000,7 @@ async fn wallet_sign(
     headers: HeaderMap,
     Json(req): Json<SignReq>,
 ) -> Result<Json<SignResp>, (StatusCode, Json<serde_json::Value>)> {
-    let token = token_from(&headers)?;
+    let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let seed = { w.lock().await.seed };
     let tag = state.prefix.to_string();
@@ -1004,21 +1096,47 @@ async fn main() {
     };
     log::info!("connected to node at {}", cli.rpc_server);
 
+    // Seed-file encryption secret: CLI flag or FIRECASH_WALLET_SECRET env.
+    let wallet_secret = cli.wallet_secret.or_else(|| std::env::var("FIRECASH_WALLET_SECRET").ok());
+    if wallet_secret.is_none() {
+        log::warn!("no --wallet-secret / FIRECASH_WALLET_SECRET set: seed files are stored in PLAINTEXT (0600 on unix)");
+    }
+    if cli.allow_default_token {
+        log::warn!("--allow-default-token: tokenless requests map to the 'default' wallet; use only on a trusted single-user localhost");
+    }
+
     let state = Arc::new(AppState {
         client,
         wallet_dir,
         prefix: prefix_from(&cli.network),
         network: cli.network,
         wallets: Mutex::new(HashMap::new()),
+        allow_default_token: cli.allow_default_token,
+        wallet_secret,
     });
 
     tokio::spawn(sync_loop(state.clone()));
 
+    // Lock CORS to an explicit browser-origin allowlist. With no --allow-origin given
+    // the list is empty, so cross-origin browser reads are refused (same-origin only):
+    // a random page a user visits can no longer read /reveal or call /send. We also
+    // drop allow_private_network(true) so a public site can't reach the loopback daemon.
+    let origins: Vec<HeaderValue> = cli
+        .allow_origin
+        .iter()
+        .filter_map(|o| match o.parse::<HeaderValue>() {
+            Ok(hv) => Some(hv),
+            Err(_) => {
+                log::error!("ignoring invalid --allow-origin {o:?}");
+                None
+            }
+        })
+        .collect();
+    log::info!("CORS allowed origins: {:?}", cli.allow_origin);
     let cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any)
-        .allow_private_network(true);
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE, HeaderName::from_static("x-wallet-token")])
+        .allow_origin(origins);
 
     let app = Router::new()
         .route("/health", get(health))

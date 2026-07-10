@@ -2302,7 +2302,9 @@ dependencies = [
 name = "firecash-walletd"
 version = "2.0.1"
 dependencies = [
+ "argon2",
  "axum 0.7.9",
+ "chacha20poly1305",
  "clap",
  "kaspa-addresses",
  "kaspa-consensus-core",
