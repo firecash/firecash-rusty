@@ -118,7 +118,20 @@ rm -rf /root/firecash/fc-node
 systemctl start firecash-node && sleep 15 && systemctl start firecash-miner firecash-pool
 
 # 4. VPS2: start node (follows VPS1 via relay), then walletd + api (see Recover).
+
+# 5. CRITICAL: clear stale wallet scan checkpoints on VPS2, or walletd HANGS.
+#    Genesis is unchanged across relaunches, so the .scan genesis-guard passes and
+#    walletd loads old-chain scan state (50 MB+ files), all wallets thrash
+#    re-scanning, the CPU pegs and the HTTP runtime starves (even /health times
+#    out). Move them aside BEFORE (re)starting walletd:
+mkdir -p /root/firecash/wallets_scan_bak
+mv /root/firecash/wallets/*.scan /root/firecash/wallets_scan_bak/   # keep the .json seeds
 ```
+
+Verify the wallet after: `curl https://wallet.firecash.info/daemon/api/status` must
+return JSON (not the SPA `<!doctype html>`). The SPA calls `origin + /daemon` — nginx
+`location /daemon/` proxies to walletd on `127.0.0.1:8501` via the autossh tunnel. A
+bare `/api/status` correctly returns the SPA (catch-all); always test under `/daemon`.
 
 Verify the fresh chain: VPS1 log shows `Accepted N blocks … via submit block`;
 VPS2 log shows `Accepted block … via relay` (following, not IBD of an old chain).
