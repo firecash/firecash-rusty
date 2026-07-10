@@ -1,7 +1,7 @@
 # FireCash — `firecash-rusty`
 
 > **⚠️ TESTNET — this is a live test network. Coins have no value, the chain may be
-> reset without notice, and consensus parameters can still change. Do not treat FC
+> reset without notice, and consensus parameters can still change. Do not treat $firecash
 > as money.**
 
 **Private-by-default money at Kaspa speed.** FireCash is a fork of
@@ -21,7 +21,7 @@ the wallet daemon, and the explorer API.
 | Consensus | GHOSTDAG BlockDAG, 10 blocks/s | same |
 | PoW | **kHeavyHash** (byte-identical to Kaspa) | kHeavyHash |
 | Merged mining | **Yes** — AuxPoW dual-acceptance with Kaspa | — |
-| Emission | 6 FC start, 3-month halving, two-step perpetual tail | fixed cap |
+| Emission | 6 $firecash start, 3-month halving, two-step perpetual tail | fixed cap |
 
 - **Shielded state:** coinbase rewards and transfers enter a mandatory Orchard pool;
   the only public quantity is the fee a spender exposes to the miner. A shielded
@@ -31,8 +31,8 @@ the wallet daemon, and the explorer API.
   kHeavyHash block (e.g. a Kaspa block) whose coinbase commits to the FireCash block
   hash. Native mining stays the backbone; merged mining adds security at zero marginal
   cost to Kaspa miners. See `consensus/core/src/auxpow.rs` and `consensus/pow/src/auxpow.rs`.
-- **Tokenomics:** 6 FC initial reward, halving every 3 months, settling on a two-step
-  perpetual tail (0.6 FC/block → 0.3 FC/block at month 24). No fixed supply cap.
+- **Tokenomics:** 6 $firecash initial reward, halving every 3 months, settling on a two-step
+  perpetual tail (0.6 $firecash/block → 0.3 $firecash/block at month 24). No fixed supply cap.
 
 ## Binaries in this repo
 
@@ -107,7 +107,7 @@ needs outbound access to the seed nodes' **p2p port 16111**; its own RPC (16110)
 ## Wallet
 
 Everything is on the **shielded (Orchard) pool** — balances and amounts are private.
-`1 FC = 100,000,000 sompi`. There are three ways to use a wallet:
+`1 $firecash = 100,000,000 sompi`. There are three ways to use a wallet:
 
 - **Web wallet (easiest):** https://wallet.firecash.info — no install.
 

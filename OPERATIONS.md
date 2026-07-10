@@ -20,7 +20,7 @@ Two servers, each running its own full `kaspad` (own datadir), peered over P2P.
 VPS1 nginx reaches VPS2's walletd/api over an `autossh -L 8500 -L 8501 root@VPS2`
 tunnel. wallet.firecash.info → walletd (8501); explorer → api (8500).
 
-Chain facts: kHeavyHash PoW (byte-identical to Kaspa), 10 BPS, 44 FC/block,
+Chain facts: kHeavyHash PoW (byte-identical to Kaspa), 10 BPS, 44 $firecash/block,
 addresses `firecash:...`, network id `firecash-mainnet`. AuxPoW merged-mining
 activation lives in `params.rs` (`merged_mining_activation`).
 
