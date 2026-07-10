@@ -449,17 +449,27 @@ impl AppState {
     /// leaf positions once pruning is active) and the *fast* one — sync is O(blocks
     /// since the pruning point), not O(chain). Returns `None` if the node lacks the
     /// RPC or a frontier yet, so the caller falls back to a full pruning-point scan.
-    async fn fast_sync_entry(&self, seed: [u8; 32]) -> Option<WalletEntry> {
-        let cp = self.client.get_shielded_tree_state().await.ok()?;
+    async fn fast_sync_entry(&self, seed: [u8; 32], guard: RpcHash) -> Option<WalletEntry> {
+        // Bound the checkpoint RPC: on a healthy chain it returns immediately, but the
+        // node's finality-point walk can be pathologically slow on a degenerate DAG
+        // (e.g. difficulty collapsed to the floor). Time it out and fall back to a full
+        // scan rather than hanging the wallet.
+        let cp = match tokio::time::timeout(std::time::Duration::from_secs(5), self.client.get_shielded_tree_state()).await {
+            Ok(Ok(cp)) => cp,
+            _ => return None,
+        };
         let fs = FrontierState {
             size: cp.size,
             leaf: (cp.size > 0).then(|| cp.leaf.as_bytes()),
             ommers: cp.ommers.iter().map(|h| h.as_bytes()).collect(),
         };
         let db = WalletDb::from_frontier(seed, &fs)?;
-        // Cursor at the checkpoint block (sync_chunk skips it); progress is proxied by
-        // the checkpoint DAA score so status shows "near tip", not "scanning from 0".
-        Some(WalletEntry::from_checkpoint(seed, db, cp.block_hash, cp.block_hash, cp.daa_score as usize))
+        // genesis = `guard` (the pruning point) keeps the persisted checkpoint stable
+        // across restarts (the finality-point base moves every block, so guarding on it
+        // would drop notes on resume). low = the finality-point checkpoint block we
+        // actually scan from; sync_chunk skips it. Progress is proxied by its DAA score
+        // so status reads "near tip", not "scanning from 0".
+        Some(WalletEntry::from_checkpoint(seed, db, guard, cp.block_hash, cp.daa_score as usize))
     }
 
     /// Fetch a loaded wallet for a token, loading it from disk on first use.
@@ -478,7 +488,7 @@ impl AppState {
             Some((db, low, scanned)) => WalletEntry::from_checkpoint(seed, db, genesis, low, scanned),
             // No persisted checkpoint: fast-sync from the node's pruning-point frontier,
             // falling back to a full pruning-point-onward scan only if that RPC fails.
-            None => match self.fast_sync_entry(seed).await {
+            None => match self.fast_sync_entry(seed, genesis).await {
                 Some(e) => e,
                 None => {
                     let (low, base) = resolve_start(&self.client, genesis, birthday).await;
@@ -710,7 +720,7 @@ async fn load_new_wallet(
         .pruning_point_hash;
     // Fast-sync from the node's pruning-point frontier (correct + O(blocks since
     // pruning)); fall back to a full pruning-point scan only if that RPC is absent.
-    let entry = match state.fast_sync_entry(seed).await {
+    let entry = match state.fast_sync_entry(seed, genesis).await {
         Some(e) => e,
         None => {
             let (low, base) = resolve_start(&state.client, genesis, birthday).await;

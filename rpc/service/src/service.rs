@@ -718,9 +718,12 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _: GetShieldedTreeStateRequest,
     ) -> RpcResult<GetShieldedTreeStateResponse> {
         let session = self.consensus_manager.consensus().unguarded_session();
-        // Checkpoint at the pruning point: it is final (never reorgs) and its frontier
-        // snapshot is retained, so a wallet can safely start there and scan forward.
-        let block_hash = session.async_pruning_point().await;
+        // Checkpoint at the finality point: the most *recent* block that can never be
+        // reorged (so a wallet can safely base its tree there), and its per-block
+        // frontier snapshot is retained. Using the finality point rather than the
+        // pruning point lets a wallet skip almost the whole chain even before pruning
+        // has advanced past genesis.
+        let block_hash = session.async_finality_point().await;
         let daa_score = session.async_get_header(block_hash).await?.daa_score;
         let (size, leaf, ommers) = session.async_get_shielded_tree_frontier(block_hash).await?;
         let leaf = RpcHash::from_bytes(leaf.unwrap_or_default());
