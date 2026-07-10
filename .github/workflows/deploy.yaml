@@ -3,6 +3,11 @@ on:
   release:
     types: [ published ]
 
+# The default GITHUB_TOKEN is read-only, so action-gh-release cannot attach
+# assets ("Resource not accessible by integration"). Grant write to releases.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ${{ matrix.os }}
