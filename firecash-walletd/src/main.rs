@@ -25,7 +25,7 @@
 //! correctly), then cheap catch-up of only new blocks. The background loop processes
 //! wallets in bounded chunks so status stays responsive while a big initial scan runs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -351,7 +351,18 @@ struct WalletEntry {
     /// `scanned` at the last persisted checkpoint — the sync loop rewrites the
     /// checkpoint once enough new blocks accrue past this.
     saved_scanned: usize,
+    /// Recent per-block **absolute** leaf counts (`db.size()` after each ingested
+    /// block), oldest→newest, capped at [`MATURED_RING`]. `send` reads the entry
+    /// `anchor_depth + 2` blocks back to root a spend at a matured anchor without a
+    /// full-chain rescan. In-memory only (not part of the persisted checkpoint), so
+    /// it is empty right after a load and refills as the sync loop advances; `send`
+    /// falls back to a one-off matured replay until it covers the maturity depth.
+    block_leaf_counts: VecDeque<u64>,
 }
+
+/// How many recent block→leaf boundaries [`WalletEntry`] keeps: enough to look back
+/// `DEFAULT_ANCHOR_DEPTH + 2` blocks (the matured-anchor cutoff) with a small margin.
+const MATURED_RING: usize = DEFAULT_ANCHOR_DEPTH as usize + 16;
 
 impl WalletEntry {
     /// `start_low` is the block hash the display scan resumes from (genesis for a
@@ -369,6 +380,7 @@ impl WalletEntry {
             updated_unix: 0,
             error: None,
             saved_scanned: base_scanned,
+            block_leaf_counts: VecDeque::new(),
         })
     }
 
@@ -388,6 +400,7 @@ impl WalletEntry {
             updated_unix: 0,
             error: None,
             saved_scanned: scanned,
+            block_leaf_counts: VecDeque::new(),
         }
     }
 
@@ -409,6 +422,12 @@ impl WalletEntry {
                 ingest_rpc_block(&mut self.db, block);
                 self.scanned += 1;
                 advanced = true;
+                // Record the block→leaf boundary so `send` can root a spend at a
+                // matured anchor (a real block's tree root) without a rescan.
+                self.block_leaf_counts.push_back(self.db.size());
+                if self.block_leaf_counts.len() > MATURED_RING {
+                    self.block_leaf_counts.pop_front();
+                }
             }
             match resp.block_hashes.last().copied() {
                 Some(h) if h != self.low && advanced => self.low = h,
@@ -941,34 +960,87 @@ async fn wallet_send(
         ));
     }
     let ingest_limit = chain_len - need_len;
-    let db = scan_to_limit(client, seed, ingest_limit).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let to_addr = Address::try_from(req.to.as_str())
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid recipient address: {e}")))?;
     let recipient = orchard_recipient_bytes(&to_addr)
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "recipient is not a shielded Orchard address"))?;
-
     let need = amount.checked_add(fee).ok_or_else(|| err(StatusCode::BAD_REQUEST, "amount + fee overflows"))?;
-    let mut candidates = db.notes().to_vec();
-    candidates.sort_by(|a, b| b.value().cmp(&a.value()));
-    let mut inputs = Vec::new();
-    let mut selected = 0u64;
-    for n in &candidates {
-        if selected >= need {
-            break;
-        }
-        let path = db
-            .witness_path(n.position)
-            .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
-        inputs.push((n.note.clone(), path));
-        selected += n.value();
-    }
-    if selected < need {
-        return Err(err(
+    // The matured cutoff: `anchor_depth + 2` blocks back from the tip (mirrors the
+    // block count `scan_to_limit` would replay to).
+    let need_back = need_len;
+
+    let insufficient = |have: u64| {
+        err(
             StatusCode::CONFLICT,
-            format!("insufficient matured funds: have {selected}, need amount+fee={need} (funds must be ~10 min old to spend)"),
-        ));
+            format!("insufficient matured funds: have {have}, need amount+fee={need} (funds must be ~10 min old to spend)"),
+        )
+    };
+
+    // Fast path: reuse the wallet state the sync loop already maintains, instead of
+    // replaying the whole chain into a throwaway db. Root the spend at the leaf count
+    // recorded `need_back` blocks back — a matured block's tree root, which consensus
+    // accepts as a finalized anchor (`is_shielded_anchor_final`). Selection + witness
+    // build run under the entry lock (CPU-only, no await); the lock is dropped before
+    // the slow proof build below.
+    let mut fast: Option<(Vec<_>, u64)> = None;
+    {
+        let e = w.lock().await;
+        if e.caught_up && e.block_leaf_counts.len() > need_back {
+            let matured = e.block_leaf_counts[e.block_leaf_counts.len() - 1 - need_back];
+            let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
+            candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+            let mut ins = Vec::new();
+            let mut selected = 0u64;
+            for n in candidates {
+                if selected >= need {
+                    break;
+                }
+                let path = e
+                    .db
+                    .witness_path_at(n.position, matured)
+                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                ins.push((n.note.clone(), path));
+                selected += n.value();
+            }
+            fast = Some((ins, selected));
+        }
     }
+
+    let inputs = match fast {
+        Some((ins, selected)) => {
+            if selected < need {
+                return Err(insufficient(selected));
+            }
+            ins
+        }
+        None => {
+            // Cold-start fallback: the boundary ring hasn't reached the maturity depth
+            // yet (e.g. right after loading a checkpoint, before `need_back` new blocks
+            // have accrued). Do the one-off matured replay — correct, just slow, and
+            // only until the sync loop fills the ring.
+            log::warn!("send: boundary ring below maturity depth; falling back to full matured scan (slow, one-off)");
+            let db = scan_to_limit(client, seed, ingest_limit).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let mut candidates = db.notes().to_vec();
+            candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+            let mut ins = Vec::new();
+            let mut selected = 0u64;
+            for n in &candidates {
+                if selected >= need {
+                    break;
+                }
+                let path = db
+                    .witness_path(n.position)
+                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                ins.push((n.note.clone(), path));
+                selected += n.value();
+            }
+            if selected < need {
+                return Err(insufficient(selected));
+            }
+            ins
+        }
+    };
 
     let ctx = payment_tx_context();
     log::info!("building Orchard payment proof (Halo 2) for {amount} sompi + {fee} fee...");

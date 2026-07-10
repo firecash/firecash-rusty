@@ -161,6 +161,14 @@ impl WalletDb {
         self.leaves.len()
     }
 
+    /// Absolute number of leaves the wallet's tree spans (`base_size + leaf_count`) —
+    /// i.e. the next leaf's position. This is the wallet's mirror of the global tree
+    /// size; recording it after each ingested block yields the block→leaf boundary a
+    /// spend needs to root at a matured anchor without a rescan.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
     /// Total spendable value the wallet currently tracks.
     pub fn balance(&self) -> u128 {
         self.notes.iter().map(|n| n.value() as u128).sum()
@@ -252,21 +260,38 @@ impl WalletDb {
     /// cached stream), paid only for the few notes a spend selects — versus the
     /// old model that paid O(N) per leaf, for every owned note, on every scan.
     pub fn witness_path(&self, position: u64) -> Option<MerklePath> {
-        // `position` is absolute; the wallet only stores leaves after `base_size`.
+        self.witness_path_at(position, self.size)
+    }
+
+    /// Like [`Self::witness_path`], but roots the witness to the tree state after
+    /// exactly `matured_leaves` **absolute** leaves — a *past* (matured) anchor —
+    /// instead of the live tip. This lets a caller spend against a finalized anchor
+    /// using the wallet's already-maintained leaf stream, with **no chain rescan**:
+    /// pass the leaf count recorded at a block that is `shielded_anchor_depth` deep.
+    ///
+    /// Returns `None` if the note has not yet entered the `matured_leaves` prefix, if
+    /// `matured_leaves` precedes the fast-sync base, or if it exceeds what the wallet
+    /// has ingested. The resulting path's root equals the tree root at that matured
+    /// block, which consensus accepts as a finalized anchor (`is_shielded_anchor_final`).
+    pub fn witness_path_at(&self, position: u64, matured_leaves: u64) -> Option<MerklePath> {
+        // Both absolute; the wallet only stores leaves after `base_size`.
         let rel = position.checked_sub(self.base_size)? as usize;
-        if rel >= self.leaves.len() {
+        let matured_rel = matured_leaves.checked_sub(self.base_size)? as usize;
+        // The note must sit strictly inside the matured prefix, and we must hold it.
+        if rel >= matured_rel || matured_rel > self.leaves.len() {
             return None;
         }
-        // Rebuild the tree from the checkpoint frontier up to and including the
-        // target leaf, so `from_tree` witnesses exactly it, then replay the later
-        // leaves to advance the witness to the current tip. For a full-scan wallet
-        // the base frontier is empty, so this reduces to rebuilding from genesis.
+        // Rebuild the tree from the checkpoint frontier up to and including the target
+        // leaf, so `from_tree` witnesses exactly it, then replay the later leaves — but
+        // only up to `matured_rel`, so the witness roots at the matured anchor, not the
+        // tip. For a full-scan wallet the base frontier is empty, so this reduces to
+        // rebuilding from genesis.
         let mut tree = CommitmentTree::from_frontier(&self.base_frontier);
         for leaf in &self.leaves[..=rel] {
             tree.append(*leaf).ok()?;
         }
         let mut witness = IncrementalWitness::<MerkleHashOrchard, TREE_DEPTH>::from_tree(tree)?;
-        for leaf in &self.leaves[rel + 1..] {
+        for leaf in &self.leaves[rel + 1..matured_rel] {
             witness.append(*leaf).ok()?;
         }
         let path = witness.path()?;
