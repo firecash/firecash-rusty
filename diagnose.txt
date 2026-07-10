@@ -1,0 +1,141 @@
+FireCash — Mining Diagnostics
+=============================
+
+"Every block I mined shows 'Is chain block: No'" — or — "All my blocks got
+rejected." This guide is for miners. It explains what those two symptoms mean,
+how to collect the right logs, and what to send so the issue can be pinned down
+in one line.
+
+
+0. First understand the two different symptoms
+----------------------------------------------
+
+They are NOT the same thing:
+
+  * "Is chain block: No"  (seen on the block explorer, /blocks/<hash>)
+      FireCash is a BlockDAG (GHOSTDAG). Many blocks are produced in parallel and
+      only ONE block per step is the "chain block" (on the virtual selected-parent
+      chain). Every other valid block is a merged side block flagged
+      isChainBlock=false. THIS IS NORMAL. A non-chain block that is "blue" is still
+      fully rewarded to its finder — chain-block vs not is NOT the same as paid vs
+      unpaid. What matters is blue (paid) vs red/orphan (not paid).
+
+  * "Block/share rejected"  (seen in YOUR miner or node log)
+      Your submission was refused before it ever entered the DAG. This is the real
+      problem to chase, and the exact reason is printed in your own logs (below).
+
+Network context: FireCash targets 10 blocks/sec. When network difficulty is low
+relative to the hashrate mining it, blocks are produced far faster than that and
+mining jobs expire in tens of milliseconds — so STALE rejects become common. That
+is network-wide and eases as difficulty rises; confirm from your logs whether your
+rejects are "stale" (network) or something on your side.
+
+
+1. Which setup are you running? (decides which logs matter)
+-----------------------------------------------------------
+
+  A) Pool mining   — an ASIC or GPU pointed at the stratum pool. No node needed.
+  B) Solo mining   — firecash-miner submitting to your own kaspad node.
+
+
+2A. Pool miners (ASIC / GPU → the stratum pool)
+-----------------------------------------------
+
+Check your miner's OWN log for accepted-vs-rejected and the reason.
+
+GPU miners (lolMiner / BzMiner / SRBMiner):
+
+  # Linux — capture, then filter
+  ./lolMiner --pool stratum+tcp://<pool-host>:<port> -u firecash:YOURADDR.worker 2>&1 | tee miner.log
+  grep -iE "accepted|reject|stale|low diff|duplicate|job" miner.log | tail -60
+
+  # Windows (PowerShell)
+  .\lolMiner.exe --pool stratum+tcp://<pool-host>:<port> -u firecash:YOURADDR.worker *>&1 | Tee-Object miner.log
+  Select-String miner.log -Pattern "accepted|reject|stale|low diff|duplicate|job" | Select-Object -Last 60
+
+ASIC (KS-series, etc.): open the miner's web dashboard -> Logs / Miner Status,
+note the Accepted / Rejected / Stale counters, and screenshot the pool config.
+
+Common pool-side reject causes to rule out:
+  * Using stratum+ssl:// on a plain-TCP port -> use stratum+tcp://
+  * Wrong worker format -> must be  firecash:<youraddress>.<workername>
+  * High stale % -> expected when difficulty is low (fast blocks); this is the
+    network, not your rig.
+
+Send: last ~200 lines of miner.log (or the ASIC log), the exact
+stratum+tcp://host:port and worker string, and the ASIC model + firmware.
+
+
+2B. Solo miners (firecash-miner → your own kaspad)
+--------------------------------------------------
+
+Step 1 — confirm your node is SYNCED and has peers BEFORE mining. Mining on an
+unsynced or isolated node means every block you make is orphaned/rejected.
+
+  # Linux — run the node with a logfile
+  ./kaspad --appdir=./fc-node --utxoindex \
+    --connect=185.147.157.125:16111 --connect=160.187.211.153:16111 2>&1 | tee firecash-node.log
+
+  # then, in another terminal:
+  grep -iE "IBD|synced|Peers|Connected|Accepted .*block|reject|orphan|stale|invalid|timestamp" firecash-node.log | tail -80
+
+  # Windows (PowerShell)
+  .\kaspad.exe --appdir=.\fc-node --utxoindex `
+    --connect=185.147.157.125:16111 --connect=160.187.211.153:16111 *>&1 | Tee-Object firecash-node.log
+  Select-String firecash-node.log -Pattern "IBD|synced|Peers|Connected|Accepted .*block|reject|orphan|stale|invalid|timestamp" | Select-Object -Last 80
+
+How to read it:
+  * still printing "IBD"                      -> not synced yet, DO NOT mine
+  * "Accepted N blocks ... via relay"         -> good, you are following the network
+  * "Accepted N blocks ... via submit block"  -> your own mined block entered the DAG
+  * "orphan" / "reject" / "invalid" / "timestamp" -> the exact reason is on that line
+
+Step 2 — rule out the big solo-only causes:
+  * Wrong/old binary: a self-built or outdated node has different consensus params,
+    so every block it makes is invalid to the network and gets rejected. Use the
+    official release binary.
+  * Clock skew: a wrong system clock makes block timestamps get rejected. Sync time
+    (timedatectl on Linux, w32tm on Windows).
+  * No peers: if there are no Peers/Connected lines, your blocks never propagate.
+
+Send: firecash-node.log (last ~200 lines) + the firecash-miner console output +
+the node version.
+
+
+3. Works for both — is a specific block actually in the chain?
+--------------------------------------------------------------
+
+Look up a block hash you mined on the explorer:
+
+  https://explorer.firecash.info/blocks/<blockhash>
+
+  * the page shows "Is chain block: Yes/No" (verboseData.isChainBlock)
+  * BLOCK NOT FOUND at all -> it never entered the DAG (rejected/orphaned): that is
+    the important case.
+
+Check the live network state yourself:
+
+  # Linux / macOS
+  curl -s https://explorer.firecash.info/api/info/blockdag
+
+  # Windows (PowerShell)
+  Invoke-RestMethod https://explorer.firecash.info/api/info/blockdag
+
+Read: if blockCount is roughly equal to virtualDaaScore, the DAG is running nearly
+linear (losing blocks are being dropped rather than merged) — a sign difficulty is
+too low for the hashrate. A healthy DAG has blockCount noticeably above the DAA
+score (those extra blocks are the merged, still-rewarded blue side blocks).
+
+
+4. The minimum to send so the exact reason can be pinned
+--------------------------------------------------------
+
+  1. Pool or solo, and your OS.
+  2. Pool:  miner/ASIC log (accepted vs rejected + reason), exact
+            stratum+tcp://host:port and worker string, ASIC model/firmware.
+  3. Solo:  firecash-node.log + firecash-miner console + node version.
+  4. One block hash you mined + your mining address (for an explorer lookup of
+     blue / red / chain status).
+
+Most reports resolve to one of: STALE (pool, low difficulty / fast blocks),
+UNSYNCED NODE or WRONG BINARY (solo). The logs above name which in a single line.
