@@ -102,11 +102,66 @@ needs outbound access to the seed nodes' **p2p port 16111**; its own RPC (16110)
 
 ## Wallet
 
-- **Web wallet:** https://wallet.firecash.info
-- **Self-hosted:**
-  ```bash
-  ./firecash-walletd --network mainnet --rpc-server 127.0.0.1:16110 --wallet-dir ./fc-wallets --listen 127.0.0.1:8501
-  ```
+Everything is on the **shielded (Orchard) pool** — balances and amounts are private.
+`1 FC = 100,000,000 sompi`. There are three ways to use a wallet:
+
+- **Web wallet (easiest):** https://wallet.firecash.info — no install.
+
+### `shielded-pay` — CLI wallet
+
+Quick offline/CLI operations against a running node. (Seeds are `[byte; 32]` for the
+reference tool; use the daemon or web wallet for real random-seed wallets.)
+
+```bash
+# Obtain your shielded address (this is what you give a sender or the miner's -a)
+./shielded-pay address --seed-byte 1 --network mainnet
+# -> firecash:pyfjy228l6gukj2vwztyq6q88eeyggjhvcuzf2jx8u4lvla42d6x0y3dsgp0w...
+
+# Check spendable balance + owned notes (scans the chain via the node RPC)
+./shielded-pay balance -s 127.0.0.1:16110 --seed-byte 1
+
+# Send a private payment (amount/fee in sompi; change returns to you)
+./shielded-pay send -s 127.0.0.1:16110 --owner-seed-byte 1 \
+  --to firecash:<recipient-address> --amount 500000000 --fee 3000000
+
+# Prove you control an address without spending (offline; discloses viewing key)
+./shielded-pay sign   --seed-byte 1 --network mainnet --message "gm"
+./shielded-pay verify --address firecash:<addr> --message "gm" --signature <hex>
+```
+
+### `firecash-walletd` — wallet daemon (REST, powers the web wallet)
+
+Run it locally for a non-custodial wallet with a REST API on `:8501`:
+
+```bash
+./firecash-walletd --network mainnet --rpc-server 127.0.0.1:16110 \
+  --wallet-dir ./fc-wallets --listen 127.0.0.1:8501 \
+  --allow-origin http://localhost:5173   # your web-wallet origin (omit for same-origin)
+```
+
+Every request carries an `X-Wallet-Token` header selecting your wallet (mint any
+random hex string once and reuse it):
+
+```bash
+TOK=$(head -c16 /dev/urandom | xxd -p)     # your wallet token — keep it
+
+# Create a new wallet (returns the seed once — write it down)
+curl -X POST -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/wallet/create
+
+# Obtain your shielded receive address
+curl -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/wallet/address
+
+# Balance + sync status
+curl -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/wallet/balance
+
+# Send (amount_fc or amount_sompi; fee optional, default 3000000 sompi)
+curl -X POST -H "X-Wallet-Token: $TOK" -H "Content-Type: application/json" \
+  -d '{"to":"firecash:<recipient>","amount_fc":5.0}' \
+  http://127.0.0.1:8501/api/wallet/send
+```
+
+Flags: `--wallet-secret <s>` (or `FIRECASH_WALLET_SECRET`) encrypts seed files at
+rest; `--allow-default-token` permits tokenless requests for single-user localhost.
 
 ## Explorer
 
@@ -121,4 +176,4 @@ https://explorer.firecash.info
 
 ## License
 
-Inherits rusty-kaspa's licensing (MIT / Apache-2.0). See `LICENSE-MIT` / `LICENSE-APACHE`.
+Inherits rusty-kaspa's ISC license. See [`LICENSE`](./LICENSE).
