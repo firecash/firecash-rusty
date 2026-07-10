@@ -14,9 +14,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Build gnu-linux on ubuntu-18.04 and musl on ubuntu latest
-        # os: [ ubuntu-18.04, ubuntu-latest, windows-latest, macos-latest ]
-        os: [ ubuntu-latest, windows-latest, macos-latest ]
+        # macos-latest = Apple Silicon (arm64); macos-13 = Intel (x86_64) so Intel Macs get a working build.
+        os: [ ubuntu-latest, windows-latest, macos-latest, macos-13 ]
     name: Building, ${{ matrix.os }}
     steps:
       - name: Fix CRLF on Windows
@@ -105,7 +104,8 @@ jobs:
           cp target/release/firecash-walletd bin/
           cp target/release/shielded-pay bin/
           cp target/release/stratum-bridge bin/
-          archive="bin/firecash-${{ github.event.release.tag_name }}-osx.zip"
+          # arch-tagged so the arm64 (macos-latest) and x86_64 (macos-13/Intel) archives don't collide.
+          archive="bin/firecash-${{ github.event.release.tag_name }}-osx-$(uname -m).zip"
           zip -r "${archive}" ./bin/*
           echo "archive=${archive}" >> $GITHUB_ENV
 
