@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -80,8 +80,13 @@ struct Cli {
     #[arg(long, default_value = "mainnet")]
     network: String,
     /// Permit binding a non-loopback address directly (prefer a TLS proxy instead).
-    #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false)]
     allow_remote: bool,
+    /// Web origin(s) allowed to call this daemon from a browser (repeatable). Defaults
+    /// to the FireCash web wallet. Never set this to "*": that lets any site the user
+    /// visits read /api/wallet/reveal (the seed) or drain the wallet cross-origin.
+    #[arg(long = "allow-origin")]
+    allow_origin: Vec<String>,
 }
 
 fn prefix_from(network: &str) -> Prefix {
@@ -1014,11 +1019,23 @@ async fn main() {
 
     tokio::spawn(sync_loop(state.clone()));
 
+    // Lock CORS to the wallet SPA origin(s). The previous `Any` + `allow_private_network(true)`
+    // let ANY website a user visited call this daemon cross-origin with no auth — reading
+    // `/api/wallet/reveal` (the seed) or posting `/api/wallet/send`. An explicit origin
+    // allowlist closes that drive-by.
+    let mut allowed_origins = cli.allow_origin.clone();
+    if allowed_origins.is_empty() {
+        allowed_origins.push("https://wallet.firecash.info".to_string());
+    }
+    let allowed: Vec<HeaderValue> = allowed_origins.iter().filter_map(|o| o.parse().ok()).collect();
+    if allowed.is_empty() {
+        log::error!("no valid --allow-origin values given; refusing to start with open CORS");
+        std::process::exit(1);
+    }
     let cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any)
-        .allow_private_network(true);
+        .allow_origin(allowed)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE, HeaderName::from_static("x-wallet-token")]);
 
     let app = Router::new()
         .route("/health", get(health))
