@@ -58,8 +58,8 @@ const SOMPI_PER_FC: u64 = 100_000_000;
 /// Shielded output script length (raw Orchard address carried in a reward script).
 const ORCHARD_SCRIPT_LEN: usize = 43;
 /// Anchor maturity depth (blocks) — must match consensus `shielded_anchor_depth`
-/// (600 * BPS = 6000 at 10 BPS, ~10 min). A note is spendable once this deep.
-const DEFAULT_ANCHOR_DEPTH: u64 = 6000;
+/// (600 * BPS = 600 at 1 BPS, ~10 min). A note is spendable once this deep.
+const DEFAULT_ANCHOR_DEPTH: u64 = 600;
 /// Max `get_blocks` pages a wallet advances per sync chunk. Kept small so the
 /// per-wallet lock is released frequently (status stays responsive); speed comes
 /// from looping back immediately instead of the old 1s pause between chunks.
