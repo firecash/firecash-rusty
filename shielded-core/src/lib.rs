@@ -31,13 +31,13 @@ pub mod wallet;
 pub mod walletdb;
 
 // The human-facing wallet facade (keys -> firecash: address -> scan -> pay).
-pub use account::{orchard_recipient_bytes, PaymentError, ShieldedAccount};
+pub use account::{PaymentError, ShieldedAccount, orchard_recipient_bytes};
 
 // Re-export the Orchard primitives the consensus layer builds on, so there is a
 // single canonical source for these types across the workspace.
 pub use orchard::{
+    Action, Bundle, NOTE_COMMITMENT_TREE_DEPTH,
     note::{ExtractedNoteCommitment, Note, Nullifier},
     tree::{Anchor, MerkleHashOrchard, MerklePath},
     value::{NoteValue, ValueCommitment, ValueSum},
-    Action, Bundle, NOTE_COMMITMENT_TREE_DEPTH,
 };

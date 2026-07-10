@@ -83,8 +83,7 @@ impl SupplyLedger {
     /// Mint a coinbase subsidy into the pool (§2.7). The subsidy is public and
     /// must already have been checked against the emission schedule by the caller.
     pub fn mint_coinbase(&mut self, subsidy: u64) -> Result<(), TurnstileViolation> {
-        self.cumulative_coinbase =
-            self.cumulative_coinbase.checked_add(subsidy as u128).ok_or(TurnstileViolation::Overflow)?;
+        self.cumulative_coinbase = self.cumulative_coinbase.checked_add(subsidy as u128).ok_or(TurnstileViolation::Overflow)?;
         Ok(())
     }
 
@@ -107,10 +106,9 @@ impl SupplyLedger {
     /// The current shielded-pool value, `coinbase − fees`. Errors with
     /// [`TurnstileViolation::PoolUnderflow`] if fees exceed coinbase.
     pub fn pool_value(&self) -> Result<u128, TurnstileViolation> {
-        self.cumulative_coinbase.checked_sub(self.cumulative_fees).ok_or(TurnstileViolation::PoolUnderflow {
-            coinbase: self.cumulative_coinbase,
-            fees: self.cumulative_fees,
-        })
+        self.cumulative_coinbase
+            .checked_sub(self.cumulative_fees)
+            .ok_or(TurnstileViolation::PoolUnderflow { coinbase: self.cumulative_coinbase, fees: self.cumulative_fees })
     }
 
     /// The hard consensus check (PLAN §2.6): the pool must be non-negative.
@@ -191,11 +189,7 @@ pub fn reconcile(
     aggregate_trapdoor: ValueCommitTrapdoor,
 ) -> Result<(), TurnstileViolation> {
     let expected = commit(-pool_value, aggregate_trapdoor);
-    if sum_cv.to_bytes() == expected.to_bytes() {
-        Ok(())
-    } else {
-        Err(TurnstileViolation::CommitmentMismatch)
-    }
+    if sum_cv.to_bytes() == expected.to_bytes() { Ok(()) } else { Err(TurnstileViolation::CommitmentMismatch) }
 }
 
 #[cfg(test)]

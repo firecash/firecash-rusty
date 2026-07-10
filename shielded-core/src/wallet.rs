@@ -20,12 +20,12 @@
 pub mod scan {
     use crate::bundle::{ActionWire, ShieldedBundle};
     use orchard::{
+        Action,
         keys::{FullViewingKey, IncomingViewingKey, Scope, SpendingKey},
         note::{ExtractedNoteCommitment, Note, Nullifier, TransmittedNoteCiphertext},
         note_encryption::OrchardDomain,
         primitives::redpallas::{Signature, SpendAuth, VerificationKey},
         value::ValueCommitment,
-        Action,
     };
     use zcash_note_encryption::try_note_decryption;
 
@@ -94,13 +94,14 @@ pub mod scan {
     }
 }
 
-pub use scan::{address_bytes_from_seed, ivk_from_seed, scan_bundle, ReceivedNote};
+pub use scan::{ReceivedNote, address_bytes_from_seed, ivk_from_seed, scan_bundle};
 
 #[cfg(feature = "circuit")]
 pub mod build {
     use crate::bundle::{ActionWire, ShieldedBundle};
     use crate::verify::sighash;
     use orchard::{
+        Action, Address, Anchor, Bundle,
         builder::{Builder, BundleType},
         bundle::{Authorization, Authorized},
         circuit::ProvingKey,
@@ -108,7 +109,6 @@ pub mod build {
         note::{ExtractedNoteCommitment, Note},
         tree::MerklePath,
         value::NoteValue,
-        Action, Address, Anchor, Bundle,
     };
     use rand::{CryptoRng, RngCore};
 
@@ -366,17 +366,8 @@ pub mod build {
 
         let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
         let pk = ProvingKey::build();
-        let wire = build_spend_bundle(
-            &pk,
-            &keys,
-            note,
-            merkle_path,
-            recipient,
-            output_value,
-            network_domain,
-            tx_context,
-            rand::rngs::OsRng,
-        )?;
+        let wire =
+            build_spend_bundle(&pk, &keys, note, merkle_path, recipient, output_value, network_domain, tx_context, rand::rngs::OsRng)?;
         Ok(wire.to_bytes())
     }
 
@@ -403,8 +394,7 @@ pub mod build {
     ) -> Result<Vec<u8>, BuildError> {
         let (first_note, first_path) = inputs.first().ok_or(BuildError::Empty)?;
         let keys = ShieldedKeys::from_seed(owner_seed).ok_or(BuildError::Empty)?;
-        let recipient =
-            Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
+        let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
         let change_addr = keys.address();
 
         let total_in: u64 = inputs.iter().map(|(n, _)| n.value().inner()).sum();
@@ -471,8 +461,7 @@ pub mod build {
             // A note worth 10_000 owned by the wallet.
             let rho = Option::<Rho>::from(Rho::from_bytes(&canon(1))).unwrap();
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(2), &rho)).unwrap();
-            let note =
-                Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
 
             // Single-leaf tree at position 0: siblings are the empty-subtree roots.
             let auth_path: [MerkleHashOrchard; 32] =
@@ -520,7 +509,8 @@ pub mod build {
         fn scan_recovers_sent_note() {
             let pk = ProvingKey::build();
             let recipient = ShieldedKeys::from_seed([2u8; 32]).expect("valid seed");
-            let wire = build_output_only_bundle(&pk, recipient.address(), 4242, &[0x33u8; 32], b"ctx", rand::rngs::OsRng).expect("build");
+            let wire =
+                build_output_only_bundle(&pk, recipient.address(), 4242, &[0x33u8; 32], b"ctx", rand::rngs::OsRng).expect("build");
 
             let ivk = crate::wallet::ivk_from_seed([2u8; 32]).unwrap();
             let received = crate::wallet::scan_bundle(&ivk, &wire);
@@ -535,4 +525,4 @@ pub mod build {
 }
 
 #[cfg(feature = "circuit")]
-pub use build::{build_output_only_bundle, build_payment_bundle, build_spend_bundle, to_wire, BuildError, ShieldedKeys};
+pub use build::{BuildError, ShieldedKeys, build_output_only_bundle, build_payment_bundle, build_spend_bundle, to_wire};

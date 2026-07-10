@@ -80,8 +80,7 @@ pub struct ActionWire {
 
 impl ActionWire {
     /// Serialized size of one action.
-    pub const SERIALIZED_LEN: usize =
-        sizes::FIELD * 4 + sizes::ENC_CIPHERTEXT + sizes::OUT_CIPHERTEXT + sizes::SIG;
+    pub const SERIALIZED_LEN: usize = sizes::FIELD * 4 + sizes::ENC_CIPHERTEXT + sizes::OUT_CIPHERTEXT + sizes::SIG;
 }
 
 /// An Orchard bundle as carried in a shielded transaction's payload.
@@ -217,8 +216,7 @@ impl ShieldedBundle {
         let value_balance = r.i64()?;
         let anchor = r.array::<{ sizes::FIELD }>()?;
         let binding_sig_vec = r.var()?;
-        let binding_sig: [u8; sizes::SIG] =
-            binding_sig_vec.as_slice().try_into().map_err(|_| BundleDecodeError::UnexpectedEof)?;
+        let binding_sig: [u8; sizes::SIG] = binding_sig_vec.as_slice().try_into().map_err(|_| BundleDecodeError::UnexpectedEof)?;
         let n_actions = r.u32()? as usize;
         // Anti-DoS: reject an oversized action count up front, before allocating
         // or parsing (bounds per-transaction verification work; see

@@ -26,12 +26,12 @@
 
 use core::fmt;
 
-use incrementalmerkletree::frontier::Frontier;
 use incrementalmerkletree::Position;
+use incrementalmerkletree::frontier::Frontier;
 use orchard::{
+    NOTE_COMMITMENT_TREE_DEPTH,
     note::ExtractedNoteCommitment,
     tree::{Anchor, MerkleHashOrchard},
-    NOTE_COMMITMENT_TREE_DEPTH,
 };
 use serde::{Deserialize, Serialize};
 

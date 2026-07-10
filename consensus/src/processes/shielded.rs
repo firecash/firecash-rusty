@@ -17,13 +17,13 @@
 use std::sync::Arc;
 
 use kaspa_consensus_core::tx::Transaction;
-use kaspa_database::prelude::{CachePolicy, StoreError, StoreResult, DB};
+use kaspa_database::prelude::{CachePolicy, DB, StoreError, StoreResult};
 use kaspa_hashes::Hash;
 use kaspa_shielded_core::coinbase::{coinbase_note, derive_coinbase_note_desc};
 use kaspa_shielded_core::nullifier::{MemNullifierSet, NullifierBytes, NullifierSet};
-use kaspa_shielded_core::state::{apply_chain_block_to, BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx};
 #[cfg(test)]
 use kaspa_shielded_core::state::CoinbaseNote;
+use kaspa_shielded_core::state::{BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx, apply_chain_block_to};
 use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
 use kaspa_shielded_core::turnstile::SupplyLedger;
 use rocksdb::WriteBatch;
@@ -120,15 +120,15 @@ pub fn build_coinbase_mint(coinbase_tx: &Transaction) -> Result<CoinbaseMint, Sh
         if script.len() < 43 {
             return Err(ShieldedManagerError::MalformedCoinbaseNote("coinbase reward script too short for an Orchard address"));
         }
-        let recipient: [u8; 43] =
-            script[..43].try_into().expect("checked length >= 43");
+        let recipient: [u8; 43] = script[..43].try_into().expect("checked length >= 43");
         // Unique per-note seed: coinbase tx id || output index.
         let mut seed = Vec::with_capacity(32 + 4);
         seed.extend_from_slice(&txid.as_bytes());
         seed.extend_from_slice(&(i as u32).to_le_bytes());
         let desc = derive_coinbase_note_desc(recipient, &seed);
-        let note = coinbase_note(&desc, out.value)
-            .map_err(|_| ShieldedManagerError::MalformedCoinbaseNote("coinbase reward recipient is not a canonical Orchard address"))?;
+        let note = coinbase_note(&desc, out.value).map_err(|_| {
+            ShieldedManagerError::MalformedCoinbaseNote("coinbase reward recipient is not a canonical Orchard address")
+        })?;
         notes.push(note);
     }
     Ok(CoinbaseMint::new(notes))
@@ -226,12 +226,7 @@ impl ShieldedStateManager {
         let mut m = self.load_nullifier_muhash(block)?;
         let nullifier_root = m.finalize().as_bytes().to_owned();
         let t = self.supply_store.get(block)?;
-        Ok(kaspa_shielded_core::commitment::shielded_state_root(
-            &anchor,
-            &nullifier_root,
-            t.cumulative_coinbase,
-            t.cumulative_fees,
-        ))
+        Ok(kaspa_shielded_core::commitment::shielded_state_root(&anchor, &nullifier_root, t.cumulative_coinbase, t.cumulative_fees))
     }
 
     /// Validate and compute one chain block's shielded transition against its

@@ -251,7 +251,11 @@ async fn diag_shielded_coinbase_note_structure() {
         ctx.simulated_time += ctx.consensus.params().target_time_per_block();
         let mut t = ctx
             .consensus
-            .build_block_template(ctx.miner_data.clone(), Box::new(OnetimeTxSelector::new(Default::default())), TemplateBuildMode::Standard)
+            .build_block_template(
+                ctx.miner_data.clone(),
+                Box::new(OnetimeTxSelector::new(Default::default())),
+                TemplateBuildMode::Standard,
+            )
             .unwrap();
         t.block.header.timestamp = ctx.simulated_time;
         t.block.header.finalize();
@@ -306,12 +310,7 @@ async fn shielded_coinbase_mints_into_the_pool_live() {
     ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)), vec![]);
 
     for _ in 0..5 {
-        ctx.build_block_template_row(0..3)
-            .assert_row_parents()
-            .validate_and_insert_row()
-            .await
-            .assert_tips()
-            .assert_valid_utxo_tip();
+        ctx.build_block_template_row(0..3).assert_row_parents().validate_and_insert_row().await.assert_tips().assert_valid_utxo_tip();
     }
 
     // Directly prove value entered the pool: a UTXO-valid chain tip's shielded
@@ -582,10 +581,7 @@ async fn non_canonical_anchor_is_not_final() {
 
     // POSITIVE: p's anchor is final relative to a spending block whose selected
     // parent is q — p is a canonical ancestor of q and (depth=1) matured.
-    assert!(
-        vp.is_shielded_anchor_final(&anchor_p, q, blue_score(q)),
-        "an anchor from a canonical ancestor, matured, must be final"
-    );
+    assert!(vp.is_shielded_anchor_final(&anchor_p, q, blue_score(q)), "an anchor from a canonical ancestor, matured, must be final");
 
     // NEGATIVE (canonicality — the #29 defense): q's anchor must NOT be final for a
     // spending block whose selected parent is p. q is not in p's past, so proving a
@@ -598,10 +594,7 @@ async fn non_canonical_anchor_is_not_final() {
 
     // NEGATIVE (fabricated): an anchor no block ever produced is not a real tree root
     // of any committed block, so it can never be final.
-    assert!(
-        !vp.is_shielded_anchor_final(&[0x33u8; 32], q, u64::MAX),
-        "an anchor no block ever produced must be rejected"
-    );
+    assert!(!vp.is_shielded_anchor_final(&[0x33u8; 32], q, u64::MAX), "an anchor no block ever produced must be rejected");
 
     // Genesis's empty-tree anchor is always final (canonical + mature by definition).
     assert!(vp.is_shielded_anchor_final(&empty_anchor, q, blue_score(q)), "the empty-tree (genesis) anchor is always final");

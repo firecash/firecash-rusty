@@ -30,23 +30,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
-    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
-    routing::{get, post},
     Json, Router,
+    extract::State,
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
+    routing::{get, post},
 };
-use chacha20poly1305::{aead::Aead, KeyInit, Key, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use clap::Parser;
 use kaspa_addresses::{Address, Prefix, Version};
-use kaspa_consensus_core::tx::{Transaction, TX_VERSION_SHIELDED};
+use kaspa_consensus_core::tx::{TX_VERSION_SHIELDED, Transaction};
 use kaspa_grpc_client::GrpcClient;
-use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode, RpcHash, RpcTransaction};
+use kaspa_rpc_core::{RpcHash, RpcTransaction, api::rpc::RpcApi, notify::mode::NotificationMode};
 use kaspa_shielded_core::bundle::ShieldedBundle;
 use kaspa_shielded_core::coinbase::derive_coinbase_note_desc;
-use kaspa_shielded_core::message::{sign_message, verify_message, FVK_LEN, SIG_LEN};
+use kaspa_shielded_core::message::{FVK_LEN, SIG_LEN, sign_message, verify_message};
 use kaspa_shielded_core::orchard_recipient_bytes;
-use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::tree::FrontierState;
+use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::wallet::build::build_wallet_payment;
 use kaspa_shielded_core::walletdb::WalletDb;
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
@@ -134,21 +134,14 @@ fn sanitize_token(raw: &str) -> Option<String> {
     if t.is_empty() || t.len() > 128 {
         return None;
     }
-    if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        Some(t.to_string())
-    } else {
-        None
-    }
+    if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') { Some(t.to_string()) } else { None }
 }
 
 /// Pull the wallet token from the request. A token is required by default (401 when
 /// absent), so an unauthenticated caller can't reach any wallet. When
 /// `allow_default` is set the daemon falls back to the "default" wallet for the
 /// trusted single-user localhost case.
-fn token_from(
-    headers: &HeaderMap,
-    allow_default: bool,
-) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+fn token_from(headers: &HeaderMap, allow_default: bool) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     match headers.get("x-wallet-token").and_then(|v| v.to_str().ok()) {
         Some(raw) => sanitize_token(raw).ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid X-Wallet-Token")),
         None if allow_default => Ok("default".to_string()),
@@ -186,9 +179,7 @@ fn encrypt_seed(seed: &[u8; 32], secret: &str) -> Result<Vec<u8>, String> {
     rand::rngs::OsRng.fill_bytes(&mut salt);
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let mut key = [0u8; 32];
-    argon2::Argon2::default()
-        .hash_password_into(secret.as_bytes(), &salt, &mut key)
-        .map_err(|e| format!("argon2: {e}"))?;
+    argon2::Argon2::default().hash_password_into(secret.as_bytes(), &salt, &mut key).map_err(|e| format!("argon2: {e}"))?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
     let ct = cipher.encrypt(XNonce::from_slice(&nonce), seed.as_slice()).map_err(|e| format!("encrypt: {e}"))?;
     let mut blob = Vec::with_capacity(16 + 24 + ct.len());
@@ -206,9 +197,7 @@ fn decrypt_seed(blob: &[u8], secret: &str) -> Result<[u8; 32], String> {
     let (salt, rest) = blob.split_at(16);
     let (nonce, ct) = rest.split_at(24);
     let mut key = [0u8; 32];
-    argon2::Argon2::default()
-        .hash_password_into(secret.as_bytes(), salt, &mut key)
-        .map_err(|e| format!("argon2: {e}"))?;
+    argon2::Argon2::default().hash_password_into(secret.as_bytes(), salt, &mut key).map_err(|e| format!("argon2: {e}"))?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
     let pt = cipher.decrypt(XNonce::from_slice(nonce), ct).map_err(|_| "decrypt failed (wrong --wallet-secret?)".to_string())?;
     <[u8; 32]>::try_from(pt.as_slice()).map_err(|_| "decrypted seed is not 32 bytes".to_string())
@@ -225,9 +214,7 @@ fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<([u8
             log::error!("wallet '{token}' is encrypted but no --wallet-secret / FIRECASH_WALLET_SECRET is set");
             None
         })?;
-        decrypt_seed(&blob, secret)
-            .map_err(|e| log::error!("cannot decrypt wallet '{token}': {e}"))
-            .ok()?
+        decrypt_seed(&blob, secret).map_err(|e| log::error!("cannot decrypt wallet '{token}': {e}")).ok()?
     } else {
         unhex(&wf.seed_hex).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())?
     };
@@ -238,14 +225,7 @@ fn wallet_exists(dir: &str, token: &str) -> bool {
     std::path::Path::new(&wallet_path(dir, token)).exists()
 }
 
-fn save_seed(
-    dir: &str,
-    token: &str,
-    network: &str,
-    seed: &[u8; 32],
-    birthday: u64,
-    secret: Option<&str>,
-) -> std::io::Result<()> {
+fn save_seed(dir: &str, token: &str, network: &str, seed: &[u8; 32], birthday: u64, secret: Option<&str>) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let (seed_hex, encrypted) = match secret {
         Some(s) => {
@@ -288,14 +268,7 @@ const CHECKPOINT_EVERY: usize = 5000;
 /// the pruning-point hash the scan is anchored to; a moved pruning point invalidates
 /// the checkpoint on load (the note-commitment tree would no longer line up), forcing
 /// a clean rescan.
-fn save_checkpoint(
-    dir: &str,
-    token: &str,
-    genesis: &RpcHash,
-    low: &RpcHash,
-    scanned: u64,
-    db: &WalletDb,
-) -> std::io::Result<()> {
+fn save_checkpoint(dir: &str, token: &str, genesis: &RpcHash, low: &RpcHash, scanned: u64, db: &WalletDb) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(SCAN_HEADER_LEN + db.leaf_count() * 32);
     buf.extend_from_slice(SCAN_MAGIC);
     buf.push(SCAN_VERSION);
@@ -619,8 +592,7 @@ impl AppState {
 
 async fn sync_loop(state: Arc<AppState>) {
     loop {
-        let wallets: Vec<(String, Wallet)> =
-            { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
+        let wallets: Vec<(String, Wallet)> = { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
         let mut any_behind = false;
         if !wallets.is_empty() {
             let chain_len = state.client.get_block_dag_info().await.map(|d| d.virtual_daa_score).unwrap_or(0);
@@ -798,9 +770,7 @@ async fn wallet_import(
     }
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&bytes);
-    let address = state
-        .address_for(&seed)
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "seed is not a valid Orchard spending key"))?;
+    let address = state.address_for(&seed).ok_or_else(|| err(StatusCode::BAD_REQUEST, "seed is not a valid Orchard spending key"))?;
     load_new_wallet(&state, &token, seed, req.birthday).await?;
     Ok(Json(CreateResp {
         address,
@@ -945,10 +915,8 @@ async fn wallet_send(
     let anchor_depth = DEFAULT_ANCHOR_DEPTH;
 
     let client = &state.client;
-    let dag = client
-        .get_block_dag_info()
-        .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("get_block_dag_info failed: {e}")))?;
+    let dag =
+        client.get_block_dag_info().await.map_err(|e| err(StatusCode::BAD_GATEWAY, format!("get_block_dag_info failed: {e}")))?;
     let net: [u8; 32] = dag.pruning_point_hash.as_bytes();
 
     let chain_len = dag.virtual_daa_score as usize;
@@ -961,8 +929,8 @@ async fn wallet_send(
     }
     let ingest_limit = chain_len - need_len;
 
-    let to_addr = Address::try_from(req.to.as_str())
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid recipient address: {e}")))?;
+    let to_addr =
+        Address::try_from(req.to.as_str()).map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid recipient address: {e}")))?;
     let recipient = orchard_recipient_bytes(&to_addr)
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "recipient is not a shielded Orchard address"))?;
     let need = amount.checked_add(fee).ok_or_else(|| err(StatusCode::BAD_REQUEST, "amount + fee overflows"))?;
@@ -1001,10 +969,9 @@ async fn wallet_send(
                 if selected >= need {
                     break;
                 }
-                let path = e
-                    .db
-                    .witness_path_at(n.position, matured)
-                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                let path =
+                    e.db.witness_path_at(n.position, matured)
+                        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
                 ins.push((n.note.clone(), path));
                 selected += n.value();
             }
@@ -1023,7 +990,9 @@ async fn wallet_send(
         // recently-matured notes. Fall back to the one-off matured replay — correct, just
         // slow, and only transient until the sync loop catches up and fills the ring.
         _ => {
-            log::warn!("send: fast path unavailable/insufficient (ring or sync not caught up); falling back to full matured scan (slow, one-off)");
+            log::warn!(
+                "send: fast path unavailable/insufficient (ring or sync not caught up); falling back to full matured scan (slow, one-off)"
+            );
             let db = scan_to_limit(client, seed, ingest_limit).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             let mut candidates = db.notes().to_vec();
             candidates.sort_by(|a, b| b.value().cmp(&a.value()));
@@ -1090,7 +1059,9 @@ async fn wallet_sign(
         address,
         message: req.message,
         signature: hex(&blob),
-        note: "This signature discloses the wallet's viewing key (proves ownership + enables note detection, but NOT spend authority).".into(),
+        note:
+            "This signature discloses the wallet's viewing key (proves ownership + enables note detection, but NOT spend authority)."
+                .into(),
     }))
 }
 
@@ -1108,11 +1079,10 @@ struct VerifyResp {
 }
 
 async fn verify(Json(req): Json<VerifyReq>) -> Result<Json<VerifyResp>, (StatusCode, Json<serde_json::Value>)> {
-    let addr = Address::try_from(req.address.as_str())
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid address: {e}")))?;
+    let addr = Address::try_from(req.address.as_str()).map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid address: {e}")))?;
     let tag = addr.prefix.to_string();
-    let raw = orchard_recipient_bytes(&addr)
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "address is not a shielded Orchard address"))?;
+    let raw =
+        orchard_recipient_bytes(&addr).ok_or_else(|| err(StatusCode::BAD_REQUEST, "address is not a shielded Orchard address"))?;
     let blob = unhex(&req.signature).ok_or_else(|| err(StatusCode::BAD_REQUEST, "signature is not valid hex"))?;
     if blob.len() != FVK_LEN + SIG_LEN {
         return Err(err(StatusCode::BAD_REQUEST, format!("signature must be {} bytes (fvk||sig)", FVK_LEN + SIG_LEN)));
@@ -1178,7 +1148,9 @@ async fn main() {
         log::warn!("no --wallet-secret / FIRECASH_WALLET_SECRET set: seed files are stored in PLAINTEXT (0600 on unix)");
     }
     if cli.allow_default_token {
-        log::warn!("--allow-default-token: tokenless requests map to the 'default' wallet; use only on a trusted single-user localhost");
+        log::warn!(
+            "--allow-default-token: tokenless requests map to the 'default' wallet; use only on a trusted single-user localhost"
+        );
     }
 
     let state = Arc::new(AppState {

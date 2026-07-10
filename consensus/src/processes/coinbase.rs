@@ -189,8 +189,12 @@ impl CoinbaseManager {
 
         // Build the current block's payload
         let subsidy = self.calc_block_subsidy(daa_score);
-        let payload =
-            self.serialize_coinbase_payload(&CoinbaseData { blue_score: ghostdag_data.blue_score, subsidy, shielded_commitment, miner_data })?;
+        let payload = self.serialize_coinbase_payload(&CoinbaseData {
+            blue_score: ghostdag_data.blue_score,
+            subsidy,
+            shielded_commitment,
+            miner_data,
+        })?;
 
         let tx_version =
             if self.toccata_activation.is_active(daa_score) { constants::TX_VERSION_TOCCATA } else { constants::TX_VERSION };
@@ -300,11 +304,8 @@ impl CoinbaseManager {
         // `subsidy_month` returns the table index, which advances `LEGACY_MONTHS_PER_HALVING /
         // SUBSIDY_HALVING_INTERVAL_MONTHS` (=4)× faster than real calendar months; convert back.
         let real_month = self.subsidy_month(daa_score) * SUBSIDY_HALVING_INTERVAL_MONTHS / LEGACY_MONTHS_PER_HALVING;
-        let per_sec = if real_month < TAIL_STEP_DOWN_MONTH {
-            TAIL_SUBSIDY_INITIAL_PER_SEC_SOMPI
-        } else {
-            TAIL_SUBSIDY_FINAL_PER_SEC_SOMPI
-        };
+        let per_sec =
+            if real_month < TAIL_STEP_DOWN_MONTH { TAIL_SUBSIDY_INITIAL_PER_SEC_SOMPI } else { TAIL_SUBSIDY_FINAL_PER_SEC_SOMPI };
         // Per-rewarded-block tail = per-second rate / BPS. The tail region is always far past
         // Crescendo activation, so the post-activation (current) BPS applies.
         per_sec.div_ceil(self.bps_history.after())
@@ -360,8 +361,11 @@ impl CoinbaseManager {
         assert!(table_index <= usize::MAX as u64);
         let table_index: usize = table_index as usize;
         // 1-BPS curve value with the firecash reward scale applied (no tail floor; used for tests).
-        let table_value =
-            if table_index >= SUBSIDY_BY_MONTH_TABLE.len() { *SUBSIDY_BY_MONTH_TABLE.last().unwrap() } else { SUBSIDY_BY_MONTH_TABLE[table_index] };
+        let table_value = if table_index >= SUBSIDY_BY_MONTH_TABLE.len() {
+            *SUBSIDY_BY_MONTH_TABLE.last().unwrap()
+        } else {
+            SUBSIDY_BY_MONTH_TABLE[table_index]
+        };
         scaled_subsidy(table_value, 1)
     }
 }
@@ -412,12 +416,18 @@ mod tests {
         let testnet_11_bps = SIMNET_PARAMS.bps();
         // Reference per-block reward for each month = firecash-scaled, BPS-rounded table value.
         let total_high_bps_rewards_rounded_up: u64 = pre_deflationary_rewards
-            + SUBSIDY_BY_MONTH_TABLE.iter().map(|x| scaled_subsidy(*x, testnet_11_bps) * testnet_11_bps * SECONDS_PER_MONTH).sum::<u64>();
+            + SUBSIDY_BY_MONTH_TABLE
+                .iter()
+                .map(|x| scaled_subsidy(*x, testnet_11_bps) * testnet_11_bps * SECONDS_PER_MONTH)
+                .sum::<u64>();
 
         let cbm = create_manager(&SIMNET_PARAMS);
         let total_high_bps_rewards: u64 = pre_deflationary_rewards
             + cbm.subsidy_by_month_table_before.iter().map(|x| x * SECONDS_PER_MONTH * cbm.bps().before()).sum::<u64>();
-        assert_eq!(total_high_bps_rewards_rounded_up, total_high_bps_rewards, "scaled subsidy adjusted to bps must match the precomputed table");
+        assert_eq!(
+            total_high_bps_rewards_rounded_up, total_high_bps_rewards,
+            "scaled subsidy adjusted to bps must match the precomputed table"
+        );
 
         let delta = total_high_bps_rewards as i64 - total_rewards as i64;
 
@@ -430,7 +440,11 @@ mod tests {
     fn subsidy_by_month_table_test() {
         let cbm = create_legacy_manager();
         cbm.subsidy_by_month_table_before.iter().enumerate().for_each(|(i, x)| {
-            assert_eq!(scaled_subsidy(SUBSIDY_BY_MONTH_TABLE[i], 1), *x, "for 1 BPS, scaled const table and precomputed values must match");
+            assert_eq!(
+                scaled_subsidy(SUBSIDY_BY_MONTH_TABLE[i], 1),
+                *x,
+                "for 1 BPS, scaled const table and precomputed values must match"
+            );
         });
 
         for network_id in NetworkId::iter() {

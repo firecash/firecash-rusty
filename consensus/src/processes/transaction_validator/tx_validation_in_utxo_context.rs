@@ -36,8 +36,7 @@ fn verify_shielded_bundle(tx: &Transaction, network_domain: &[u8; 32]) -> TxResu
     // this transaction (ctx), so a valid bundle cannot be replayed onto another
     // network or lifted into a different transaction.
     let sighash = kaspa_shielded_core::verify::sighash(&bundle, network_domain, &ctx);
-    kaspa_shielded_core::verify::verify_bundle(&bundle, &sighash)
-        .map_err(|e| TxRuleError::InvalidShieldedBundle(format!("{e:?}")))
+    kaspa_shielded_core::verify::verify_bundle(&bundle, &sighash).map_err(|e| TxRuleError::InvalidShieldedBundle(format!("{e:?}")))
 }
 
 /// A build without the `shielded-circuit` feature cannot verify Halo 2 proofs, so

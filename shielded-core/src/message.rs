@@ -78,12 +78,7 @@ fn message_digest(network_tag: &[u8], address: &[u8; ADDRESS_LEN], message: &[u8
 /// Sign `message` with the wallet identified by `seed`, asserting ownership of the
 /// wallet's default external address, scoped to `network_tag`. Returns `None` only
 /// if `seed` is not a valid Orchard spending key (negligibly rare).
-pub fn sign_message(
-    seed: [u8; 32],
-    network_tag: &[u8],
-    message: &[u8],
-    mut rng: impl RngCore + CryptoRng,
-) -> Option<SignedMessage> {
+pub fn sign_message(seed: [u8; 32], network_tag: &[u8], message: &[u8], mut rng: impl RngCore + CryptoRng) -> Option<SignedMessage> {
     let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
     let fvk = FullViewingKey::from(&sk);
     let address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
@@ -149,10 +144,7 @@ mod tests {
     #[test]
     fn sign_then_verify_roundtrips() {
         let signed = sign_message(seed(7), b"firecash-mainnet", b"i own this address", OsRng).unwrap();
-        assert_eq!(
-            verify_message(&signed.address, b"firecash-mainnet", b"i own this address", &signed.fvk, &signed.sig),
-            Ok(())
-        );
+        assert_eq!(verify_message(&signed.address, b"firecash-mainnet", b"i own this address", &signed.fvk, &signed.sig), Ok(()));
     }
 
     #[test]
@@ -180,10 +172,7 @@ mod tests {
         let attacker = sign_message(seed(9), b"net", b"msg", OsRng).unwrap();
         let victim = sign_message(seed(3), b"net", b"msg", OsRng).unwrap();
         assert_ne!(attacker.address, victim.address);
-        assert_eq!(
-            verify_message(&victim.address, b"net", b"msg", &attacker.fvk, &attacker.sig),
-            Err(VerifyError::AddressMismatch)
-        );
+        assert_eq!(verify_message(&victim.address, b"net", b"msg", &attacker.fvk, &attacker.sig), Err(VerifyError::AddressMismatch));
     }
 
     #[test]
@@ -193,10 +182,7 @@ mod tests {
         let victim = sign_message(seed(3), b"net", b"msg", OsRng).unwrap();
         let attacker = sign_message(seed(9), b"net", b"msg", OsRng).unwrap();
         // Victim's binding holds, but attacker's signature over it does not verify.
-        assert_eq!(
-            verify_message(&victim.address, b"net", b"msg", &victim.fvk, &attacker.sig),
-            Err(VerifyError::BadSignature)
-        );
+        assert_eq!(verify_message(&victim.address, b"net", b"msg", &victim.fvk, &attacker.sig), Err(VerifyError::BadSignature));
     }
 
     #[test]

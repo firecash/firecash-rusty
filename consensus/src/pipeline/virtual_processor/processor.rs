@@ -1580,8 +1580,7 @@ impl VirtualStateProcessor {
             self.pruning_point_manager.expected_header_pruning_point(virtual_state.ghostdag_data.to_compact()).pruning_point;
         // Commit to the selected parent's shielded state root (PLAN §2.10) so the template's
         // coinbase matches what `verify_coinbase_transaction` will expect for this block.
-        let shielded_commitment =
-            self.shielded_state_manager.state_root_at(virtual_state.ghostdag_data.selected_parent).unwrap();
+        let shielded_commitment = self.shielded_state_manager.state_root_at(virtual_state.ghostdag_data.selected_parent).unwrap();
         let coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -1664,7 +1663,16 @@ impl VirtualStateProcessor {
     /// Note that pruning point-related stores are initialized by `init`
     pub fn process_genesis(self: &Arc<Self>) {
         // Write the UTXO state of genesis
-        self.commit_utxo_state(self.genesis.hash, UtxoDiff::default(), MuHash::new(), AcceptanceData::default(), ZERO_HASH, None, 0, None);
+        self.commit_utxo_state(
+            self.genesis.hash,
+            UtxoDiff::default(),
+            MuHash::new(),
+            AcceptanceData::default(),
+            ZERO_HASH,
+            None,
+            0,
+            None,
+        );
 
         // Init the virtual selected chain store
         let mut batch = WriteBatch::default();

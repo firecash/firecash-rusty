@@ -9,7 +9,7 @@ use super::{
 use crate::constants::LOCK_TIME_THRESHOLD;
 use kaspa_consensus_core::{
     constants::{TX_VERSION, TX_VERSION_TOCCATA},
-    tx::{Transaction, TX_VERSION_SHIELDED},
+    tx::{TX_VERSION_SHIELDED, Transaction},
 };
 
 pub(crate) enum LockTimeType {

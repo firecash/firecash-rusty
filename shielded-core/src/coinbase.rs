@@ -24,9 +24,9 @@
 
 use group::ff::{FromUniformBytes, PrimeField};
 use orchard::{
+    Address,
     note::{ExtractedNoteCommitment, Note, RandomSeed, Rho},
     value::NoteValue,
-    Address,
 };
 use pasta_curves::pallas;
 
@@ -116,12 +116,11 @@ pub enum CoinbaseNoteError {
 /// to derive the global-tree leaf and to bind the commitment to the emission- and
 /// fee-checked value.
 pub fn coinbase_note_commitment(desc: &CoinbaseNoteDesc, value: u64) -> Result<ExtractedNoteCommitment, CoinbaseNoteError> {
-    let recipient: Address =
-        Option::from(Address::from_raw_address_bytes(&desc.recipient)).ok_or(CoinbaseNoteError::BadRecipient)?;
+    let recipient: Address = Option::from(Address::from_raw_address_bytes(&desc.recipient)).ok_or(CoinbaseNoteError::BadRecipient)?;
     let rho: Rho = Option::from(Rho::from_bytes(&desc.rho)).ok_or(CoinbaseNoteError::BadRho)?;
     let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(desc.rseed, &rho)).ok_or(CoinbaseNoteError::BadRseed)?;
-    let note: Note = Option::from(Note::from_parts(recipient, NoteValue::from_raw(value), rho, rseed))
-        .ok_or(CoinbaseNoteError::BadNote)?;
+    let note: Note =
+        Option::from(Note::from_parts(recipient, NoteValue::from_raw(value), rho, rseed)).ok_or(CoinbaseNoteError::BadNote)?;
     Ok(ExtractedNoteCommitment::from(note.commitment()))
 }
 

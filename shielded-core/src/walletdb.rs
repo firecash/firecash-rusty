@@ -34,15 +34,15 @@
 use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
 use incrementalmerkletree::witness::IncrementalWitness;
 use orchard::{
+    Address,
     keys::{FullViewingKey, IncomingViewingKey, Scope, SpendingKey},
     note::{ExtractedNoteCommitment, Note, RandomSeed, Rho},
     tree::{MerkleHashOrchard, MerklePath},
     value::NoteValue,
-    Address,
 };
 
 use crate::bundle::ShieldedBundle;
-use crate::coinbase::{coinbase_note_commitment, CoinbaseNoteDesc};
+use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};
 use crate::tree::{FrontierState, GlobalTree, TREE_DEPTH};
 use crate::wallet::scan::scan_bundle;
 
@@ -180,11 +180,7 @@ impl WalletDb {
         // An empty tree has the Orchard empty-tree anchor; a non-empty tree roots
         // its full depth. This mirrors `GlobalTree::anchor`.
         use orchard::tree::Anchor;
-        if self.size == 0 {
-            Anchor::empty_tree().to_bytes()
-        } else {
-            self.tree.root().to_bytes()
-        }
+        if self.size == 0 { Anchor::empty_tree().to_bytes() } else { self.tree.root().to_bytes() }
     }
 
     /// Ingest one accepted chain block's shielded effects, **in the exact order
@@ -216,8 +212,7 @@ impl WalletDb {
                 // balance and spend-selection never count or re-offer it.
                 self.notes.retain(|n| n.nullifier != action.nullifier);
 
-                let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&action.cmx))
-                else {
+                let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&action.cmx)) else {
                     continue;
                 };
                 let owned = received.iter().find(|r| r.action_index == i).map(|r| r.note.clone());
@@ -512,10 +507,7 @@ mod tests {
 
         // Block 2: one more coinbase note (a stranger's), advancing the tree.
         let c = coinbase_for(address_of([9u8; 32]), b"b2||0", 3_000);
-        let mint2 = CoinbaseMint::new(vec![CoinbaseNote {
-            value: c.1,
-            commitment: coinbase_note_commitment(&c.0, c.1).unwrap(),
-        }]);
+        let mint2 = CoinbaseMint::new(vec![CoinbaseNote { value: c.1, commitment: coinbase_note_commitment(&c.0, c.1).unwrap() }]);
         state.apply_chain_block(Some(&mint2), &[]).unwrap();
         db.ingest_block(&[c], &[]);
 
@@ -668,7 +660,7 @@ mod circuit_tests {
     use crate::bundle::ShieldedBundle;
     use crate::state::{CoinbaseMint, CoinbaseNote, ShieldedState, ShieldedTx};
     use crate::verify::{sighash, verify_bundle};
-    use crate::wallet::build::{build_spend_bundle, build_wallet_payment, ShieldedKeys};
+    use crate::wallet::build::{ShieldedKeys, build_spend_bundle, build_wallet_payment};
     use crate::wallet::scan::address_bytes_from_seed;
     use orchard::circuit::ProvingKey;
 
@@ -710,18 +702,8 @@ mod circuit_tests {
         let merkle_path = db.witness_path(owned.position).expect("wallet builds a witness path on demand");
         let recipient = ShieldedKeys::from_seed([42u8; 32]).unwrap().address();
         let output_value = 7_000u64;
-        let wire = build_spend_bundle(
-            &pk,
-            &keys,
-            owned.note,
-            merkle_path,
-            recipient,
-            output_value,
-            &net,
-            ctx,
-            rand::rngs::OsRng,
-        )
-        .expect("wallet builds a real spend from its own witness");
+        let wire = build_spend_bundle(&pk, &keys, owned.note, merkle_path, recipient, output_value, &net, ctx, rand::rngs::OsRng)
+            .expect("wallet builds a real spend from its own witness");
 
         // Consensus accepts it: proof verifies, and it spends against the anchor
         // the wallet witnessed — i.e. the node's anchor.

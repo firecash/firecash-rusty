@@ -65,8 +65,7 @@ impl ShieldedTx {
     pub fn from_bundle(bundle: &ShieldedBundle) -> Result<Self, BundleExtractError> {
         let mut commitments = Vec::with_capacity(bundle.actions.len());
         for a in &bundle.actions {
-            let cmx = Option::from(ExtractedNoteCommitment::from_bytes(&a.cmx))
-                .ok_or(BundleExtractError::NonCanonicalCommitment)?;
+            let cmx = Option::from(ExtractedNoteCommitment::from_bytes(&a.cmx)).ok_or(BundleExtractError::NonCanonicalCommitment)?;
             commitments.push(cmx);
         }
         let nullifiers = bundle.actions.iter().map(|a| a.nullifier).collect();
@@ -394,8 +393,7 @@ mod tests {
         let mut st = ShieldedState::new();
 
         // Block 1: pure coinbase, one subsidy, no fees. pool = subsidy.
-        st.apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(1) }])), &[])
-            .unwrap();
+        st.apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(1) }])), &[]).unwrap();
         assert_eq!(st.supply.pool_value().unwrap(), SUBSIDY as u128);
 
         // Block 2: a shielded payment pays FEE (value leaves the pool), AND this
@@ -410,8 +408,7 @@ mod tests {
         .unwrap();
 
         // Block 3: another plain subsidy, no fees.
-        st.apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(3) }])), &[])
-            .unwrap();
+        st.apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(3) }])), &[]).unwrap();
 
         // Turnstile: pool == cumulative subsidy. The FEE left the pool in block 2
         // and returned via block 2's coinbase re-mint; it neither inflated the
@@ -424,18 +421,14 @@ mod tests {
         // exactly FEE — proving the re-mint is what closes the loop, not that the
         // fee is silently ignored.
         let mut no_remint = ShieldedState::new();
-        no_remint
-            .apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(1) }])), &[])
-            .unwrap();
+        no_remint.apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(1) }])), &[]).unwrap();
         no_remint
             .apply_chain_block(
                 Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(2) }])),
                 &[tx(&[1], &[100], FEE)],
             )
             .unwrap();
-        no_remint
-            .apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(3) }])), &[])
-            .unwrap();
+        no_remint.apply_chain_block(Some(&CoinbaseMint::new(vec![CoinbaseNote { value: SUBSIDY, commitment: cmx(3) }])), &[]).unwrap();
         assert_eq!(
             no_remint.supply.pool_value().unwrap(),
             cumulative_subsidy - FEE as u128,
@@ -495,14 +488,8 @@ mod tests {
 
     #[test]
     fn extract_rejects_minting_value_balance() {
-        let bundle = ShieldedBundle {
-            actions: vec![],
-            flags: 0,
-            value_balance: -1,
-            anchor: [0; 32],
-            proof: vec![],
-            binding_sig: [0; 64],
-        };
+        let bundle =
+            ShieldedBundle { actions: vec![], flags: 0, value_balance: -1, anchor: [0; 32], proof: vec![], binding_sig: [0; 64] };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::MintingValueBalance)));
     }
 
@@ -510,14 +497,8 @@ mod tests {
     fn extract_rejects_non_canonical_commitment() {
         let mut bad = action(1, 0);
         bad.cmx = [0xff; 32]; // not a canonical Pallas base-field element
-        let bundle = ShieldedBundle {
-            actions: vec![bad],
-            flags: 0,
-            value_balance: 0,
-            anchor: [0; 32],
-            proof: vec![],
-            binding_sig: [0; 64],
-        };
+        let bundle =
+            ShieldedBundle { actions: vec![bad], flags: 0, value_balance: 0, anchor: [0; 32], proof: vec![], binding_sig: [0; 64] };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::NonCanonicalCommitment)));
     }
 
@@ -548,9 +529,9 @@ mod tests {
 #[cfg(all(test, feature = "circuit"))]
 mod circuit_e2e {
     use super::*;
-    use crate::coinbase::{coinbase_note_commitment, CoinbaseNoteDesc};
+    use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};
     use crate::verify::{sighash, verify_bundle};
-    use crate::wallet::build::{build_spend_bundle, ShieldedKeys};
+    use crate::wallet::build::{ShieldedKeys, build_spend_bundle};
     use incrementalmerkletree::{Hashable, Level};
     use orchard::{
         circuit::ProvingKey,
@@ -603,8 +584,7 @@ mod circuit_e2e {
         let recipient = ShieldedKeys::from_seed([6u8; 32]).unwrap().address();
         let output_value = 8_000u64;
         let ctx = b"e2e";
-        let wire =
-            build_spend_bundle(&pk, &keys, note, merkle_path, recipient, output_value, &net, ctx, rand::rngs::OsRng).unwrap();
+        let wire = build_spend_bundle(&pk, &keys, note, merkle_path, recipient, output_value, &net, ctx, rand::rngs::OsRng).unwrap();
 
         // The consensus verifier accepts the real bundle, and it spends against the
         // coinbase anchor with the expected public fee.

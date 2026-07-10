@@ -1,4 +1,5 @@
 use super::{VirtualStateProcessor, bounds::SeqCommitBounds};
+use crate::processes::shielded::ComputedBlockShielded;
 use crate::{
     errors::{
         BlockProcessResult,
@@ -21,6 +22,7 @@ use crate::{
         },
     },
 };
+use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
 use kaspa_consensus_core::{
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
     acceptance_data::{AcceptedTxEntry, MergesetBlockAcceptanceData},
@@ -38,10 +40,8 @@ use kaspa_consensus_core::{
 use kaspa_core::{debug, info, trace};
 use kaspa_hashes::Hash;
 use kaspa_muhash::MuHash;
-use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
 use kaspa_shielded_core::bundle::ShieldedBundle;
 use kaspa_shielded_core::state::ShieldedTx;
-use crate::processes::shielded::ComputedBlockShielded;
 use kaspa_utils::refs::Refs;
 
 use crate::model::services::seq_commit_accessor::SeqCommitAccessor;
@@ -191,7 +191,8 @@ impl VirtualStateProcessor {
                     // it somehow does not, we DROP that transaction rather than disqualify
                     // the merging block: a single unusable merged tx must never be able to
                     // halt the chain (see the accepted-order drop principle, PLAN §2.4).
-                    if let Some(stx) = ShieldedBundle::from_bytes(&validated_tx.tx().payload).ok().and_then(|b| ShieldedTx::from_bundle(&b).ok())
+                    if let Some(stx) =
+                        ShieldedBundle::from_bytes(&validated_tx.tx().payload).ok().and_then(|b| ShieldedTx::from_bundle(&b).ok())
                     {
                         ctx.shielded_txs.push(stx);
                     }
@@ -401,7 +402,14 @@ impl VirtualStateProcessor {
         let shielded_commitment = self.shielded_state_manager.state_root_at(ghostdag_data.selected_parent).unwrap();
         let expected_coinbase = self
             .coinbase_manager
-            .expected_coinbase_transaction(daa_score, miner_data, ghostdag_data, mergeset_rewards, mergeset_non_daa, shielded_commitment)
+            .expected_coinbase_transaction(
+                daa_score,
+                miner_data,
+                ghostdag_data,
+                mergeset_rewards,
+                mergeset_non_daa,
+                shielded_commitment,
+            )
             .unwrap()
             .tx;
         if hashing::tx::hash(coinbase) != hashing::tx::hash(&expected_coinbase) { Err(BadCoinbaseTransaction) } else { Ok(()) }

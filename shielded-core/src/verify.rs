@@ -119,13 +119,13 @@ mod circuit_verify {
     use group::{Group, GroupEncoding};
     use nonempty::NonEmpty;
     use orchard::{
+        Action, ActionFromPartsError, Bundle, Proof,
         bundle::{Authorized, BatchValidator, Flags, ProofSizeEnforcement},
         circuit::{Instance, VerifyingKey},
         note::{ExtractedNoteCommitment, Nullifier, TransmittedNoteCiphertext},
         primitives::redpallas::{Binding, Signature, SpendAuth, VerificationKey},
         tree::Anchor,
         value::ValueCommitment,
-        Action, ActionFromPartsError, Bundle, Proof,
     };
     use pasta_curves::pallas;
     use rand::{CryptoRng, RngCore};
@@ -148,11 +148,7 @@ mod circuit_verify {
 
     /// As [`verify_bundle`], but with a caller-provided verifying key (e.g. for
     /// batching across many bundles without re-fetching the static).
-    pub fn verify_bundle_with_vk(
-        bundle: &ShieldedBundle,
-        sighash: &[u8; 32],
-        vk: &VerifyingKey,
-    ) -> Result<(), BundleVerifyError> {
+    pub fn verify_bundle_with_vk(bundle: &ShieldedBundle, sighash: &[u8; 32], vk: &VerifyingKey) -> Result<(), BundleVerifyError> {
         if bundle.actions.is_empty() {
             return Err(BundleVerifyError::NoActions);
         }
@@ -171,10 +167,12 @@ mod circuit_verify {
         let mut cv_sum: Option<ValueCommitment> = None;
 
         for a in &bundle.actions {
-            let nf: Nullifier = Option::from(Nullifier::from_bytes(&a.nullifier)).ok_or(BundleVerifyError::NonCanonicalField("nullifier"))?;
+            let nf: Nullifier =
+                Option::from(Nullifier::from_bytes(&a.nullifier)).ok_or(BundleVerifyError::NonCanonicalField("nullifier"))?;
             let cmx: ExtractedNoteCommitment =
                 Option::from(ExtractedNoteCommitment::from_bytes(&a.cmx)).ok_or(BundleVerifyError::NonCanonicalField("cmx"))?;
-            let cv_net: ValueCommitment = Option::from(ValueCommitment::from_bytes(&a.cv_net)).ok_or(BundleVerifyError::NonCanonicalField("cv_net"))?;
+            let cv_net: ValueCommitment =
+                Option::from(ValueCommitment::from_bytes(&a.cv_net)).ok_or(BundleVerifyError::NonCanonicalField("cv_net"))?;
             let rk = VerificationKey::<SpendAuth>::try_from(a.rk).map_err(|_| BundleVerifyError::NonCanonicalField("rk"))?;
 
             // Consensus encoding rules (April-2026 disclosure): rk and epk must be
@@ -215,8 +213,7 @@ mod circuit_verify {
         let cv_sum = cv_sum.expect("actions are non-empty");
         let vb_commit = crate::turnstile::commit(bundle.value_balance, crate::turnstile::zero_trapdoor());
         let bvk_point = cv_sum - vb_commit;
-        let bvk = VerificationKey::<Binding>::try_from(bvk_point.to_bytes())
-            .map_err(|_| BundleVerifyError::BindingSigInvalid)?;
+        let bvk = VerificationKey::<Binding>::try_from(bvk_point.to_bytes()).map_err(|_| BundleVerifyError::BindingSigInvalid)?;
         let binding_sig = Signature::<Binding>::from(bundle.binding_sig);
         bvk.verify(sighash, &binding_sig).map_err(|_| BundleVerifyError::BindingSigInvalid)?;
 
@@ -283,11 +280,7 @@ mod circuit_verify {
             let bundle = to_orchard_bundle(wire)?;
             batch.add_bundle(&bundle, *sighash);
         }
-        if batch.validate(verifying_key(), rng) {
-            Ok(())
-        } else {
-            Err(BundleVerifyError::ProofInvalid)
-        }
+        if batch.validate(verifying_key(), rng) { Ok(()) } else { Err(BundleVerifyError::ProofInvalid) }
     }
 }
 
@@ -305,12 +298,12 @@ mod e2e {
     use super::*;
     use crate::bundle::{ActionWire, ShieldedBundle};
     use orchard::{
+        Action, Anchor, Bundle,
         builder::{Builder, BundleType},
         bundle::{Authorization, Authorized},
         circuit::ProvingKey,
         keys::{FullViewingKey, Scope, SpendingKey},
         value::NoteValue,
-        Action, Anchor, Bundle,
     };
 
     /// Extract the effect fields shared by proven and authorized bundles, with a
@@ -409,8 +402,7 @@ mod e2e {
 
         // 8. Batch verification (PLAN §2.8): a batch of valid bundles verifies;
         //    a batch containing a tampered bundle fails.
-        super::verify_bundles_batched(&[(&wire, msg), (&wire, msg)], rand::rngs::OsRng)
-            .expect("batch of valid bundles verifies");
+        super::verify_bundles_batched(&[(&wire, msg), (&wire, msg)], rand::rngs::OsRng).expect("batch of valid bundles verifies");
         assert!(super::verify_bundles_batched(&[(&wire, msg), (&bad_proof, msg)], rand::rngs::OsRng).is_err());
     }
 }
@@ -418,7 +410,7 @@ mod e2e {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::{sizes, ActionWire};
+    use crate::bundle::{ActionWire, sizes};
 
     fn action(seed: u8) -> ActionWire {
         ActionWire {

@@ -123,12 +123,12 @@ impl ShieldedAccount {
         network_domain: &[u8; 32],
         tx_context: &[u8],
     ) -> Result<Vec<u8>, PaymentError> {
-        use crate::wallet::build::{build_payment_bundle, ShieldedKeys};
-        use orchard::{circuit::ProvingKey, Address as OrchardAddress};
+        use crate::wallet::build::{ShieldedKeys, build_payment_bundle};
+        use orchard::{Address as OrchardAddress, circuit::ProvingKey};
 
         let recipient_raw = orchard_recipient_bytes(recipient).ok_or(PaymentError::BadRecipient)?;
-        let recipient_addr =
-            Option::<OrchardAddress>::from(OrchardAddress::from_raw_address_bytes(&recipient_raw)).ok_or(PaymentError::BadRecipient)?;
+        let recipient_addr = Option::<OrchardAddress>::from(OrchardAddress::from_raw_address_bytes(&recipient_raw))
+            .ok_or(PaymentError::BadRecipient)?;
 
         let need = amount.checked_add(fee).ok_or(PaymentError::AmountOverflow)?;
 

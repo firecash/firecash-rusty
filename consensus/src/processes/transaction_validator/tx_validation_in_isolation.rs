@@ -6,7 +6,7 @@ use crate::constants::{MAX_SOMPI, TX_VERSION_TOCCATA};
 use kaspa_consensus_core::subnets::{
     CoinbaseSubnetwork, NativeSubnetwork, SUBNETWORK_NAMESPACE_LEN, SUBNETWORK_ZERO_TAIL_LEN, Subnetwork,
 };
-use kaspa_consensus_core::tx::{Transaction, TX_VERSION_SHIELDED};
+use kaspa_consensus_core::tx::{TX_VERSION_SHIELDED, Transaction};
 use kaspa_shielded_core::bundle::ShieldedBundle;
 use std::collections::HashSet;
 
@@ -260,8 +260,8 @@ mod tests {
         constants::{TX_VERSION, TX_VERSION_TOCCATA},
         subnets::{SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_NATIVE, SubnetworkId},
         tx::{
-            ComputeCommit, ScriptPublicKey, Transaction, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput,
-            TX_VERSION_SHIELDED, scriptvec,
+            ComputeCommit, ScriptPublicKey, TX_VERSION_SHIELDED, Transaction, TransactionId, TransactionInput, TransactionOutpoint,
+            TransactionOutput, scriptvec,
         },
     };
     use kaspa_core::assert_match;

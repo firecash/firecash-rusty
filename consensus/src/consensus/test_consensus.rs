@@ -208,8 +208,7 @@ impl TestConsensus {
         // The coinbase commits to the selected parent's shielded state root (PLAN §2.10).
         // These manual test blocks run on non-shielded configs where every block shares the
         // empty shielded state, so the root at genesis equals the root at any selected parent.
-        let shielded_commitment =
-            self.consensus.virtual_processor.shielded_state_root_at(self.params.genesis.hash).unwrap();
+        let shielded_commitment = self.consensus.virtual_processor.shielded_state_root_at(self.params.genesis.hash).unwrap();
         let cb_payload: Vec<u8> = header.blue_score.to_le_bytes().iter().copied() // Blue score
             .chain(self.consensus.services.coinbase_manager.calc_block_subsidy(header.daa_score).to_le_bytes().iter().copied()) // Subsidy
             .chain(shielded_commitment.iter().copied()) // Shielded state root (32)
