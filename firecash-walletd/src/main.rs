@@ -979,15 +979,20 @@ async fn wallet_send(
 
     // Fast path: reuse the wallet state the sync loop already maintains, instead of
     // replaying the whole chain into a throwaway db. Root the spend at the leaf count
-    // recorded `need_back` blocks back — a matured block's tree root, which consensus
-    // accepts as a finalized anchor (`is_shielded_anchor_final`). Selection + witness
-    // build run under the entry lock (CPU-only, no await); the lock is dropped before
-    // the slow proof build below.
-    let mut fast: Option<(Vec<_>, u64)> = None;
+    // recorded `need_back` blocks back from the wallet's latest scanned block — always a
+    // matured, canonical block root (a wallet that is behind the tip simply roots at an
+    // even deeper anchor, still valid), which consensus accepts as a finalized anchor
+    // (`is_shielded_anchor_final`). Selection + witness build run under the entry lock
+    // (CPU-only, no await); the lock is dropped before the slow proof build below. We do
+    // NOT gate on `caught_up` — on a fast chain that flag is rarely set, and the ring
+    // anchor is valid regardless; `caught_up` is only used to decide whether an
+    // insufficient result is authoritative (see the match below).
+    let mut fast: Option<(Vec<_>, u64, bool)> = None;
     {
         let e = w.lock().await;
-        if e.caught_up && e.block_leaf_counts.len() > need_back {
+        if e.block_leaf_counts.len() > need_back {
             let matured = e.block_leaf_counts[e.block_leaf_counts.len() - 1 - need_back];
+            let caught_up = e.caught_up;
             let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
             candidates.sort_by(|a, b| b.value().cmp(&a.value()));
             let mut ins = Vec::new();
@@ -1003,23 +1008,22 @@ async fn wallet_send(
                 ins.push((n.note.clone(), path));
                 selected += n.value();
             }
-            fast = Some((ins, selected));
+            fast = Some((ins, selected, caught_up));
         }
     }
 
     let inputs = match fast {
-        Some((ins, selected)) => {
-            if selected < need {
-                return Err(insufficient(selected));
-            }
-            ins
-        }
-        None => {
-            // Cold-start fallback: the boundary ring hasn't reached the maturity depth
-            // yet (e.g. right after loading a checkpoint, before `need_back` new blocks
-            // have accrued). Do the one-off matured replay — correct, just slow, and
-            // only until the sync loop fills the ring.
-            log::warn!("send: boundary ring below maturity depth; falling back to full matured scan (slow, one-off)");
+        // Enough matured funds at the wallet's own anchor — the fast, no-rescan path.
+        Some((ins, selected, _)) if selected >= need => ins,
+        // Not enough, but the wallet is caught up to the tip, so a full replay would see
+        // the exact same matured notes: report insufficient without the slow scan.
+        Some((_, selected, true)) => return Err(insufficient(selected)),
+        // Either the ring has not reached the maturity depth yet (cold start, right after
+        // a checkpoint load), or the wallet is still behind the tip and may be missing
+        // recently-matured notes. Fall back to the one-off matured replay — correct, just
+        // slow, and only transient until the sync loop catches up and fills the ring.
+        _ => {
+            log::warn!("send: fast path unavailable/insufficient (ring or sync not caught up); falling back to full matured scan (slow, one-off)");
             let db = scan_to_limit(client, seed, ingest_limit).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             let mut candidates = db.notes().to_vec();
             candidates.sort_by(|a, b| b.value().cmp(&a.value()));
