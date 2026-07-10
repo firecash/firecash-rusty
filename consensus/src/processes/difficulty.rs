@@ -11,7 +11,7 @@ use kaspa_consensus_core::{
 use kaspa_hashes::Hash;
 use kaspa_math::{Uint256, Uint320};
 use std::{
-    cmp::{Ordering, max},
+    cmp::{Ordering, max, min},
     ops::Deref,
     sync::Arc,
 };
@@ -192,8 +192,18 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
     pub fn calculate_difficulty_bits(&self, window: &BlockWindowHeap, ghostdag_data: &GhostdagData) -> u32 {
         let base_bits = self.calculate_base_difficulty_bits(window, ghostdag_data);
         match self.launch_min_target(ghostdag_data.blue_score) {
-            // Schedule inactive / finished: the pure DAA governs. Post-launch difficulty
-            // is whatever real network hashrate demands — blocks are not artificially easy.
+            // Past the launch window (schedule ran and is finished): pure DAA, BUT never let
+            // difficulty drop back below the launch floor — otherwise, if the DAA ever
+            // mis-measures (e.g. a fragmented DAG makes the selected chain look slow), it can
+            // spiral difficulty all the way down to the trivial minimum and never recover.
+            // The floor is `genesis_target` (the easy-start difficulty): after the easy window
+            // the chain can rise above it freely, but can never become *easier* than it again.
+            None if self.ramp_end_blue_score > 0 => {
+                let daa_target = Uint256::from_compact_target_bits(base_bits);
+                // Smaller target = harder; cap the target at genesis so difficulty >= genesis.
+                min(daa_target, self.genesis_target).compact_target_bits()
+            }
+            // Schedule disabled entirely (ramp_end == 0): upstream KIP-0004 pure DAA.
             None => base_bits,
             // Launch window: cap the difficulty from above by flooring the target. Taking the
             // *larger* (=easier) of the DAA target and the ceiling target keeps difficulty at
