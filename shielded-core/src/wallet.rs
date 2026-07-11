@@ -479,6 +479,80 @@ pub mod build {
             assert_eq!(wire.value_balance, 2_000);
         }
 
+        /// NON-CUSTODIAL SPEND: the Orchard prove/sign split, end to end.
+        ///
+        /// The **prover** (a server) has only the full viewing key + proving key and
+        /// builds the Halo 2 proof — it never sees the spend authority. The **signer**
+        /// (the device) has only `ask` and applies the RedPallas spend-auth signatures
+        /// over the sighash — it never proves. A server can therefore prepare a spend
+        /// it cannot authorize, and a device authorizes it without proving. The
+        /// resulting bundle verifies identically to a locally-built one.
+        #[test]
+        fn non_custodial_split_spend_verifies() {
+            use orchard::builder::{Builder, BundleType};
+            use orchard::keys::SpendAuthorizingKey;
+            use orchard::value::NoteValue;
+
+            let pk = ProvingKey::build();
+            let keys = ShieldedKeys::from_seed([5u8; 32]).expect("valid seed");
+            let ctx = b"firecash-noncustodial";
+            let net = [0x44u8; 32];
+
+            // A note worth 10_000 owned by the wallet, alone at tree position 0.
+            let rho = Option::<Rho>::from(Rho::from_bytes(&canon(1))).unwrap();
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(2), &rho)).unwrap();
+            let note =
+                Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
+            let auth_path: [MerkleHashOrchard; 32] =
+                core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+            let merkle_path = MerklePath::from_parts(0, auth_path);
+            let anchor = merkle_path.root(ExtractedNoteCommitment::from(note.commitment()));
+            let recipient = ShieldedKeys::from_seed([6u8; 32]).unwrap().address();
+
+            // Spend 10_000, send 8_000 to the recipient, no change → fee = 2_000.
+            let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+            builder.add_spend(keys.fvk.clone(), note, merkle_path).expect("add_spend");
+            builder.add_output(None, recipient, NoteValue::from_raw(8_000), [0u8; 512]).expect("out");
+
+            let mut rng = rand::rngs::OsRng;
+
+            // === SERVER (viewing key + proving key; NO spend authority) ===
+            let (mut pczt, _meta) = builder.build_for_pczt(&mut rng).expect("build_for_pczt");
+            pczt.create_proof(&pk, &mut rng).expect("prove");
+
+            // Sighash over the effects (proof/sigs excluded) — the message the device signs.
+            let effects = pczt.extract_effects::<i64>().expect("effects").expect("some effects");
+            let effects_wire = to_wire(&effects, |_| [0u8; 64], Vec::new(), [0u8; 64]);
+            let msg = sighash(&effects_wire, &net, ctx);
+
+            // === DEVICE (ONLY `ask`; never proves) ===
+            let ask = SpendAuthorizingKey::from(&keys.sk);
+            let mut signed = 0;
+            for action in pczt.actions_mut() {
+                if action.sign(msg, &ask, &mut rng).is_ok() {
+                    signed += 1;
+                }
+            }
+            assert_eq!(signed, 1, "exactly the one real spend action is signed on-device");
+
+            // === SERVER (finalize + extract; still no spend authority) ===
+            pczt.finalize_io(msg, &mut rng).expect("finalize_io");
+            let unbound = pczt.extract::<i64>().expect("extract").expect("some unbound");
+            let authorized = unbound.apply_binding_signature(msg, &mut rng).expect("bind");
+
+            let wire = to_wire(
+                &authorized,
+                |a| <[u8; 64]>::from(a.authorization()),
+                authorized.authorization().proof().as_ref().to_vec(),
+                <[u8; 64]>::from(authorized.authorization().binding_signature()),
+            );
+
+            // The split-built bundle verifies exactly like a locally-built one.
+            let m2 = sighash(&wire, &net, ctx);
+            crate::verify::verify_bundle(&wire, &m2).expect("non-custodial split spend must verify");
+            assert_eq!(wire.value_balance, 2_000);
+        }
+
         /// The full loop: the wallet builds a real shielded bundle, and the
         /// consensus verifier accepts it under the same sighash.
         #[test]
