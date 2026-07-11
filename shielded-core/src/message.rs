@@ -132,6 +132,16 @@ pub fn verify_message(
     vk.verify(&digest, &Signature::<SpendAuth>::from(*sig)).map_err(|_| VerifyError::BadSignature)
 }
 
+/// Derive the wallet's serialized full viewing key (`ak ‖ nk ‖ rivk`, 96 bytes) from
+/// its `seed`, without the proving circuit. The device sends this to the daemon's
+/// non-custodial `/prepare` endpoint so the server can scan watch-only and build the
+/// payment proof; it grants viewing (not spend) capability. Returns `None` only if
+/// `seed` is not a valid Orchard spending key.
+pub fn fvk_bytes_from_seed(seed: [u8; 32]) -> Option<[u8; FVK_LEN]> {
+    let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
+    Some(FullViewingKey::from(&sk).to_bytes())
+}
+
 /// Device-side spend-auth signing for a **non-custodial payment** (no proving circuit).
 ///
 /// Given the wallet `seed`, a per-action randomizer `alpha` (from the server's
