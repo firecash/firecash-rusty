@@ -132,6 +132,22 @@ pub fn verify_message(
     vk.verify(&digest, &Signature::<SpendAuth>::from(*sig)).map_err(|_| VerifyError::BadSignature)
 }
 
+/// Device-side spend-auth signing for a **non-custodial payment** (no proving circuit).
+///
+/// Given the wallet `seed`, a per-action randomizer `alpha` (from the server's
+/// `prepare_payment` request), and the payment `sighash`, produce the RedPallas
+/// spend-auth signature the server applies via `finalize_payment`. This is the ONLY
+/// step that needs the spend key, and it runs entirely on the device. Returns `None`
+/// if `seed` is not a valid spending key or `alpha` is not a canonical scalar.
+pub fn sign_spend_auth_from_seed(seed: [u8; 32], alpha: [u8; 32], sighash: [u8; 32]) -> Option<[u8; 64]> {
+    use group::ff::PrimeField;
+    let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
+    let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(alpha))?;
+    let ask = SpendAuthorizingKey::from(&sk);
+    let sig = ask.randomize(&alpha).sign(rand::rngs::OsRng, &sighash);
+    Some(<[u8; 64]>::from(&sig))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
