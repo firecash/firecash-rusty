@@ -129,6 +129,37 @@ impl WalletDb {
         })
     }
 
+    /// Build a **watch-only** wallet view from a serialized full viewing key
+    /// (`ak ‖ nk ‖ rivk`, 96 bytes). This holds **no spend authority**: it scans and
+    /// recognises the wallet's notes, tracks balances, and can build a spend *proof*
+    /// (via [`crate::wallet::build::prepare_payment`]), but it cannot authorize a
+    /// spend — that signature must come from the device holding the seed. This is the
+    /// server side of the non-custodial (mobile) wallet: the daemon syncs with only
+    /// the FVK, so a server compromise cannot move funds. Returns `None` if the bytes
+    /// are not a valid full viewing key.
+    pub fn from_fvk(fvk_bytes: &[u8; 96]) -> Option<Self> {
+        let fvk = FullViewingKey::from_bytes(fvk_bytes)?;
+        let ivk = fvk.to_ivk(Scope::External);
+        let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        Some(Self {
+            ivk,
+            fvk,
+            my_address,
+            tree: CommitmentTree::empty(),
+            base_frontier: Frontier::empty(),
+            base_size: 0,
+            leaves: Vec::new(),
+            notes: Vec::new(),
+            size: 0,
+        })
+    }
+
+    /// This wallet's full viewing key. Grants viewing (not spend) capability; the
+    /// non-custodial payment builder needs it to construct the proof.
+    pub fn fvk(&self) -> &FullViewingKey {
+        &self.fvk
+    }
+
     /// Build a wallet that **fast-syncs** from a checkpoint frontier: the tree starts
     /// at the checkpoint's leaf count, and only leaves appended *after* the checkpoint
     /// are scanned and stored — so sync cost is O(blocks since the checkpoint), not
@@ -480,6 +511,47 @@ mod tests {
         assert_eq!(db.notes().len(), 1, "only the wallet's own coinbase note is tracked");
         assert_eq!(db.balance(), 5_000);
         assert_eq!(db.notes()[0].position, 0, "our note is leaf 0 (first coinbase note)");
+    }
+
+    /// A **watch-only** wallet loaded from just the FVK discovers exactly the same
+    /// owned notes, positions, balance and tip anchor as the seed wallet — proving the
+    /// non-custodial server can sync with no spend authority.
+    #[test]
+    fn watch_only_fvk_sees_same_notes_as_seed() {
+        let mine = [7u8; 32];
+        let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(mine)).unwrap();
+        let fvk_bytes = FullViewingKey::from(&sk).to_bytes();
+
+        let mut seed_db = WalletDb::from_seed(mine).unwrap();
+        let mut watch_db = WalletDb::from_fvk(&fvk_bytes).unwrap();
+
+        // Same block stream into both: our notes at index 1 of each block, behind decoys.
+        let blocks = [
+            (coinbase_for(address_of([1u8; 32]), b"b1||0", 1_000), coinbase_for(address_of(mine), b"b1||1", 2_000)),
+            (coinbase_for(address_of([9u8; 32]), b"b2||0", 3_000), coinbase_for(address_of(mine), b"b2||1", 4_000)),
+        ];
+        for (a, b) in blocks {
+            seed_db.ingest_block(&[a.clone(), b.clone()], &[]);
+            watch_db.ingest_block(&[a, b], &[]);
+        }
+
+        assert_eq!(watch_db.balance(), seed_db.balance());
+        assert_eq!(watch_db.balance(), 6_000, "both owned notes discovered watch-only");
+        assert_eq!(watch_db.notes().len(), seed_db.notes().len());
+        assert_eq!(watch_db.anchor(), seed_db.anchor(), "same tip anchor");
+        for (w, s) in watch_db.notes().iter().zip(seed_db.notes()) {
+            assert_eq!(w.position, s.position);
+            assert_eq!(w.value(), s.value());
+            // The watch-only wallet can build the identical spend witness (a proof
+            // input) — it just can't sign the spend.
+            let pw = watch_db.witness_path(w.position).expect("watch-only witness");
+            let ps = seed_db.witness_path(s.position).expect("seed witness");
+            let cw = ExtractedNoteCommitment::from(w.note.commitment());
+            let cs = ExtractedNoteCommitment::from(s.note.commitment());
+            assert_eq!(pw.root(cw), ps.root(cs), "identical witness root");
+        }
+        // The FVK the watch-only wallet exposes matches the seed's FVK.
+        assert_eq!(watch_db.fvk().to_bytes(), fvk_bytes);
     }
 
     /// The wallet's mirrored anchor tracks the consensus `GlobalTree` anchor leaf

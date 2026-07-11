@@ -47,7 +47,7 @@ use kaspa_shielded_core::message::{FVK_LEN, SIG_LEN, sign_message, verify_messag
 use kaspa_shielded_core::orchard_recipient_bytes;
 use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
-use kaspa_shielded_core::wallet::build::build_wallet_payment;
+use kaspa_shielded_core::wallet::build::{build_wallet_payment, finalize_payment, prepare_payment, PreparedPayment};
 use kaspa_shielded_core::walletdb::WalletDb;
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 use serde::{Deserialize, Serialize};
@@ -454,9 +454,16 @@ fn ingest_rpc_block(db: &mut WalletDb, block: &kaspa_rpc_core::RpcBlock) {
 /// One-off full replay up to `ingest_limit` blocks (used by send to root a spend to
 /// a matured anchor, independent of the live tip db).
 async fn scan_to_limit(client: &GrpcClient, seed: [u8; 32], ingest_limit: usize) -> Result<WalletDb, String> {
+    let db = WalletDb::from_seed(seed).ok_or("seed is not a valid Orchard spending key")?;
+    scan_db_to_limit(client, db, ingest_limit).await
+}
+
+/// Scan the chain into a **pre-built** wallet view up to `ingest_limit` blocks past
+/// the pruning point. Shared by the seed ([`scan_to_limit`]) and watch-only (FVK,
+/// non-custodial `/prepare`) paths — the only difference is which key built `db`.
+async fn scan_db_to_limit(client: &GrpcClient, mut db: WalletDb, ingest_limit: usize) -> Result<WalletDb, String> {
     let dag = client.get_block_dag_info().await.map_err(|e| format!("get_block_dag_info failed: {e}"))?;
     let genesis = dag.pruning_point_hash;
-    let mut db = WalletDb::from_seed(seed).ok_or("seed is not a valid Orchard spending key")?;
     let mut low = genesis;
     let mut count = 0usize;
     loop {
@@ -524,7 +531,24 @@ struct AppState {
     allow_default_token: bool,
     /// Secret for encrypting seed files at rest. `None` → seeds stored in plaintext.
     wallet_secret: Option<String>,
+    /// In-flight **non-custodial** payments: a `/api/wallet/prepare` builds the proof
+    /// from a viewing key and parks the awaiting-signature bundle here, keyed by a
+    /// random session id; `/api/wallet/submit` pops it, applies the device's spend-auth
+    /// signatures, and broadcasts. Held in memory only — a restart drops pending
+    /// sessions (the device just re-prepares). The seed is never involved.
+    prepared: Mutex<HashMap<String, PreparedSession>>,
 }
+
+/// A non-custodial payment proven and awaiting on-device spend-auth signatures.
+struct PreparedSession {
+    payment: PreparedPayment,
+    amount: u64,
+    fee: u64,
+    created: std::time::Instant,
+}
+
+/// How long a prepared (unsigned) non-custodial payment lives before it is swept.
+const PREPARED_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl AppState {
     fn address_for(&self, seed: &[u8; 32]) -> Option<String> {
@@ -1034,6 +1058,187 @@ async fn wallet_send(
     }
 }
 
+// ===========================================================================
+// Non-custodial payment: prepare (viewing key only) + submit (device sigs).
+//
+// This is the mobile / hardened path. The device holds the seed and never sends
+// it: it posts only its 96-byte FULL VIEWING KEY to `/prepare`. The daemon scans
+// watch-only, builds the Halo 2 proof, signs the throwaway padding dummies, and
+// returns the payment sighash plus one spend randomizer (`alpha`) per real spend.
+// The device signs each with `ask.randomize(alpha)` (e.g. via firecash-signer) and
+// posts the signatures to `/submit`, which applies them and broadcasts. A server
+// compromise can see balances but CANNOT move funds — it never holds spend authority.
+// The crypto split is proven in shielded-core (`non_custodial_payment_api_roundtrip`).
+// ===========================================================================
+
+#[derive(Deserialize)]
+struct PrepareReq {
+    /// 96-byte full viewing key (hex). Grants viewing capability, not spend.
+    fvk_hex: String,
+    /// Recipient `firecash:` shielded address.
+    to: String,
+    amount_sompi: Option<u64>,
+    amount_fc: Option<f64>,
+    fee: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct SpendAuthReq {
+    /// Action index in the bundle this randomizer authorizes.
+    index: usize,
+    /// 32-byte spend randomizer (hex); the device signs `ask.randomize(alpha)`.
+    alpha: String,
+}
+
+#[derive(Serialize)]
+struct PrepareResp {
+    /// Opaque id to submit the signatures against.
+    session: String,
+    /// 32-byte payment sighash (hex) the device signs.
+    sighash: String,
+    /// Public fee / value balance of the payment.
+    value_balance: i64,
+    amount_sompi: u64,
+    fee_sompi: u64,
+    /// One randomizer per real spend the device must sign.
+    spend_auth: Vec<SpendAuthReq>,
+}
+
+async fn wallet_prepare(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PrepareReq>,
+) -> Result<Json<PrepareResp>, (StatusCode, Json<serde_json::Value>)> {
+    use rand::RngCore;
+
+    // Watch-only: authenticated by possession of the FVK, not a token/seed.
+    let fvk_bytes = unhex(&req.fvk_hex)
+        .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex must be 96 bytes of hex"))?;
+
+    let amount = match (req.amount_sompi, req.amount_fc) {
+        (Some(s), _) => s,
+        (None, Some(fc)) => (fc * SOMPI_PER_FC as f64).round() as u64,
+        (None, None) => return Err(err(StatusCode::BAD_REQUEST, "specify amount_sompi or amount_fc")),
+    };
+    let fee = req.fee.unwrap_or(3_000_000);
+
+    let client = &state.client;
+    let dag =
+        client.get_block_dag_info().await.map_err(|e| err(StatusCode::BAD_GATEWAY, format!("get_block_dag_info failed: {e}")))?;
+    let net: [u8; 32] = dag.pruning_point_hash.as_bytes();
+    let chain_len = dag.virtual_daa_score as usize;
+    let need_len = DEFAULT_ANCHOR_DEPTH as usize + 2;
+    if chain_len <= need_len {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("chain too short ({chain_len} blocks): no note has matured past depth {DEFAULT_ANCHOR_DEPTH} yet"),
+        ));
+    }
+    let ingest_limit = chain_len - need_len;
+
+    let to_addr =
+        Address::try_from(req.to.as_str()).map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid recipient address: {e}")))?;
+    let recipient = orchard_recipient_bytes(&to_addr)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "recipient is not a shielded Orchard address"))?;
+    let need = amount.checked_add(fee).ok_or_else(|| err(StatusCode::BAD_REQUEST, "amount + fee overflows"))?;
+
+    // Watch-only scan: the note set is recovered from the FVK alone (no seed).
+    let db = WalletDb::from_fvk(&fvk_bytes).ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?;
+    log::info!("non-custodial prepare: watch-only scan of up to {ingest_limit} matured blocks...");
+    let db = scan_db_to_limit(client, db, ingest_limit).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Select matured notes (all scanned notes are past the maturity cutoff).
+    let mut candidates = db.notes().to_vec();
+    candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+    let mut inputs = Vec::new();
+    let mut selected = 0u64;
+    for n in &candidates {
+        if selected >= need {
+            break;
+        }
+        let path =
+            db.witness_path(n.position).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+        inputs.push((n.note.clone(), path));
+        selected += n.value();
+    }
+    if selected < need {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("insufficient matured funds: have {selected}, need amount+fee={need} (funds must be ~10 min old to spend)"),
+        ));
+    }
+
+    let ctx = payment_tx_context();
+    log::info!("non-custodial prepare: building Orchard payment proof (Halo 2)...");
+    let payment = prepare_payment(db.fvk(), inputs, recipient, amount, fee, &net, &ctx)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to prepare payment: {e:?}")))?;
+
+    let spend_auth: Vec<SpendAuthReq> =
+        payment.spend_auth_requests.iter().map(|(i, alpha)| SpendAuthReq { index: *i, alpha: hex(alpha) }).collect();
+    let sighash_hex = hex(&payment.sighash);
+    let value_balance = payment.value_balance;
+
+    // Park the awaiting-signature payment under a random, unguessable session id.
+    let mut sid = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut sid);
+    let session = hex(&sid);
+    {
+        let now = std::time::Instant::now();
+        let mut map = state.prepared.lock().await;
+        map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL); // bound memory
+        map.insert(session.clone(), PreparedSession { payment, amount, fee, created: now });
+    }
+
+    Ok(Json(PrepareResp { session, sighash: sighash_hex, value_balance, amount_sompi: amount, fee_sompi: fee, spend_auth }))
+}
+
+#[derive(Deserialize)]
+struct SubmitSig {
+    /// Action index this signature authorizes (echoed from `spend_auth`).
+    index: usize,
+    /// 64-byte RedPallas spend-auth signature (hex).
+    sig: String,
+}
+
+#[derive(Deserialize)]
+struct SubmitReq {
+    /// The `session` returned by `/prepare`.
+    session: String,
+    /// The device's spend-auth signatures, one per `spend_auth` request.
+    sigs: Vec<SubmitSig>,
+}
+
+async fn wallet_submit(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SubmitReq>,
+) -> Result<Json<SendResp>, (StatusCode, Json<serde_json::Value>)> {
+    // Pop the session (single-use); also sweep any expired ones.
+    let session = {
+        let now = std::time::Instant::now();
+        let mut map = state.prepared.lock().await;
+        map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL);
+        map.remove(&req.session)
+    };
+    let PreparedSession { payment, amount, fee, .. } =
+        session.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such prepared session (expired or already submitted)"))?;
+
+    let mut device_sigs: Vec<(usize, [u8; SIG_LEN])> = Vec::with_capacity(req.sigs.len());
+    for s in &req.sigs {
+        let sig = unhex(&s.sig)
+            .and_then(|b| <[u8; SIG_LEN]>::try_from(b.as_slice()).ok())
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "each sig must be 64 bytes of hex"))?;
+        device_sigs.push((s.index, sig));
+    }
+
+    let bundle = finalize_payment(payment, device_sigs)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("could not finalize payment (bad/missing signatures?): {e:?}")))?;
+    let tx: Transaction = payment_tx(bundle.to_bytes());
+    match state.client.submit_transaction(RpcTransaction::from(&tx), false).await {
+        Ok(accepted) => Ok(Json(SendResp { txid: accepted.to_string(), amount_sompi: amount, fee_sompi: fee })),
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payment: {e}"))),
+    }
+}
+
 #[derive(Deserialize)]
 struct SignReq {
     message: String,
@@ -1168,6 +1373,7 @@ async fn main() {
         wallets: Mutex::new(HashMap::new()),
         allow_default_token: cli.allow_default_token,
         wallet_secret,
+        prepared: Mutex::new(HashMap::new()),
     });
 
     tokio::spawn(sync_loop(state.clone()));
@@ -1202,6 +1408,8 @@ async fn main() {
         .route("/api/wallet/reveal", get(wallet_reveal))
         .route("/api/wallet/balance", get(wallet_balance))
         .route("/api/wallet/send", post(wallet_send))
+        .route("/api/wallet/prepare", post(wallet_prepare))
+        .route("/api/wallet/submit", post(wallet_submit))
         .route("/api/wallet/sign", post(wallet_sign))
         .route("/api/verify", post(verify))
         .layer(cors)
