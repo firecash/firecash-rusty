@@ -33,7 +33,8 @@ const SECONDS_PER_MONTH: u64 = 2629800;
 //      `LEGACY_MONTHS_PER_HALVING / SUBSIDY_HALVING_INTERVAL_MONTHS` = 4× faster so a full halving
 //      takes 3 months.
 //   2. Every table value is scaled by `REWARD_SCALE_NUM / REWARD_SCALE_DEN` (then divided by BPS),
-//      setting the initial reward to 6 FC/s (44 FC × 3/22): 6 FC/block at 10 BPS, 60 FC/block at 1 BPS.
+//      setting the initial reward to 60 FC/s per-second-equivalent (44 FC × 3/22 = 6 FC/block at
+//      10 BPS): at the live 1 BPS rate this is 60 FC/block; at 10 BPS it would be 6 FC/block.
 // Once the curve decays below the tail floor, a two-step tail subsidy is paid forever: the curve
 // crosses the tail rate around month 10, so `TAIL_SUBSIDY_INITIAL_PER_SEC_SOMPI` (6 FC/s) is paid up
 // to real month `TAIL_STEP_DOWN_MONTH` (=24), after which it steps down to
