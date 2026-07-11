@@ -319,11 +319,6 @@ struct WalletEntry {
     caught_up: bool,
     scanned: usize,
     chain_len: u64,
-    /// DAA score of the wallet's latest ingested block. `synced` is reported as
-    /// "within `SYNC_MARGIN` of the node tip" using this — the flickery `caught_up`
-    /// almost never latches on a live ~1-block/s chain (a new block lands during
-    /// nearly every sync pass), so it made the UI show "syncing" forever.
-    tip_daa: u64,
     updated_unix: u64,
     error: Option<String>,
     /// `scanned` at the last persisted checkpoint — the sync loop rewrites the
@@ -364,7 +359,6 @@ impl WalletEntry {
             updated_unix: 0,
             error: None,
             saved_scanned: base_scanned,
-            tip_daa: 0,
             block_leaf_counts: VecDeque::new(),
         })
     }
@@ -385,7 +379,6 @@ impl WalletEntry {
             updated_unix: 0,
             error: None,
             saved_scanned: scanned,
-            tip_daa: 0,
             block_leaf_counts: VecDeque::new(),
         }
     }
@@ -407,7 +400,6 @@ impl WalletEntry {
                 }
                 ingest_rpc_block(&mut self.db, block);
                 self.scanned += 1;
-                self.tip_daa = block.header.daa_score.max(self.tip_daa);
                 advanced = true;
                 // Record the block→leaf boundary so `send` can root a spend at a
                 // matured anchor (a real block's tree root) without a rescan.
@@ -715,7 +707,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
             resp.has_wallet = true;
             resp.address = state.address_for(&e.seed);
             let tip = e.chain_len.max(daa_score);
-            resp.synced = e.caught_up || tip.saturating_sub(e.tip_daa) <= SYNC_MARGIN;
+            resp.synced = e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip;
             resp.scanned_blocks = e.scanned;
             resp.chain_len = tip;
             resp.balance_sompi = e.db.balance().to_string();
@@ -888,7 +880,7 @@ async fn wallet_balance(
     Ok(Json(BalanceResp {
         balance_sompi: e.db.balance().to_string(),
         balance_fc: fmt_fc(e.db.balance()),
-        synced: e.caught_up || e.chain_len.saturating_sub(e.tip_daa) <= SYNC_MARGIN,
+        synced: e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= e.chain_len,
         scanned_blocks: e.scanned,
         chain_len: e.chain_len,
         notes,
