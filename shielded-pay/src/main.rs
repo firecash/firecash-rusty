@@ -61,14 +61,24 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Generate a brand-new wallet: a random 32-byte seed and its shielded address.
+    /// Keep the seed secret — whoever holds it controls the funds.
+    New {
+        /// Network prefix: mainnet | testnet | devnet | simnet.
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
     /// Print the bech32 shielded (Orchard) address for a wallet seed on a network —
     /// e.g. to hand to the miner as `--mining-address`.
     Address {
-        /// Seed byte: the 32-byte wallet seed is `[byte; 32]` (matches the test wallets).
+        /// Real 32-byte wallet seed as 64 hex chars.
         #[arg(long)]
-        seed_byte: u8,
+        seed_hex: Option<String>,
+        /// Test convenience: the 32-byte seed is `[byte; 32]`. Prefer `--seed-hex`.
+        #[arg(long)]
+        seed_byte: Option<u8>,
         /// Network prefix: mainnet | testnet | devnet | simnet.
-        #[arg(long, default_value = "devnet")]
+        #[arg(long, default_value = "mainnet")]
         network: String,
     },
     /// Print the node's current virtual DAA score (a proxy for chain height /
@@ -96,9 +106,12 @@ enum Cmd {
         /// kaspad gRPC endpoint (host:port).
         #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
         rpc_server: String,
-        /// Wallet seed byte (32-byte seed is `[byte; 32]`).
+        /// Real 32-byte wallet seed as 64 hex chars.
         #[arg(long)]
-        seed_byte: u8,
+        seed_hex: Option<String>,
+        /// Test convenience: the 32-byte seed is `[byte; 32]`. Prefer `--seed-hex`.
+        #[arg(long)]
+        seed_byte: Option<u8>,
     },
     /// Real wallet payment: scan the chain, pick a **matured** owned note, and pay
     /// `--amount` to `--to`, returning the change to the sender and leaving `--fee`
@@ -108,9 +121,12 @@ enum Cmd {
         /// kaspad gRPC endpoint (host:port).
         #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
         rpc_server: String,
-        /// Wallet seed byte of the sender (the note owner).
+        /// Real 32-byte sender seed as 64 hex chars.
         #[arg(long)]
-        owner_seed_byte: u8,
+        owner_seed_hex: Option<String>,
+        /// Test convenience: the sender seed is `[byte; 32]`. Prefer `--owner-seed-hex`.
+        #[arg(long)]
+        owner_seed_byte: Option<u8>,
         /// Recipient bech32 shielded address.
         #[arg(long)]
         to: String,
@@ -130,9 +146,12 @@ enum Cmd {
     /// a shielded chain, where the address itself carries no verification key) — this
     /// grants note-detection capability but never spend authority.
     Sign {
-        /// Wallet seed byte (32-byte seed is `[byte; 32]`).
+        /// Real 32-byte wallet seed as 64 hex chars.
         #[arg(long)]
-        seed_byte: u8,
+        seed_hex: Option<String>,
+        /// Test convenience: the 32-byte seed is `[byte; 32]`. Prefer `--seed-hex`.
+        #[arg(long)]
+        seed_byte: Option<u8>,
         /// Network prefix: mainnet | testnet | devnet | simnet (scopes the signature).
         #[arg(long, default_value = "mainnet")]
         network: String,
@@ -153,15 +172,18 @@ enum Cmd {
         #[arg(long)]
         sig: String,
     },
-    /// Spend the first coinbase note (tree position 0) minted to `--owner-seed-byte`
+    /// Spend the first coinbase note (tree position 0) minted to the owner wallet
     /// and pay it to `--to`, submitting the shielded transaction over gRPC.
     Pay {
         /// kaspad gRPC endpoint (host:port).
         #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
         rpc_server: String,
-        /// Seed byte of the wallet that mined the coinbase note (the note owner).
+        /// Real 32-byte owner seed as 64 hex chars.
         #[arg(long)]
-        owner_seed_byte: u8,
+        owner_seed_hex: Option<String>,
+        /// Test convenience: the owner seed is `[byte; 32]`. Prefer `--owner-seed-hex`.
+        #[arg(long)]
+        owner_seed_byte: Option<u8>,
         /// Recipient bech32 shielded address (use the `address` subcommand to derive one).
         #[arg(long)]
         to: String,
@@ -184,11 +206,33 @@ fn prefix_from(network: &str) -> Prefix {
     }
 }
 
+/// Resolve a wallet seed from the mutually-exclusive `--seed-hex` (a real 32-byte
+/// hex seed) or `--seed-byte` (the test convenience `[byte; 32]`). Exactly one of the
+/// two must be given.
+fn resolve_seed(seed_hex: Option<String>, seed_byte: Option<u8>) -> [u8; 32] {
+    match (seed_hex, seed_byte) {
+        (Some(_), Some(_)) => fatal("give either --seed-hex or --seed-byte, not both".into()),
+        (None, None) => fatal("a seed is required: pass --seed-hex <64 hex chars> (or --seed-byte <0-255> for a test wallet)".into()),
+        (None, Some(b)) => [b; 32],
+        (Some(h), None) => {
+            let h = h.trim();
+            if h.len() != 64 {
+                fatal("--seed-hex must be exactly 32 bytes (64 hex chars)".into());
+            }
+            let bytes: Vec<u8> = (0..64)
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or_else(|_| fatal("--seed-hex is not valid hex".into())))
+                .collect();
+            bytes.try_into().expect("checked length 32")
+        }
+    }
+}
+
 /// Derive the bech32 shielded address string for a seed on a network. Uses
 /// `String::from(&addr)` (not `Display`, which appends a `(ShieldedOrchard)` tag).
-fn address_string(seed_byte: u8, prefix: Prefix) -> String {
-    let raw = address_bytes_from_seed([seed_byte; 32]).unwrap_or_else(|| {
-        log::error!("seed byte {seed_byte} is not a valid Orchard spending key");
+fn address_string(seed: [u8; 32], prefix: Prefix) -> String {
+    let raw = address_bytes_from_seed(seed).unwrap_or_else(|| {
+        log::error!("seed is not a valid Orchard spending key");
         std::process::exit(1);
     });
     String::from(&Address::new(prefix, Version::ShieldedOrchard, &raw))
@@ -273,11 +317,11 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 
 /// Sign a message with a wallet seed, proving control of the wallet's shielded
 /// address. Offline. Prints the address, the message, and the signature hex.
-fn sign(seed_byte: u8, network: String, message: String) {
+fn sign(seed: [u8; 32], network: String, message: String) {
     let prefix = prefix_from(&network);
     let tag = prefix.to_string();
-    let signed = sign_message([seed_byte; 32], tag.as_bytes(), message.as_bytes(), rand::rngs::OsRng)
-        .unwrap_or_else(|| fatal(format!("seed byte {seed_byte} is not a valid Orchard spending key")));
+    let signed = sign_message(seed, tag.as_bytes(), message.as_bytes(), rand::rngs::OsRng)
+        .unwrap_or_else(|| fatal("seed is not a valid Orchard spending key".into()));
 
     let addr = String::from(&Address::new(prefix, Version::ShieldedOrchard, &signed.address));
     // The signature blob is `fvk (96) || sig (64)`; the fvk binds it to the address.
@@ -411,10 +455,10 @@ fn ingest_rpc_block(db: &mut WalletDb, block: &kaspa_rpc_core::RpcBlock) {
     db.ingest_block(&coinbase_notes, &bundle_refs);
 }
 
-async fn balance(rpc_server: String, seed_byte: u8) {
+async fn balance(rpc_server: String, seed: [u8; 32]) {
     let client = connect(&rpc_server).await;
-    log::info!("scanning accepted chain for notes owned by seed {seed_byte}...");
-    let (db, total) = scan_chain(&client, [seed_byte; 32], None).await;
+    log::info!("scanning accepted chain for notes owned by this wallet...");
+    let (db, total) = scan_chain(&client, seed, None).await;
     log::info!("scanned {total} accepted chain blocks; anchor(tip) = {}", hex32(&db.anchor()));
     println!("balance: {} ({} note(s))", db.balance(), db.notes().len());
     for n in db.notes() {
@@ -422,7 +466,7 @@ async fn balance(rpc_server: String, seed_byte: u8) {
     }
 }
 
-async fn send(rpc_server: String, owner_seed_byte: u8, to: String, amount: u64, fee: u64, anchor_depth: u64) {
+async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64, fee: u64, anchor_depth: u64) {
     let client = connect(&rpc_server).await;
 
     let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
@@ -441,7 +485,7 @@ async fn send(rpc_server: String, owner_seed_byte: u8, to: String, amount: u64, 
     }
     let ingest_limit = chain_len - need_len;
     log::info!("scanning to matured block {ingest_limit}/{chain_len} (anchor_depth {anchor_depth})...");
-    let db = scan_chain(&client, [owner_seed_byte; 32], Some(ingest_limit)).await.0;
+    let db = scan_chain(&client, owner_seed, Some(ingest_limit)).await.0;
 
     let to_addr = Address::try_from(to.as_str()).unwrap_or_else(|e| fatal(format!("invalid --to address {to:?}: {e}")));
     let recipient = orchard_recipient_bytes(&to_addr).unwrap_or_else(|| fatal("--to is not a shielded Orchard address".into()));
@@ -479,7 +523,7 @@ async fn send(rpc_server: String, owner_seed_byte: u8, to: String, amount: u64, 
 
     let ctx = payment_tx_context();
     log::info!("building real Orchard payment proof (Halo 2) — this takes a few seconds...");
-    let payload = build_wallet_payment([owner_seed_byte; 32], inputs, recipient, amount, fee, &net, &ctx)
+    let payload = build_wallet_payment(owner_seed, inputs, recipient, amount, fee, &net, &ctx)
         .unwrap_or_else(|e| fatal(format!("failed to build wallet payment: {e:?}")));
 
     let tx: Transaction = payment_tx(payload);
@@ -494,7 +538,7 @@ async fn send(rpc_server: String, owner_seed_byte: u8, to: String, amount: u64, 
     }
 }
 
-async fn pay(rpc_server: String, owner_seed_byte: u8, to: String, fee: u64) {
+async fn pay(rpc_server: String, owner_seed: [u8; 32], to: String, fee: u64) {
     let client = connect(&rpc_server).await;
 
     // The sighash's network separator is the chain's genesis hash; on a young chain
@@ -526,7 +570,7 @@ async fn pay(rpc_server: String, owner_seed_byte: u8, to: String, fee: u64) {
 
     log::info!("building real Orchard spend proof (Halo 2) — this takes a few seconds...");
     let payload = build_singleleaf_coinbase_spend(
-        [owner_seed_byte; 32],
+        owner_seed,
         note.coinbase_txid.as_bytes(),
         note.out_index,
         note.value,
@@ -556,8 +600,23 @@ async fn pay(rpc_server: String, owner_seed_byte: u8, to: String, fee: u64) {
 async fn main() {
     kaspa_core::log::try_init_logger("info");
     match Cli::parse().cmd {
-        Cmd::Address { seed_byte, network } => {
-            println!("{}", address_string(seed_byte, prefix_from(&network)));
+        Cmd::New { network } => {
+            use rand::RngCore;
+            let prefix = prefix_from(&network);
+            // A random seed that is a valid Orchard spending key (retry the rare miss).
+            let mut seed = [0u8; 32];
+            let address = loop {
+                rand::rngs::OsRng.fill_bytes(&mut seed);
+                if let Some(raw) = address_bytes_from_seed(seed) {
+                    break String::from(&Address::new(prefix, Version::ShieldedOrchard, &raw));
+                }
+            };
+            println!("seed_hex: {}", hex32(&seed));
+            println!("address:  {address}");
+            eprintln!("KEEP THE SEED SECRET. Whoever holds it controls the funds. Pass it to other commands as --seed-hex.");
+        }
+        Cmd::Address { seed_hex, seed_byte, network } => {
+            println!("{}", address_string(resolve_seed(seed_hex, seed_byte), prefix_from(&network)));
         }
         Cmd::Info { rpc_server } => {
             let client = connect(&rpc_server).await;
@@ -578,20 +637,20 @@ async fn main() {
                 println!("{}", Transaction::try_from(entry.transaction).map(|t| t.id().to_string()).unwrap_or_default());
             }
         }
-        Cmd::Balance { rpc_server, seed_byte } => {
-            balance(rpc_server, seed_byte).await;
+        Cmd::Balance { rpc_server, seed_hex, seed_byte } => {
+            balance(rpc_server, resolve_seed(seed_hex, seed_byte)).await;
         }
-        Cmd::Send { rpc_server, owner_seed_byte, to, amount, fee, anchor_depth } => {
-            send(rpc_server, owner_seed_byte, to, amount, fee, anchor_depth).await;
+        Cmd::Send { rpc_server, owner_seed_hex, owner_seed_byte, to, amount, fee, anchor_depth } => {
+            send(rpc_server, resolve_seed(owner_seed_hex, owner_seed_byte), to, amount, fee, anchor_depth).await;
         }
-        Cmd::Sign { seed_byte, network, message } => {
-            sign(seed_byte, network, message);
+        Cmd::Sign { seed_hex, seed_byte, network, message } => {
+            sign(resolve_seed(seed_hex, seed_byte), network, message);
         }
         Cmd::Verify { address, message, sig } => {
             verify(address, message, sig);
         }
-        Cmd::Pay { rpc_server, owner_seed_byte, to, fee } => {
-            pay(rpc_server, owner_seed_byte, to, fee).await;
+        Cmd::Pay { rpc_server, owner_seed_hex, owner_seed_byte, to, fee } => {
+            pay(rpc_server, resolve_seed(owner_seed_hex, owner_seed_byte), to, fee).await;
         }
     }
 }
