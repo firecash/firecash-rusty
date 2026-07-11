@@ -67,6 +67,7 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/firecash-walletd bin/
           cp target/x86_64-unknown-linux-musl/release/shielded-pay bin/
           cp target/x86_64-unknown-linux-musl/release/stratum-bridge bin/
+          cp docs/RELEASE_README.txt bin/README.txt
           archive="bin/firecash-${{ github.event.release.tag_name }}-linux-amd64.zip"
           zip -r "${archive}" ./bin/*
           echo "archive=${archive}" >> $GITHUB_ENV
@@ -86,6 +87,7 @@ jobs:
           cp target/release/firecash-walletd.exe bin/
           cp target/release/shielded-pay.exe bin/
           cp target/release/stratum-bridge.exe bin/
+          cp docs/RELEASE_README.txt bin/README.txt
           archive="bin/firecash-${{ github.event.release.tag_name }}-win64.zip"
           powershell "Compress-Archive bin/* \"${archive}\""
           echo "archive=${archive}" >> $GITHUB_ENV
@@ -104,6 +106,7 @@ jobs:
           cp target/release/firecash-walletd bin/
           cp target/release/shielded-pay bin/
           cp target/release/stratum-bridge bin/
+          cp docs/RELEASE_README.txt bin/README.txt
           # arch-tagged so the arm64 (macos-latest) and x86_64 (macos-13/Intel) archives don't collide.
           archive="bin/firecash-${{ github.event.release.tag_name }}-osx-$(uname -m).zip"
           zip -r "${archive}" ./bin/*
