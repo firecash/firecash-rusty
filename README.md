@@ -109,7 +109,15 @@ needs outbound access to the seed nodes' **p2p port 16111**; its own RPC (16110)
 Everything is on the **shielded (Orchard) pool** — balances and amounts are private.
 `1 $firecash = 100,000,000 sompi`. There are three ways to use a wallet:
 
-- **Web wallet (easiest):** https://wallet.firecash.info — no install.
+- **Web & mobile wallet (easiest):** https://wallet.firecash.info — no install; also
+  packaged as a native iOS/Android app (Capacitor). See
+  [firecash-wallet](https://github.com/firecash/firecash-wallet) / its `MOBILE.md`.
+
+  > **Custody:** in the default hosted mode the daemon holds the seed and *can* spend.
+  > Orchard splits a spend into **prove** (viewing key only) and **sign** (spend key only),
+  > so the seed never has to be on the server — the non-custodial roadmap moves signing to
+  > the device (see `docs/NON_CUSTODIAL_WALLET.md`). Self-hosting the daemon is already
+  > fully non-custodial.
 
 ### `shielded-pay` — CLI wallet
 
