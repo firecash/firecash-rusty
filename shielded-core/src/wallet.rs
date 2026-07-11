@@ -107,9 +107,11 @@ pub mod build {
         circuit::ProvingKey,
         keys::{FullViewingKey, Scope, SpendAuthorizingKey, SpendingKey},
         note::{ExtractedNoteCommitment, Note},
+        primitives::redpallas::{Signature, SpendAuth},
         tree::MerklePath,
         value::NoteValue,
     };
+    use pasta_curves::pallas;
     use rand::{CryptoRng, RngCore};
 
     /// A wallet's Orchard keys, derived from a 32-byte seed.
@@ -434,6 +436,126 @@ pub mod build {
         .to_bytes())
     }
 
+    // ============================================================================
+    // Non-custodial payment: the Orchard prove/sign split as a reusable API.
+    //
+    // `prepare_payment` runs on a SERVER that holds only the full viewing key — it
+    // builds the bundle, creates the Halo 2 proof, and signs any throwaway padding
+    // dummies, but it CANNOT authorize the real spends. It hands the device a sighash
+    // plus one randomizer per real spend. The device runs `sign_spend_auth` with the
+    // spend key (which never leaves it) and returns signatures. `finalize_payment`
+    // applies them and emits the wire bundle. The server never sees the spend key.
+    // Proven end-to-end by `non_custodial_payment_api_roundtrip`.
+    // ============================================================================
+
+    /// A payment prepared by the server, awaiting on-device spend-auth signatures.
+    pub struct PreparedPayment {
+        pczt: orchard::pczt::Bundle,
+        /// The 32-byte sighash the device signs.
+        pub sighash: [u8; 32],
+        /// Public fee / value balance of the payment.
+        pub value_balance: i64,
+        /// One `(action_index, alpha)` per real spend the device must authorize.
+        pub spend_auth_requests: Vec<(usize, [u8; 32])>,
+    }
+
+    /// SERVER role (viewing key + proving key only): build + prove a payment and sign
+    /// its padding dummies. Returns the sighash and the per-spend randomizers the
+    /// device must sign. Never sees the spend authority.
+    pub fn prepare_payment(
+        fvk: &FullViewingKey,
+        inputs: Vec<(Note, MerklePath)>,
+        recipient_addr: [u8; 43],
+        amount: u64,
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+    ) -> Result<PreparedPayment, BuildError> {
+        use group::ff::PrimeField;
+
+        let (first_note, first_path) = inputs.first().ok_or(BuildError::Empty)?;
+        let recipient =
+            Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
+        let change_addr = fvk.address_at(0u32, Scope::External);
+        let total_in: u64 = inputs.iter().map(|(n, _)| n.value().inner()).sum();
+        let change = total_in.checked_sub(amount).and_then(|v| v.checked_sub(fee)).ok_or(BuildError::Empty)?;
+        let anchor = first_path.root(ExtractedNoteCommitment::from(first_note.commitment()));
+
+        let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+        for (note, merkle_path) in inputs {
+            builder.add_spend(fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        }
+        builder
+            .add_output(None, recipient, NoteValue::from_raw(amount), [0u8; 512])
+            .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        if change > 0 {
+            builder
+                .add_output(None, change_addr, NoteValue::from_raw(change), [0u8; 512])
+                .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        }
+
+        let pk = ProvingKey::build();
+        let mut rng = rand::rngs::OsRng;
+        let (mut pczt, _meta) = builder.build_for_pczt(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        pczt.create_proof(&pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+
+        let effects = pczt.extract_effects::<i64>().map_err(|e| BuildError::Proof(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
+        let value_balance = *effects.value_balance();
+        let effects_wire = to_wire(&effects, |_| [0u8; 64], Vec::new(), [0u8; 64]);
+        let sighash = crate::verify::sighash(&effects_wire, network_domain, tx_context);
+
+        // Classify each action: throwaway dummy (server signs) vs real spend (device signs).
+        let mut dummies: Vec<(usize, SpendingKey)> = Vec::new();
+        let mut spend_auth_requests: Vec<(usize, [u8; 32])> = Vec::new();
+        for (i, action) in pczt.actions().iter().enumerate() {
+            let spend = action.spend();
+            if let Some(sk) = spend.dummy_sk() {
+                dummies.push((i, sk.clone()));
+            } else if let Some(alpha) = spend.alpha() {
+                spend_auth_requests.push((i, alpha.to_repr()));
+            }
+        }
+        for (i, sk) in dummies {
+            let ask = SpendAuthorizingKey::from(&sk);
+            pczt.actions_mut()[i].sign(sighash, &ask, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+        }
+
+        Ok(PreparedPayment { pczt, sighash, value_balance, spend_auth_requests })
+    }
+
+    /// DEVICE role (spend key only): produce the RedPallas spend-auth signature for one
+    /// real spend, from its `alpha` randomizer and the payment sighash.
+    pub fn sign_spend_auth(ask: &SpendAuthorizingKey, alpha: [u8; 32], sighash: [u8; 32]) -> Option<[u8; 64]> {
+        use group::ff::PrimeField;
+        let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(alpha))?;
+        let mut rng = rand::rngs::OsRng;
+        let sig = ask.randomize(&alpha).sign(&mut rng, &sighash);
+        Some(<[u8; 64]>::from(&sig))
+    }
+
+    /// SERVER role: apply the device's spend-auth signatures, finalize IO, and emit the
+    /// verifiable wire bundle. Still never touches the spend key.
+    pub fn finalize_payment(
+        mut prepared: PreparedPayment,
+        device_sigs: Vec<(usize, [u8; 64])>,
+    ) -> Result<ShieldedBundle, BuildError> {
+        let sighash = prepared.sighash;
+        let mut rng = rand::rngs::OsRng;
+        for (i, sig) in device_sigs {
+            let sig = Signature::<SpendAuth>::from(sig);
+            prepared.pczt.actions_mut()[i].apply_signature(sighash, sig).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+        }
+        prepared.pczt.finalize_io(sighash, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+        let unbound = prepared.pczt.extract::<i64>().map_err(|e| BuildError::Proof(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
+        let authorized = unbound.apply_binding_signature(sighash, &mut rng).ok_or_else(|| BuildError::Proof("binding".into()))?;
+        Ok(to_wire(
+            &authorized,
+            |a| <[u8; 64]>::from(a.authorization()),
+            authorized.authorization().proof().as_ref().to_vec(),
+            <[u8; 64]>::from(authorized.authorization().binding_signature()),
+        ))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -553,6 +675,53 @@ pub mod build {
             assert_eq!(wire.value_balance, 2_000);
         }
 
+        /// The reusable non-custodial API end to end, WITH change (so the bundle carries
+        /// a padding dummy the server signs and a real spend the device signs).
+        #[test]
+        fn non_custodial_payment_api_roundtrip() {
+            let keys = ShieldedKeys::from_seed([7u8; 32]).unwrap();
+            let net = [0x55u8; 32];
+            let ctx = b"firecash-nc-api";
+
+            let rho = Option::<Rho>::from(Rho::from_bytes(&canon(3))).unwrap();
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(4), &rho)).unwrap();
+            let note =
+                Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
+            let auth_path: [MerkleHashOrchard; 32] =
+                core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+            let merkle_path = MerklePath::from_parts(0, auth_path);
+            let recipient = ShieldedKeys::from_seed([8u8; 32]).unwrap().address();
+
+            // SERVER (viewing key only): pay 6_000, fee 1_000 → change 3_000.
+            let prepared = prepare_payment(
+                &keys.fvk,
+                vec![(note, merkle_path)],
+                recipient.to_raw_address_bytes(),
+                6_000,
+                1_000,
+                &net,
+                ctx,
+            )
+            .expect("prepare");
+            assert_eq!(prepared.value_balance, 1_000);
+            assert_eq!(prepared.spend_auth_requests.len(), 1, "exactly one real spend to authorize");
+            let sh = prepared.sighash;
+
+            // DEVICE (spend key only): sign each requested spend.
+            let ask = SpendAuthorizingKey::from(&keys.sk);
+            let device_sigs: Vec<(usize, [u8; 64])> = prepared
+                .spend_auth_requests
+                .iter()
+                .map(|(i, alpha)| (*i, sign_spend_auth(&ask, *alpha, sh).expect("device sign")))
+                .collect();
+
+            // SERVER: finalize + verify.
+            let wire = finalize_payment(prepared, device_sigs).expect("finalize");
+            let msg = crate::verify::sighash(&wire, &net, ctx);
+            crate::verify::verify_bundle(&wire, &msg).expect("non-custodial payment must verify");
+            assert_eq!(wire.value_balance, 1_000);
+        }
+
         /// The full loop: the wallet builds a real shielded bundle, and the
         /// consensus verifier accepts it under the same sighash.
         #[test]
@@ -599,4 +768,7 @@ pub mod build {
 }
 
 #[cfg(feature = "circuit")]
-pub use build::{BuildError, ShieldedKeys, build_output_only_bundle, build_payment_bundle, build_spend_bundle, to_wire};
+pub use build::{
+    BuildError, PreparedPayment, ShieldedKeys, build_output_only_bundle, build_payment_bundle, build_spend_bundle,
+    finalize_payment, prepare_payment, sign_spend_auth, to_wire,
+};
