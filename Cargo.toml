@@ -378,6 +378,38 @@ lto = "thin"
 strip = true
 overflow-checks = true
 
+# Halo 2 proving is the wallet's dominant cost (seconds per payment). These crates
+# are audited constant-time field/curve arithmetic that relies on wrapping ops, so
+# the workspace's `overflow-checks = true` buys no safety there and taxes every
+# multiplication. Build them for speed: full opt, one codegen unit, no checks.
+[profile.release.package.halo2_proofs]
+opt-level = 3
+codegen-units = 1
+overflow-checks = false
+
+[profile.release.package.halo2_gadgets]
+opt-level = 3
+codegen-units = 1
+overflow-checks = false
+
+[profile.release.package.pasta_curves]
+opt-level = 3
+codegen-units = 1
+overflow-checks = false
+
+[profile.release.package.orchard]
+opt-level = 3
+codegen-units = 1
+overflow-checks = false
+
+[profile.release.package.ff]
+opt-level = 3
+overflow-checks = false
+
+[profile.release.package.group]
+opt-level = 3
+overflow-checks = false
+
 [profile.heap]
 inherits = "release"
 debug = true

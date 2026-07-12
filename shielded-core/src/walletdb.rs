@@ -107,6 +107,19 @@ pub struct WalletDb {
     /// Number of leaves ingested so far, absolute (`base_size + leaves.len()`) — the
     /// next leaf's position.
     size: u64,
+    /// Live membership witnesses for owned notes, held at exactly
+    /// [`witnessed_upto`](Self::witnessed_upto) leaves — i.e. **lagging at the matured
+    /// anchor**, which is where a spend must root anyway. Rebuilding a witness on
+    /// demand costs a full replay of the leaf stream (Sinsemilla hashing: ~21s over a
+    /// 174K-leaf chain, *per note* — the dominant cost of a send, dwarfing the ~7s
+    /// Halo 2 proof). Advancing these incrementally as the wallet syncs makes a spend's
+    /// witness lookup O(1).
+    witnesses: Vec<(u64, IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>)>,
+    /// The tree at exactly `witnessed_upto` leaves — the state a newly matured note's
+    /// witness is snapshotted from. (`tree` mirrors the *tip*; this one lags.)
+    lag_tree: CommitmentTree<MerkleHashOrchard, TREE_DEPTH>,
+    /// Absolute leaf count `witnesses` / `lag_tree` include.
+    witnessed_upto: u64,
     /// Every nullifier revealed by an **applied** bundle in this wallet's stream.
     /// Mirrors the consensus drop rule (PLAN §2.4): a bundle any of whose
     /// nullifiers was already spent is DROPPED — it appends no leaves. Without
@@ -116,6 +129,11 @@ pub struct WalletDb {
     /// and shifts every later leaf position off the consensus tree.
     spent_nullifiers: HashSet<[u8; 32]>,
 }
+
+/// How many owned notes keep a live witness. Beyond this, advancing every witness on
+/// every leaf would reintroduce the O(N·k) scan that once made a wallet op take 33
+/// minutes; the excess notes fall back to the on-demand rebuild.
+const MAX_LIVE_WITNESSES: usize = 256;
 
 impl WalletDb {
     /// Build a wallet view from a 32-byte seed. Returns `None` if the seed is not
@@ -135,6 +153,9 @@ impl WalletDb {
             leaves: Vec::new(),
             notes: Vec::new(),
             size: 0,
+            witnesses: Vec::new(),
+            lag_tree: CommitmentTree::empty(),
+            witnessed_upto: 0,
             spent_nullifiers: HashSet::new(),
         })
     }
@@ -161,6 +182,9 @@ impl WalletDb {
             leaves: Vec::new(),
             notes: Vec::new(),
             size: 0,
+            witnesses: Vec::new(),
+            lag_tree: CommitmentTree::empty(),
+            witnessed_upto: 0,
             spent_nullifiers: HashSet::new(),
         })
     }
@@ -208,6 +232,9 @@ impl WalletDb {
         self.base_frontier = gt.frontier().clone();
         self.base_size = gt.size();
         self.tree = CommitmentTree::from_frontier(&self.base_frontier);
+        self.lag_tree = CommitmentTree::from_frontier(&self.base_frontier);
+        self.witnessed_upto = self.base_size;
+        self.witnesses.clear();
         self.size = self.base_size;
         Some(())
     }
@@ -308,6 +335,57 @@ impl WalletDb {
     /// advance the tip mirror, and — if it is a note we own — remember it (no
     /// witness is built here; that is deferred to [`Self::witness_path`]). This is
     /// O(1) amortised per leaf, so a full scan is O(N), not O(N²).
+    /// Advance the live witnesses (and the tree they hang off) to exactly
+    /// `target_leaves` absolute leaves — the **matured** leaf count a spend must root
+    /// at. The sync loop calls this as it ingests, so by the time the user presses
+    /// Send, every spendable note's witness already exists and
+    /// [`witness_path_at`](Self::witness_path_at) is a lookup instead of a full
+    /// Sinsemilla replay of the chain.
+    ///
+    /// Costs one tree append per leaf plus one witness append per live witness — all
+    /// O(1) amortized — so a full sync stays linear. Witnesses are only held for the
+    /// first [`MAX_LIVE_WITNESSES`] owned notes; a wallet with more than that (a miner
+    /// accumulating thousands of coinbase notes) falls back to the on-demand rebuild
+    /// for the excess rather than paying `k` appends per leaf forever.
+    pub fn advance_witnesses(&mut self, target_leaves: u64) {
+        let target = target_leaves.min(self.size);
+        let start = self.witnessed_upto.max(self.base_size);
+        if target <= start {
+            return;
+        }
+        // A spent note's witness is dead weight — drop it before advancing the rest.
+        let live: HashSet<u64> = self.notes.iter().map(|n| n.position).collect();
+        self.witnesses.retain(|(pos, _)| live.contains(pos));
+
+        for abs in start..target {
+            let Some(&leaf) = self.leaves.get((abs - self.base_size) as usize) else { break };
+            // Every already-open witness must see every later leaf...
+            for (_, w) in self.witnesses.iter_mut() {
+                let _ = w.append(leaf);
+            }
+            // ...and the lagging tree, which is what a newly matured note's witness is
+            // snapshotted from (it then witnesses exactly the leaf just appended).
+            let _ = self.lag_tree.append(leaf);
+            if live.contains(&abs) && self.witnesses.len() < MAX_LIVE_WITNESSES {
+                if let Some(w) = IncrementalWitness::from_tree(self.lag_tree.clone()) {
+                    self.witnesses.push((abs, w));
+                }
+            }
+        }
+        self.witnessed_upto = target;
+    }
+
+    /// The live witness for `position`, if one is held **at exactly** `matured_leaves`.
+    fn live_witness_path(&self, position: u64, matured_leaves: u64) -> Option<MerklePath> {
+        if self.witnessed_upto != matured_leaves {
+            return None;
+        }
+        let (_, w) = self.witnesses.iter().find(|(p, _)| *p == position)?;
+        let path = w.path()?;
+        let auth: [MerkleHashOrchard; TREE_DEPTH as usize] = path.path_elems().try_into().ok()?;
+        Some(MerklePath::from_parts(u64::from(path.position()) as u32, auth))
+    }
+
     fn append_leaf(&mut self, cmx: ExtractedNoteCommitment, owned: Option<Note>) {
         let leaf = MerkleHashOrchard::from_cmx(&cmx);
         self.leaves.push(leaf);
@@ -344,6 +422,11 @@ impl WalletDb {
     /// has ingested. The resulting path's root equals the tree root at that matured
     /// block, which consensus accepts as a finalized anchor (`is_shielded_anchor_final`).
     pub fn witness_path_at(&self, position: u64, matured_leaves: u64) -> Option<MerklePath> {
+        // Fast path: the sync loop already advanced a live witness to this exact
+        // matured cutoff, so the path is a lookup rather than a full replay.
+        if let Some(path) = self.live_witness_path(position, matured_leaves) {
+            return Some(path);
+        }
         // Both absolute; the wallet only stores leaves after `base_size`.
         let rel = position.checked_sub(self.base_size)? as usize;
         let matured_rel = matured_leaves.checked_sub(self.base_size)? as usize;
@@ -476,6 +559,9 @@ impl WalletDb {
         };
         db.base_frontier = base_frontier;
         db.base_size = base_size;
+        db.lag_tree = CommitmentTree::from_frontier(&db.base_frontier);
+        db.witnessed_upto = base_size;
+        db.witnesses.clear();
         db.tree = CommitmentTree::from_frontier(&db.base_frontier);
 
         let size = r.u64()?;
@@ -619,6 +705,59 @@ mod tests {
         }
         // The FVK the watch-only wallet exposes matches the seed's FVK.
         assert_eq!(watch_db.fvk().to_bytes(), fvk_bytes);
+    }
+
+    /// The live (incrementally advanced) witness must be byte-for-byte the witness the
+    /// on-demand rebuild produces — a spend roots at it, so any divergence would mint an
+    /// unspendable note. Checked at several maturity cutoffs, with our notes interleaved
+    /// among other people's leaves.
+    #[test]
+    fn live_witness_matches_rebuilt_witness() {
+        let mine = [21u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+
+        // 12 blocks; ours at blocks 2, 5 and 9, each behind a stranger's note.
+        for b in 0..12u8 {
+            let tag = [b, b, b, b];
+            let theirs = coinbase_for(address_of([b.wrapping_add(1); 32]), &tag, 100 + b as u64);
+            if b == 2 || b == 5 || b == 9 {
+                let ours = coinbase_for(address_of(mine), &[b, 9, 9, 9], 1_000 + b as u64);
+                db.ingest_block(&[theirs, ours], &[]);
+            } else {
+                db.ingest_block(&[theirs], &[]);
+            }
+        }
+        assert_eq!(db.notes().len(), 3);
+
+        // Cutoffs inside the stream (a matured anchor always lags the tip).
+        let n = db.size();
+        for cutoff in [n - 3, n - 1, n] {
+            // Rebuild-only reference (a pristine wallet replaying the same stream never
+            // calls advance_witnesses, so it always takes the on-demand path).
+            let mut fresh = WalletDb::from_seed(mine).unwrap();
+            fresh.leaves = db.leaves.clone();
+            fresh.notes = db.notes.to_vec();
+            fresh.size = db.size;
+            fresh.tree = db.tree.clone();
+
+            let mut live = WalletDb::from_seed(mine).unwrap();
+            live.leaves = db.leaves.clone();
+            live.notes = db.notes.to_vec();
+            live.size = db.size;
+            live.tree = db.tree.clone();
+            live.advance_witnesses(cutoff);
+
+            for n in db.notes() {
+                if n.position >= cutoff {
+                    continue;
+                }
+                let want = fresh.witness_path_at(n.position, cutoff).expect("rebuilt witness");
+                let got = live.witness_path_at(n.position, cutoff).expect("live witness");
+                let cm = ExtractedNoteCommitment::from(n.note.commitment());
+                assert_eq!(got.root(cm), want.root(cm), "same anchor at cutoff {cutoff}, position {}", n.position);
+                assert_eq!(got.auth_path(), want.auth_path(), "same authentication path");
+            }
+        }
     }
 
     /// A checkpoint carries tree + notes but no key material, so a watch-only wallet

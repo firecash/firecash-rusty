@@ -683,8 +683,26 @@ impl WalletEntry {
                 break;
             }
         }
+        // Keep every spendable note's Merkle witness advanced to the anchor a spend will
+        // actually root at, here in the background — so pressing Send costs a lookup, not
+        // a full Sinsemilla replay of the chain (measured: 21s per note, and a send needs
+        // one per input note).
+        self.advance_spend_witnesses();
         self.error = None;
         self.updated_unix = now_unix();
+    }
+
+    /// The newest chain-block boundary at least `anchor_depth + slack` blue units below
+    /// the sink: the matured, canonical anchor a spend roots at.
+    fn matured_leaves(&self) -> Option<u64> {
+        let cutoff_blue = self.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
+        self.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, leaves)| leaves)
+    }
+
+    fn advance_spend_witnesses(&mut self) {
+        if let Some(matured) = self.matured_leaves() {
+            self.db.advance_witnesses(matured);
+        }
     }
 }
 
@@ -1375,7 +1393,10 @@ async fn wallet_send(
     // score). The entry lock is held only for selection + witness building.
     let mut planned: Option<(Vec<(Vec<_>, u64, Vec<u64>)>, u64, bool)> = None;
     {
-        let e = w.lock().await;
+        let mut e = w.lock().await;
+        // Top up the live witnesses to the current matured anchor (a no-op unless a
+        // block landed since the last sync tick), so witnessing below is a lookup.
+        e.advance_spend_witnesses();
         let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
             let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
@@ -1663,8 +1684,9 @@ async fn wallet_prepare(
     let mut have_total: Option<u64> = None;
     if let Ok(token) = token_from(&headers, state.allow_default_token) {
         if let Some(w) = state.get_wallet(&token).await {
-            let e = w.lock().await;
+            let mut e = w.lock().await;
             if e.db.fvk().to_bytes() == fvk_bytes {
+                e.advance_spend_witnesses();
                 let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
                     let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
