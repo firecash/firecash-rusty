@@ -307,6 +307,40 @@ async fn follow(state: Arc<AppState>) {
 
 // ---- REST handlers ----
 
+/// Public network overview: how many nodes this node can see. `nodes` counts the
+/// node itself plus its unique connected peer addresses; peer IPs are masked to
+/// /24 (privacy-first chain — the count is the story, not who runs them).
+async fn info_network(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    match s.client.get_connected_peer_info().await {
+        Ok(resp) => {
+            let peers = resp.peer_info;
+            let mut ips: Vec<String> = peers
+                .iter()
+                .map(|p| {
+                    let ip = p.address.ip.to_string();
+                    match ip.rsplit_once('.') {
+                        Some((net, _)) => format!("{net}.x"),
+                        None => "ipv6".to_string(),
+                    }
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            ips.sort();
+            let versions: Vec<String> =
+                peers.iter().map(|p| p.user_agent.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            Json(json!({
+                "nodes": ips.len() + 1, // unique peers + this node
+                "connectedPeers": peers.len(),
+                "peerNets": ips,
+                "userAgents": versions,
+            }))
+            .into_response()
+        }
+        Err(e) => err(e.to_string()),
+    }
+}
+
 async fn info_blockdag(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     match s.client.get_block_dag_info().await {
         Ok(d) => Json(json!({
@@ -667,6 +701,7 @@ async fn main() {
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
     let app = Router::new()
         .route("/info/blockdag", get(info_blockdag))
+        .route("/info/network", get(info_network))
         .route("/info/coinsupply", get(info_coinsupply))
         .route("/info/blockreward", get(info_blockreward))
         .route("/info/halving", get(info_halving))

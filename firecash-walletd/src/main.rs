@@ -68,10 +68,17 @@ const PAGES_PER_CHUNK: usize = 4;
 const SHIELDED_PAGE: u64 = 200;
 /// Blue-score margin the sync holds back from the sink before ingesting a chain
 /// block. The wallet's tree is append-only (no rollback), so it must not ingest a
-/// block that a routine near-tip reorg could still replace; anything deeper is
-/// settled. A reorg deeper than this margin sets `reorged` and triggers a clean
-/// rescan instead of silent divergence.
-const SYNC_TIP_MARGIN: u64 = 20;
+/// block that a routine near-tip reorg could still replace. Blue score advances
+/// roughly with the DAG block rate, so on a wide DAG a small margin is only
+/// seconds of depth — 20 was observed thrashing live (dozens of reorg evictions
+/// per hour). 200 ≈ 2–3 minutes of settling; balances simply lag the tip by
+/// that much. A reorg deeper than this margin triggers a rescan.
+const SYNC_TIP_MARGIN: u64 = 200;
+/// How many consecutive sync passes must see the cursor off the selected chain
+/// before the wallet is evicted and rescanned. The virtual chain flips
+/// transiently near the tip; a single `reorged` response is usually stale within
+/// a pass or two, and a rescan costs the whole scan history.
+const REORG_STRIKES: u32 = 3;
 /// Extra blue-score slack under the consensus anchor-maturity depth when picking
 /// the anchor a spend roots at, so it stays matured while the tx awaits merging.
 const ANCHOR_SLACK: u64 = 30;
@@ -429,10 +436,11 @@ struct WalletEntry {
     /// The sink's blue score from the latest sync response — the reference the
     /// matured cutoff is measured against.
     sink_blue: u64,
-    /// Set when the chain reorged below `low` (deeper than [`SYNC_TIP_MARGIN`]):
-    /// the append-only wallet tree cannot roll back, so the sync loop discards
-    /// the checkpoint and reloads this wallet from scratch.
-    reorged: bool,
+    /// Consecutive sync passes that saw the cursor off the selected chain
+    /// (deeper reorg than [`SYNC_TIP_MARGIN`]). Transient virtual flips clear on
+    /// retry; at [`REORG_STRIKES`] the sync loop discards the checkpoint and
+    /// reloads this wallet from scratch (the append-only tree cannot roll back).
+    reorged_strikes: u32,
 }
 
 /// How many chain-block→leaf boundaries [`WalletEntry`] keeps. Anchor maturity is
@@ -473,7 +481,7 @@ impl WalletEntry {
             saved_scanned: scanned,
             boundaries,
             sink_blue,
-            reorged: false,
+            reorged_strikes: 0,
         }
     }
 
@@ -490,7 +498,7 @@ impl WalletEntry {
                     // Distinguish "cursor no longer known" (pruned / relaunched —
                     // needs a rescan) from a transient node failure.
                     if client.get_block(self.low, false).await.is_err() && client.get_block_dag_info().await.is_ok() {
-                        self.reorged = true;
+                        self.reorged_strikes = REORG_STRIKES;
                         self.error = Some("wallet cursor no longer known to the node; rescanning".into());
                     } else {
                         self.error = Some(format!("get_shielded_blocks failed: {e}"));
@@ -499,10 +507,13 @@ impl WalletEntry {
                 }
             };
             if resp.reorged {
-                self.reorged = true;
-                self.error = Some("chain reorged below the wallet cursor; rescanning".into());
+                // Usually a transient virtual flip near the tip: retry a few
+                // passes before paying for a full rescan.
+                self.reorged_strikes += 1;
+                self.error = Some("chain reorged below the wallet cursor; retrying".into());
                 return;
             }
+            self.reorged_strikes = 0;
             self.sink_blue = resp.sink_blue_score;
             let settled = resp.sink_blue_score.saturating_sub(SYNC_TIP_MARGIN);
             let mut advanced = false;
@@ -751,13 +762,17 @@ async fn sync_loop(state: Arc<AppState>) {
                 let was_caught_up = e.caught_up;
                 e.caught_up = false;
                 e.sync_chunk(&state.client).await;
-                if e.reorged {
+                if e.reorged_strikes >= REORG_STRIKES {
                     // The append-only tree cannot roll back a deep reorg: discard
                     // the checkpoint and evict the wallet; the next request reloads
                     // it cleanly (fast-sync or full scan).
                     log::warn!("wallet '{token}': deep reorg below cursor — discarding checkpoint and rescanning");
                     let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
                     reorged_tokens.push(token.clone());
+                    continue;
+                }
+                if e.reorged_strikes > 0 {
+                    any_behind = true;
                     continue;
                 }
                 if !e.caught_up {
