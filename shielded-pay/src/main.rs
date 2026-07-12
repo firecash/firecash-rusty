@@ -33,8 +33,9 @@ use clap::{Parser, Subcommand};
 use kaspa_addresses::{Address, Prefix, Version};
 use kaspa_consensus_core::tx::{Transaction, TX_VERSION_SHIELDED};
 use kaspa_grpc_client::GrpcClient;
-use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode, RpcHash, RpcTransaction};
-use kaspa_shielded_core::bundle::ShieldedBundle;
+use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode, RpcHash, RpcShieldedChainBlock, RpcTransaction};
+use kaspa_shielded_core::bundle::{expected_wire_len, ShieldedBundle};
+use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::coinbase::derive_coinbase_note_desc;
 use kaspa_shielded_core::message::{sign_message, verify_message, FVK_LEN, SIG_LEN};
 use kaspa_shielded_core::orchard_recipient_bytes;
@@ -376,90 +377,91 @@ fn verify(address: String, message: String, sig: String) {
 /// linear chain (blue_score == index) that is exactly consensus's accepted set and
 /// order. Handling wide-DAG mergeset acceptance order is the remaining item in the
 /// real-wallet task.
-async fn scan_chain(client: &GrpcClient, seed: [u8; 32], ingest_blocks: Option<usize>) -> (WalletDb, usize) {
+async fn scan_chain(client: &GrpcClient, seed: [u8; 32], matured_margin: Option<u64>) -> (WalletDb, usize) {
     let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
-    let genesis = dag.pruning_point_hash;
+    let start = dag.pruning_point_hash;
 
     let mut db = WalletDb::from_seed(seed).unwrap_or_else(|| fatal("seed is not a valid Orchard spending key".into()));
-    let limit = ingest_blocks.unwrap_or(usize::MAX);
+    // Anchor the tree at the pruning-point frontier so absolute leaf positions are
+    // right even after pruning advances past genesis.
+    let ts = client
+        .get_shielded_tree_state(Some(start))
+        .await
+        .unwrap_or_else(|e| fatal(format!("get_shielded_tree_state({start}) failed: {e} — node too old? update it")));
+    if ts.block_hash != start {
+        fatal("node ignored the explicit tree-state checkpoint (update the node)".into());
+    }
+    let fs = FrontierState {
+        size: ts.size,
+        leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+        ommers: ts.ommers.iter().map(|h| h.as_bytes()).collect(),
+    };
+    db.apply_frontier(&fs).unwrap_or_else(|| fatal("inconsistent pruning-point frontier".into()));
 
-    // Page through the chain with the batch `get_blocks` RPC (each call returns many
-    // blocks in topological order after `low`), rather than one round-trip per block.
-    // On a linear chain that order is the accepted-note order consensus uses.
-    let mut low = genesis;
+    let mut low = start;
     let mut count = 0usize;
     loop {
-        if count >= limit {
-            break;
-        }
         let resp = client
-            .get_blocks(Some(low), true, true)
+            .get_shielded_blocks(low, 500)
             .await
-            .unwrap_or_else(|e| fatal(format!("get_blocks from {low} failed: {e}")));
+            .unwrap_or_else(|e| fatal(format!("get_shielded_blocks from {low} failed: {e}")));
+        if resp.reorged {
+            fatal("chain reorged during the scan; retry".into());
+        }
+        // `matured_margin = Some(m)` stops `m` blue-score units below the sink, so
+        // every recovered note is matured and the wallet's anchor is a matured,
+        // canonical chain-block root a spend may prove against.
+        let cutoff = matured_margin.map(|m| resp.sink_blue_score.saturating_sub(m)).unwrap_or(u64::MAX);
         let mut advanced = false;
-        for (hash, block) in resp.block_hashes.iter().zip(resp.blocks.iter()) {
-            // Skip the page anchor (`low`, re-sent as the first element) and genesis.
-            if *hash == low || *hash == genesis {
-                continue;
+        for b in &resp.blocks {
+            if b.blue_score > cutoff {
+                return (db, count);
             }
-            if count >= limit {
-                break;
-            }
-            ingest_rpc_block(&mut db, block);
+            ingest_shielded_chain_block(&mut db, b);
+            low = b.hash;
             count += 1;
             advanced = true;
         }
-        let last = resp.block_hashes.last().copied();
-        match last {
-            Some(h) if h != low && advanced => low = h,
-            _ => break, // no progress -> reached the tip
+        if !advanced {
+            return (db, count);
         }
     }
-    (db, count)
 }
 
-/// Feed one RPC block's shielded effects into the wallet in consensus order:
-/// coinbase notes (each output's `(recipient, txid||index)` derivation, exactly as
-/// consensus mints them), then the block's accepted shielded (v2) transactions.
-fn ingest_rpc_block(db: &mut WalletDb, block: &kaspa_rpc_core::RpcBlock) {
+/// Feed one chain block's shielded effects into the wallet — the node already
+/// assembled them (`GetShieldedBlocks`) exactly as the consensus §2.4 transition
+/// applied them: the block's own coinbase notes first, then each accepted
+/// (post-retain) bundle's actions in consensus order.
+fn ingest_shielded_chain_block(db: &mut WalletDb, blk: &RpcShieldedChainBlock) {
     let mut coinbase_notes = Vec::new();
-    if let Some(cb) = block.transactions.first() {
-        let txid = cb
-            .verbose_data
-            .as_ref()
-            .unwrap_or_else(|| fatal("coinbase tx missing verbose_data (transaction id)".into()))
-            .transaction_id;
-        for (i, out) in cb.outputs.iter().enumerate() {
-            let script = out.script_public_key.script();
-            if script.len() >= ORCHARD_SCRIPT_LEN {
-                let mut recipient = [0u8; ORCHARD_SCRIPT_LEN];
-                recipient.copy_from_slice(&script[..ORCHARD_SCRIPT_LEN]);
-                let mut note_seed = Vec::with_capacity(36);
-                note_seed.extend_from_slice(&txid.as_bytes());
-                note_seed.extend_from_slice(&(i as u32).to_le_bytes());
-                coinbase_notes.push((derive_coinbase_note_desc(recipient, &note_seed), out.value));
-            }
+    for (i, out) in blk.coinbase_outputs.iter().enumerate() {
+        if out.script_public_key.len() >= ORCHARD_SCRIPT_LEN {
+            let mut recipient = [0u8; ORCHARD_SCRIPT_LEN];
+            recipient.copy_from_slice(&out.script_public_key[..ORCHARD_SCRIPT_LEN]);
+            let mut note_seed = Vec::with_capacity(36);
+            note_seed.extend_from_slice(&blk.coinbase_txid.as_bytes());
+            note_seed.extend_from_slice(&(i as u32).to_le_bytes());
+            coinbase_notes.push((derive_coinbase_note_desc(recipient, &note_seed), out.value));
         }
     }
-
-    let mut bundles = Vec::new();
-    for tx in block.transactions.iter().skip(1) {
-        if tx.version == TX_VERSION_SHIELDED {
-            match ShieldedBundle::from_bytes(&tx.payload) {
-                Ok(b) => bundles.push(b),
-                Err(e) => log::warn!("skipping undecodable shielded payload: {e:?}"),
-            }
-        }
-    }
+    let bundles: Vec<ShieldedBundle> = blk.accepted_bundles.iter().filter_map(|p| ShieldedBundle::from_bytes(p).ok()).collect();
     let bundle_refs: Vec<&ShieldedBundle> = bundles.iter().collect();
     db.ingest_block(&coinbase_notes, &bundle_refs);
+}
+
+/// The shielded sighash **network domain**: the chain's genesis hash — what
+/// consensus verifies signatures against (`params.genesis.hash`). NOT the moving
+/// pruning point (they only coincide on a young, unpruned chain).
+async fn resolve_genesis(client: &GrpcClient) -> RpcHash {
+    let resp = client.get_blocks(None, false, false).await.unwrap_or_else(|e| fatal(format!("cannot resolve genesis: {e}")));
+    *resp.block_hashes.first().unwrap_or_else(|| fatal("cannot resolve genesis: empty response".into()))
 }
 
 async fn balance(rpc_server: String, seed: [u8; 32]) {
     let client = connect(&rpc_server).await;
     log::info!("scanning accepted chain for notes owned by this wallet...");
     let (db, total) = scan_chain(&client, seed, None).await;
-    log::info!("scanned {total} accepted chain blocks; anchor(tip) = {}", hex32(&db.anchor()));
+    log::info!("scanned {total} chain blocks; anchor(tip) = {}", hex32(&db.anchor()));
     println!("balance: {} ({} note(s))", db.balance(), db.notes().len());
     for n in db.notes() {
         println!("  note position={} value={}", n.position, n.value());
@@ -469,23 +471,14 @@ async fn balance(rpc_server: String, seed: [u8; 32]) {
 async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64, fee: u64, anchor_depth: u64) {
     let client = connect(&rpc_server).await;
 
-    let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
-    let genesis = dag.pruning_point_hash;
-    let net: [u8; 32] = genesis.as_bytes();
+    let net: [u8; 32] = resolve_genesis(&client).await.as_bytes();
 
-    // Root the spend to a finalized anchor: ingest only up to the block at the
-    // maturity depth (a small margin below it for safety). Every anchor at or below
-    // that block has been published into the node's finalized ring. On a linear
-    // chain the virtual DAA score equals the chain length (blue score).
-    let chain_len = dag.virtual_daa_score as usize;
-    let margin = 2usize;
-    let need_len = anchor_depth as usize + margin;
-    if chain_len <= need_len {
-        fatal(format!("chain too short ({chain_len} blocks): no note has matured past anchor_depth {anchor_depth} yet"));
-    }
-    let ingest_limit = chain_len - need_len;
-    log::info!("scanning to matured block {ingest_limit}/{chain_len} (anchor_depth {anchor_depth})...");
-    let db = scan_chain(&client, owner_seed, Some(ingest_limit)).await.0;
+    // Root the spend to a matured, canonical anchor: scan only chain blocks at
+    // least `anchor_depth + slack` blue-score units below the sink (consensus
+    // measures anchor maturity in blue score), so the wallet's tip anchor is one
+    // a spend may prove against.
+    log::info!("scanning the matured chain prefix (anchor_depth {anchor_depth})...");
+    let db = scan_chain(&client, owner_seed, Some(anchor_depth + 30)).await.0;
 
     let to_addr = Address::try_from(to.as_str()).unwrap_or_else(|e| fatal(format!("invalid --to address {to:?}: {e}")));
     let recipient = orchard_recipient_bytes(&to_addr).unwrap_or_else(|| fatal("--to is not a shielded Orchard address".into()));
@@ -493,12 +486,24 @@ async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64,
     // Select matured notes to cover amount + fee: greedily take the largest notes
     // first, so the fewest inputs are needed (a smaller, cheaper proof).
     let need = amount.checked_add(fee).unwrap_or_else(|| fatal("amount + fee overflows".into()));
+    // Standard-mass cap: transient mass = tx bytes × 4 with a 100,000 cap, and
+    // each spent note adds 884 wire + 2,272 proof bytes — at most SIX spends fit
+    // one standard transaction (`expected_wire_len`). Refuse an over-cap send
+    // up front instead of proving for an hour and getting mempool-rejected.
+    let max_spends = {
+        let budget = 100_000usize / 4 - 256;
+        let mut n = 1usize;
+        while expected_wire_len((n + 1).max(2)) <= budget {
+            n += 1;
+        }
+        n
+    };
     let mut candidates: Vec<_> = db.notes().to_vec();
     candidates.sort_by(|a, b| b.value().cmp(&a.value())); // descending
     let mut inputs = Vec::new();
     let mut selected = 0u64;
     for n in &candidates {
-        if selected >= need {
+        if selected >= need || inputs.len() == max_spends {
             break;
         }
         let path = db.witness_path(n.position).unwrap_or_else(|| fatal("matured note has no witness path".into()));
@@ -507,10 +512,16 @@ async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64,
         log::info!("  input: note position={} value={}", n.position, n.value());
     }
     if selected < need {
+        let have: u64 = candidates.iter().map(|n| n.value()).sum();
+        if have >= need {
+            fatal(format!(
+                "amount needs more than {max_spends} input notes (standard tx size cap): max sendable in one tx is {} — send in chunks (or consolidate via firecash-walletd /api/wallet/consolidate)",
+                selected.saturating_sub(fee)
+            ));
+        }
         fatal(format!(
-            "insufficient matured funds: have {selected} across {} matured note(s), need amount+fee={need} (total balance {})",
-            inputs.len(),
-            db.balance()
+            "insufficient matured funds: have {have} across {} matured note(s), need amount+fee={need}",
+            candidates.len()
         ));
     }
     log::info!(
@@ -541,10 +552,8 @@ async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64,
 async fn pay(rpc_server: String, owner_seed: [u8; 32], to: String, fee: u64) {
     let client = connect(&rpc_server).await;
 
-    // The sighash's network separator is the chain's genesis hash; on a young chain
-    // the pruning point is still genesis, so we read it straight from the node.
     let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
-    let genesis = dag.pruning_point_hash;
+    let genesis = resolve_genesis(&client).await;
     let net: [u8; 32] = genesis.as_bytes();
     log::info!("network domain (genesis) = {genesis}, virtual daa = {}", dag.virtual_daa_score);
 
