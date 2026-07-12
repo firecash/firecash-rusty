@@ -25,7 +25,7 @@
 //! correctly), then cheap catch-up of only new blocks. The background loop processes
 //! wallets in bounded chunks so status stays responsive while a big initial scan runs.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -63,7 +63,11 @@ const DEFAULT_ANCHOR_DEPTH: u64 = 600;
 /// Max `GetShieldedBlocks` pages a wallet advances per sync chunk. Kept small so
 /// the per-wallet lock is released frequently (status stays responsive); speed
 /// comes from looping back immediately instead of pausing between chunks.
-const PAGES_PER_CHUNK: usize = 16;
+// Small so each `sync_chunk` — which holds the wallet's mutex the whole time — is short
+// (one page ≈ 200 blocks ≈ tens of ms). The status handler locks the same mutex; a large
+// chunk held the lock for seconds and hung status behind the sync loop. The loop drops
+// the lock and re-acquires per chunk, so status interleaves.
+const PAGES_PER_CHUNK: usize = 2;
 /// Chain blocks requested per `GetShieldedBlocks` page.
 const SHIELDED_PAGE: u64 = 200;
 /// Blue-score margin the sync holds back from the sink before ingesting a chain
@@ -410,7 +414,27 @@ const SCAN_HEADER_LEN: usize = 77;
 /// Rewrite the checkpoint after this many newly-scanned blocks (and once a wallet
 /// first reaches the tip). Bounds work lost on a crash without writing the growing
 /// blob on every tiny sync pass; a restart re-scans at most this many cheap blocks.
-const CHECKPOINT_EVERY: usize = 5000;
+// Persist scan progress this often. Kept modest so a daemon restart during a long
+// initial scan doesn't throw away all progress and re-trigger a full rescan of the
+// whole wallet cohort (a "thundering herd" that pins every core). At ~32B/leaf the
+// checkpoint blob stays small, so frequent writes are cheap.
+const CHECKPOINT_EVERY: usize = 1000;
+
+/// Max leaves the background loop advances a wallet's spend-witnesses per step before
+/// yielding, so a large catch-up never runs as one core-pinning burst.
+const WITNESS_ADVANCE_CAP: u64 = 4000;
+
+/// A wallet is synced by the background loop only while it has been touched by a
+/// request within this window; after that it is parked until the next request. Keeps a
+/// public daemon's CPU proportional to *active* wallets, not total tokens ever seen.
+const ACTIVE_SYNC_WINDOW: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Real sleep between wallets in the sync loop, to guarantee CPU headroom for the HTTP
+/// handlers even while scans run. Caps sync throughput; keeps the daemon responsive.
+const SYNC_WALLET_THROTTLE_MS: u64 = 150;
+/// Sleep after each ingested page inside a wallet's chunk, same reason (a single page
+/// is ~200 blocks of pure-CPU trial decryption with no natural await).
+const SYNC_PAGE_THROTTLE_MS: u64 = 5;
 
 /// Persist a wallet's scan checkpoint atomically (write-tmp + rename). `genesis`
 /// is the network genesis hash (a chain relaunch invalidates the checkpoint);
@@ -682,12 +706,25 @@ impl WalletEntry {
                 self.caught_up = true;
                 break;
             }
+            // Just yield between pages — do NOT sleep here: this runs while the wallet's
+            // mutex is held, and sleeping would block any status call for this wallet for
+            // the sleep's duration. The CPU throttle is the between-wallet sleep in
+            // `sync_loop`, which runs with the lock released.
+            tokio::task::yield_now().await;
         }
-        // Keep every spendable note's Merkle witness advanced to the anchor a spend will
-        // actually root at, here in the background — so pressing Send costs a lookup, not
-        // a full Sinsemilla replay of the chain (measured: 21s per note, and a send needs
-        // one per input note).
-        self.advance_spend_witnesses();
+        // Advance the spend witnesses toward the matured anchor a bounded step at a time,
+        // yielding between steps. Only near the tip (`caught_up`): during a long initial
+        // scan the user cannot spend anyway, and advancing witnesses across the whole
+        // 170K-leaf history in one pass is an O(N*k) burst that pins a core and starves
+        // the HTTP handler — the live "wallet won't connect" outage. Near the tip the
+        // catch-up is small and, once done, stays incremental.
+        if self.caught_up {
+            if let Some(matured) = self.matured_leaves() {
+                while self.db.advance_witnesses_capped(matured, WITNESS_ADVANCE_CAP) {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
         self.error = None;
         self.updated_unix = now_unix();
     }
@@ -776,10 +813,15 @@ async fn replay_matured(client: &GrpcClient, mut db: WalletDb) -> Result<WalletD
 type Wallet = Arc<Mutex<WalletEntry>>;
 
 struct AppState {
-    /// One shared gRPC connection to the node, reused by every request and the sync
-    /// loop. Opening a fresh connection per request (as before) exhausted the node's
-    /// connection budget under polling and surfaced as spurious "node offline".
+    /// gRPC connection for the REQUEST path — wallet loads, the tip ticker, prepare /
+    /// submit. Kept separate from `sync_client` so the background sync loop's continuous
+    /// block-fetch traffic can't make a user's wallet load (which needs a couple of node
+    /// RPCs) queue for seconds. Sharing one connection for both was the root cause of the
+    /// "wallet won't connect": loads timed out behind the sync loop, so wallets never
+    /// cached and every poll re-ran a slow, timing-out load.
     client: GrpcClient,
+    /// Dedicated gRPC connection for the background sync loop's block fetches.
+    sync_client: GrpcClient,
     wallet_dir: String,
     prefix: Prefix,
     network: String,
@@ -795,6 +837,23 @@ struct AppState {
     genesis: RpcHash,
     /// Shared `GetShieldedBlocks` page cache for the sync loop (see [`PageCache`]).
     page_cache: Mutex<PageCache>,
+    /// Last time each wallet token was touched by a request. The sync loop only keeps
+    /// a wallet synced while it is being actively viewed; idle wallets (the bulk of a
+    /// public daemon's tokens are one-time visitors) stop consuming CPU. Without this,
+    /// 272 loaded wallets all full-scanning at once pinned every core and starved even
+    /// `/health` — a live outage. A returning user's first poll re-touches and resumes
+    /// it from its checkpoint.
+    last_touch: Mutex<HashMap<String, std::time::Instant>>,
+    /// Caps how many wallets load (rebuild their Merkle tree from the checkpoint /
+    /// pruning point — tens of thousands of Sinsemilla hashes, synchronous on the async
+    /// worker) at once. Without it, a daemon restart makes every reconnecting browser
+    /// trigger a load simultaneously; hundreds of concurrent tree rebuilds pin every
+    /// runtime worker and starve even `/health` (a live outage). With a small cap, most
+    /// workers stay free for HTTP and loads queue briefly instead of melting the box.
+    load_gate: tokio::sync::Semaphore,
+    /// Last known virtual DAA score, refreshed by the sync loop and successful status
+    /// calls, so status can answer instantly when the node RPC is momentarily contended.
+    node_tip: Mutex<(u64, std::time::Instant)>,
     /// In-flight **non-custodial** payments: a `/api/wallet/prepare` builds the proof
     /// from a viewing key and parks the awaiting-signature bundle here, keyed by a
     /// random session id; `/api/wallet/submit` pops it, applies the device's spend-auth
@@ -887,8 +946,45 @@ impl AppState {
         Some(WalletEntry::from_parts(key, db, guard, start, ts.daa_score as usize, VecDeque::new(), 0))
     }
 
+    /// Mark a token active so the sync loop keeps it current (idle wallets are parked).
+    async fn touch(&self, token: &str) {
+        self.last_touch.lock().await.insert(token.to_string(), std::time::Instant::now());
+    }
+
+    /// The wallet if it is already loaded in memory — never loads. For the request path,
+    /// which must not block on a load.
+    async fn cached_wallet(&self, token: &str) -> Option<Wallet> {
+        self.wallets.lock().await.get(token).cloned()
+    }
+
+    /// Ensure a known-but-unloaded wallet gets loaded, in the background, exactly once.
+    /// The request path calls this and returns "loading…" immediately; when the load
+    /// finishes the wallet is in the map and the next poll answers from it.
+    fn spawn_load(self: &Arc<Self>, token: &str) {
+        let state = self.clone();
+        let token = token.to_string();
+        tokio::spawn(async move {
+            // `get_wallet` dedupes via the load gate + cache re-check, so racing spawns
+            // for the same token collapse to one real load.
+            let _ = state.get_wallet(&token).await;
+        });
+    }
+
     /// Fetch a loaded wallet for a token, loading it from disk on first use.
-    async fn get_wallet(&self, token: &str) -> Option<Wallet> {
+    async fn get_wallet(self: &Arc<Self>, token: &str) -> Option<Wallet> {
+        // Mark the wallet active so the sync loop keeps it current; idle wallets are
+        // parked (see `sync_loop`).
+        self.last_touch.lock().await.insert(token.to_string(), std::time::Instant::now());
+        {
+            let map = self.wallets.lock().await;
+            if let Some(w) = map.get(token) {
+                return Some(w.clone());
+            }
+        }
+        // Cache miss → an expensive load. Gate concurrent loads so a reconnect storm
+        // can't pin every worker with tree rebuilds. Re-check the cache after acquiring
+        // the permit: while we waited, another task may have loaded this same wallet.
+        let _permit = self.load_gate.acquire().await.ok()?;
         {
             let map = self.wallets.lock().await;
             if let Some(w) = map.get(token) {
@@ -924,16 +1020,37 @@ async fn sync_loop(state: Arc<AppState>) {
         let wallets: Vec<(String, Wallet)> = { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
         let mut any_behind = false;
         let mut reorged_tokens: Vec<String> = Vec::new();
+        // Only sync wallets touched within this window. The rest are parked (kept in
+        // memory at their last checkpoint) until a request re-touches them — so a
+        // public daemon with hundreds of one-time-visitor tokens doesn't try to
+        // full-scan all of them at once and pin every core.
+        let active: HashSet<String> = {
+            let now = std::time::Instant::now();
+            state
+                .last_touch
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, t)| now.duration_since(**t) < ACTIVE_SYNC_WINDOW)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
         if !wallets.is_empty() {
-            let chain_len = state.client.get_block_dag_info().await.map(|d| d.virtual_daa_score).unwrap_or(0);
+            let chain_len = state.sync_client.get_block_dag_info().await.map(|d| d.virtual_daa_score).unwrap_or(0);
+            if chain_len > 0 {
+                *state.node_tip.lock().await = (chain_len, std::time::Instant::now());
+            }
             for (token, w) in wallets {
+                if !active.contains(&token) {
+                    continue; // parked: nobody is looking at this wallet right now
+                }
                 let mut e = w.lock().await;
                 e.chain_len = chain_len;
                 // Advance one chunk from `low` (also serves as the cheap tip catch-up
                 // once already synced).
                 let was_caught_up = e.caught_up;
                 e.caught_up = false;
-                e.sync_chunk(&state.client, &state.page_cache).await;
+                e.sync_chunk(&state.sync_client, &state.page_cache).await;
                 if e.reorged_strikes >= REORG_STRIKES {
                     // The append-only tree cannot roll back a deep reorg: discard
                     // the checkpoint and evict the wallet; the next request reloads
@@ -971,6 +1088,14 @@ async fn sync_loop(state: Arc<AppState>) {
                         e.saved_scanned = e.scanned;
                     }
                 }
+                drop(e);
+                // A real sleep (not just yield_now) between wallets. yield_now only hands
+                // off to another ready tokio task, which is useless when every core is
+                // already pinned by CPU-bound scan work — HTTP still can't get a cycle.
+                // A short wall-clock sleep forces the loop to relinquish the CPU so the
+                // HTTP handlers (and wallet loads) actually run. Caps sync throughput but
+                // keeps the daemon responsive under a big rescan.
+                tokio::time::sleep(std::time::Duration::from_millis(SYNC_WALLET_THROTTLE_MS)).await;
             }
         }
         if !reorged_tokens.is_empty() {
@@ -1036,9 +1161,14 @@ struct StatusResp {
 
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<StatusResp> {
     let token = token_from(&headers, state.allow_default_token).ok();
-    let (node_connected, daa_score) = match state.client.get_block_dag_info().await {
-        Ok(d) => (true, d.virtual_daa_score),
-        Err(_) => (false, 0),
+    // Do NOT call the node here. The gRPC client is shared with the background sync loop,
+    // whose block fetches make a fresh get_block_dag_info queue for seconds — which made
+    // every status call take ~4s. The sync loop already refreshes `node_tip` every pass,
+    // and a dedicated ticker keeps it current even with no wallets loaded, so status reads
+    // the cached tip instantly. `node_connected` follows whether the tip is fresh.
+    let (node_connected, daa_score) = {
+        let (tip, at) = *state.node_tip.lock().await;
+        (at.elapsed() < std::time::Duration::from_secs(30), tip)
     };
 
     let mut resp = StatusResp {
@@ -1059,20 +1189,37 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
     };
 
     if let Some(token) = token {
-        if let Some(w) = state.get_wallet(&token).await {
-            let e = w.lock().await;
+        // NEVER load on the request path. A wallet load makes node RPCs and rebuilds a
+        // Merkle tree — seconds of work. Doing it here (even with a timeout) livelocked
+        // the daemon: the timeout cancelled the half-done load, so the wallet never
+        // cached, so every poll re-ran and re-cancelled it. Instead: if the wallet is
+        // already loaded, answer from it (fast); otherwise kick off a background load
+        // and report "syncing" until it lands. Subsequent polls are instant.
+        state.touch(&token).await;
+        if let Some(w) = state.cached_wallet(&token).await {
+            if let Ok(e) = w.try_lock() {
+                resp.has_wallet = true;
+                resp.address = Some(state.address_of(&e.db));
+                resp.watch_only = e.key.is_watch_only();
+                let tip = e.chain_len.max(daa_score);
+                resp.synced = e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip;
+                resp.scanned_blocks = e.scanned;
+                resp.chain_len = tip;
+                resp.balance_sompi = e.db.balance().to_string();
+                resp.balance_fc = fmt_fc(e.db.balance());
+                resp.note_count = e.db.notes().len();
+                resp.updated_unix = e.updated_unix;
+                resp.error = e.error.clone();
+            } else {
+                // Being synced this instant; report last-known-good next poll.
+                resp.has_wallet = true;
+                resp.error = Some("updating…".into());
+            }
+        } else if wallet_exists(&state.wallet_dir, &token) {
+            // Known wallet, not yet in memory — load it in the background.
+            state.spawn_load(&token);
             resp.has_wallet = true;
-            resp.address = Some(state.address_of(&e.db));
-            resp.watch_only = e.key.is_watch_only();
-            let tip = e.chain_len.max(daa_score);
-            resp.synced = e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip;
-            resp.scanned_blocks = e.scanned;
-            resp.chain_len = tip;
-            resp.balance_sompi = e.db.balance().to_string();
-            resp.balance_fc = fmt_fc(e.db.balance());
-            resp.note_count = e.db.notes().len();
-            resp.updated_unix = e.updated_unix;
-            resp.error = e.error.clone();
+            resp.error = Some("loading…".into());
         }
     }
     Json(resp)
@@ -1942,7 +2089,14 @@ async fn verify(Json(req): Json<VerifyReq>) -> Result<Json<VerifyResp>, (StatusC
 // main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
+// Oversubscribe worker threads (2x cores). The background sync loop does CPU-bound
+// work (trial decryption, witness advance) on the runtime; with only `ncpu` workers a
+// mass initial scan of many wallets pins every worker and HTTP handlers — which only
+// read in-memory state — starve for seconds (observed live: public /api/status timing
+// out at 15s during a 170-wallet rescan). With more workers than cores, a newly
+// runnable HTTP handler is always schedulable within a time slice, so status stays
+// responsive while scans grind in the background.
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
     kaspa_core::log::try_init_logger("info");
     let cli = Cli::parse();
@@ -1962,28 +2116,33 @@ async fn main() {
     });
     let _ = std::fs::create_dir_all(&wallet_dir);
 
-    // Open the single shared node connection up front; retry until the node is up.
-    let client = loop {
-        match GrpcClient::connect_with_args(
-            NotificationMode::Direct,
-            format!("grpc://{}", cli.rpc_server),
-            None,
-            true,
-            None,
-            false,
-            Some(500_000),
-            Default::default(),
-        )
-        .await
-        {
-            Ok(c) => break c,
-            Err(e) => {
-                log::warn!("node {} not reachable yet ({e}); retrying in 3s...", cli.rpc_server);
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Two node connections: one for the request path, one for the background sync loop,
+    // so heavy sync traffic can't stall user wallet loads. Retry until the node is up.
+    async fn connect_node(rpc_server: &str, label: &str) -> GrpcClient {
+        loop {
+            match GrpcClient::connect_with_args(
+                NotificationMode::Direct,
+                format!("grpc://{rpc_server}"),
+                None,
+                true,
+                None,
+                false,
+                Some(500_000),
+                Default::default(),
+            )
+            .await
+            {
+                Ok(c) => break c,
+                Err(e) => {
+                    log::warn!("node {rpc_server} ({label}) not reachable yet ({e}); retrying in 3s...");
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
             }
         }
-    };
-    log::info!("connected to node at {}", cli.rpc_server);
+    }
+    let client = connect_node(&cli.rpc_server, "request").await;
+    let sync_client = connect_node(&cli.rpc_server, "sync").await;
+    log::info!("connected to node at {} (2 connections: request + sync)", cli.rpc_server);
 
     // Seed-file encryption secret: CLI flag or FIRECASH_WALLET_SECRET env.
     let wallet_secret = cli.wallet_secret.or_else(|| std::env::var("FIRECASH_WALLET_SECRET").ok());
@@ -2008,6 +2167,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         client,
+        sync_client,
         wallet_dir,
         prefix: prefix_from(&cli.network),
         network: cli.network,
@@ -2016,10 +2176,28 @@ async fn main() {
         wallet_secret,
         genesis,
         page_cache: Mutex::new(PageCache::new()),
+        last_touch: Mutex::new(HashMap::new()),
+        load_gate: tokio::sync::Semaphore::new(2),
+        node_tip: Mutex::new((0, std::time::Instant::now())),
         prepared: Mutex::new(HashMap::new()),
     });
 
     tokio::spawn(sync_loop(state.clone()));
+
+    // Keep the cached node tip fresh independently of loaded wallets, so `status` can
+    // report node connectivity + chain height without ever calling the node on the
+    // request path (which was contended by the sync loop and made status take ~4s).
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(d) = state.client.get_block_dag_info().await {
+                    *state.node_tip.lock().await = (d.virtual_daa_score, std::time::Instant::now());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
+    }
 
     // Build the (deterministic, process-wide) Orchard proving key now, off the
     // async runtime, so the first send doesn't eat the multi-minute keygen.

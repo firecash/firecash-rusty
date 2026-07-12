@@ -348,8 +348,26 @@ impl WalletDb {
     /// accumulating thousands of coinbase notes) falls back to the on-demand rebuild
     /// for the excess rather than paying `k` appends per leaf forever.
     pub fn advance_witnesses(&mut self, target_leaves: u64) {
-        let target = target_leaves.min(self.size);
+        self.advance_witnesses_capped(target_leaves, u64::MAX);
+    }
+
+    /// [`Self::advance_witnesses`] but advancing at most `max_leaves` this call, so the
+    /// work is bounded and the caller can spread a large catch-up across sync passes
+    /// (yielding between them) instead of one multi-second burst that starves the HTTP
+    /// handler. Returns `true` if there is still more to advance toward `target_leaves`.
+    pub fn advance_witnesses_capped(&mut self, target_leaves: u64, max_leaves: u64) -> bool {
+        let full_target = target_leaves.min(self.size);
         let start = self.witnessed_upto.max(self.base_size);
+        if full_target <= start {
+            return false;
+        }
+        let target = full_target.min(start.saturating_add(max_leaves));
+        let more = target < full_target;
+        self.advance_witnesses_range(start, target);
+        more
+    }
+
+    fn advance_witnesses_range(&mut self, start: u64, target: u64) {
         if target <= start {
             return;
         }
