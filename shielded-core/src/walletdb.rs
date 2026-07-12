@@ -174,17 +174,38 @@ impl WalletDb {
     /// supplies every left sibling the witness needs).
     pub fn from_frontier(seed: [u8; 32], checkpoint: &FrontierState) -> Option<Self> {
         let mut db = Self::from_seed(seed)?;
-        let gt = GlobalTree::from_state(checkpoint).ok()?;
-        db.base_frontier = gt.frontier().clone();
-        db.base_size = gt.size();
-        db.tree = CommitmentTree::from_frontier(&db.base_frontier);
-        db.size = db.base_size;
+        db.apply_frontier(checkpoint)?;
         Some(db)
+    }
+
+    /// Rebase a **freshly constructed** wallet (no leaves ingested yet) onto a
+    /// node-supplied checkpoint frontier — the fast-sync start shared by the
+    /// seed ([`Self::from_frontier`]) and watch-only ([`Self::from_fvk`]) paths.
+    /// Returns `None` on an inconsistent frontier or if leaves were already
+    /// ingested (the base must precede all stored leaves).
+    pub fn apply_frontier(&mut self, checkpoint: &FrontierState) -> Option<()> {
+        if !self.leaves.is_empty() || self.base_size != 0 {
+            return None;
+        }
+        let gt = GlobalTree::from_state(checkpoint).ok()?;
+        self.base_frontier = gt.frontier().clone();
+        self.base_size = gt.size();
+        self.tree = CommitmentTree::from_frontier(&self.base_frontier);
+        self.size = self.base_size;
+        Some(())
     }
 
     /// The wallet's owned, unspent notes.
     pub fn notes(&self) -> &[OwnedNote] {
         &self.notes
+    }
+
+    /// Absolute position of the first leaf this wallet actually scanned: 0 for a
+    /// full-scan wallet, or the fast-sync checkpoint's leaf count. Notes minted
+    /// *before* this base are invisible to the wallet — a caller deciding whether
+    /// a fast-synced view is complete for a given wallet birthday needs this.
+    pub fn base_size(&self) -> u64 {
+        self.base_size
     }
 
     /// Number of leaves in the cached commitment stream (== notes ingested so far).

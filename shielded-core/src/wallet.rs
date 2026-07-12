@@ -113,6 +113,20 @@ pub mod build {
     };
     use pasta_curves::pallas;
     use rand::{CryptoRng, RngCore};
+    use std::sync::OnceLock;
+
+    /// The process-wide Orchard [`ProvingKey`], built once and reused.
+    ///
+    /// `ProvingKey::build()` is a multi-minute Halo 2 keygen; rebuilding it per
+    /// payment (as the wallet builders originally did) dominated every send —
+    /// live pool payouts measured ~5 minutes each, almost all of it keygen.
+    /// The key is deterministic and read-only, so one shared instance serves
+    /// every proof for the life of the process. Callers that want to hide the
+    /// one-time cost can invoke this at startup from a background thread.
+    pub fn proving_key() -> &'static ProvingKey {
+        static PROVING_KEY: OnceLock<ProvingKey> = OnceLock::new();
+        PROVING_KEY.get_or_init(ProvingKey::build)
+    }
 
     /// A wallet's Orchard keys, derived from a 32-byte seed.
     pub struct ShieldedKeys {
@@ -367,9 +381,9 @@ pub mod build {
         let merkle_path = MerklePath::from_parts(0, auth_path);
 
         let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
-        let pk = ProvingKey::build();
+        let pk = proving_key();
         let wire =
-            build_spend_bundle(&pk, &keys, note, merkle_path, recipient, output_value, network_domain, tx_context, rand::rngs::OsRng)?;
+            build_spend_bundle(pk, &keys, note, merkle_path, recipient, output_value, network_domain, tx_context, rand::rngs::OsRng)?;
         Ok(wire.to_bytes())
     }
 
@@ -415,11 +429,11 @@ pub mod build {
             .add_output(None, change_addr, NoteValue::from_raw(change), [0u8; 512])
             .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
 
-        let pk = ProvingKey::build();
+        let pk = proving_key();
         let mut rng = rand::rngs::OsRng;
         let (unauth, _meta) =
             builder.build::<i64>(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
-        let proven = unauth.create_proof(&pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+        let proven = unauth.create_proof(pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
         let effects = to_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
         let msg = sighash(&effects, network_domain, tx_context);
@@ -494,10 +508,10 @@ pub mod build {
                 .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
 
-        let pk = ProvingKey::build();
+        let pk = proving_key();
         let mut rng = rand::rngs::OsRng;
         let (mut pczt, _meta) = builder.build_for_pczt(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
-        pczt.create_proof(&pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+        pczt.create_proof(pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
         let effects = pczt.extract_effects::<i64>().map_err(|e| BuildError::Proof(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
         let value_balance = *effects.value_balance();

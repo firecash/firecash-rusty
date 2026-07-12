@@ -79,8 +79,31 @@ pub struct ActionWire {
 }
 
 impl ActionWire {
-    /// Serialized size of one action.
-    pub const SERIALIZED_LEN: usize = sizes::FIELD * 4 + sizes::ENC_CIPHERTEXT + sizes::OUT_CIPHERTEXT + sizes::SIG;
+    /// Serialized size of one action: five 32-byte field/group elements
+    /// (nullifier, rk, cmx, cv_net, ephemeral_key) + both ciphertexts + the
+    /// spend-auth signature = 884 bytes.
+    pub const SERIALIZED_LEN: usize = sizes::FIELD * 5 + sizes::ENC_CIPHERTEXT + sizes::OUT_CIPHERTEXT + sizes::SIG;
+}
+
+/// Size of the Orchard Halo 2 proof for a bundle of `n` actions, in bytes:
+/// `2720 + 2272·n`. These constants mirror `orchard::circuit::Proof::
+/// expected_proof_size` (guarded there by tests: 4992 bytes at 1 action,
+/// 7264 at 2) — the proof grows linearly with the action count.
+pub const fn expected_proof_len(n_actions: usize) -> usize {
+    2720 + 2272 * n_actions
+}
+
+/// Exact serialized size of a [`ShieldedBundle`] with `n` actions and a
+/// standard-size proof, per [`ShieldedBundle::to_bytes`]:
+/// fixed header (flags 1 + value_balance 8 + anchor 32 + binding_sig 4+64 +
+/// action count 4 + proof length prefix 4 = 117) + `n·884` + proof.
+///
+/// A wallet uses this to bound the number of spends per transaction **before**
+/// paying for the (minutes-long) proof: Kaspa's mempool standardness caps
+/// per-dimension mass at 100 000, and transient mass = serialized tx bytes × 4,
+/// so a standard shielded tx must stay under ~25 000 bytes total.
+pub const fn expected_wire_len(n_actions: usize) -> usize {
+    117 + n_actions * ActionWire::SERIALIZED_LEN + expected_proof_len(n_actions)
 }
 
 /// An Orchard bundle as carried in a shielded transaction's payload.
@@ -339,6 +362,21 @@ mod tests {
             binding_sig: [0u8; sizes::SIG],
         };
         assert_eq!(ShieldedBundle::from_bytes(&at_cap.to_bytes()).map(|b| b.actions.len()), Ok(MAX_ACTIONS_PER_BUNDLE));
+    }
+
+    /// `expected_wire_len` must track `to_bytes` exactly (a wallet sizes its
+    /// spends against the standard-mass cap with it *before* proving).
+    #[test]
+    fn expected_wire_len_matches_encoding() {
+        for n in [0usize, 1, 2, 5, 14] {
+            let mut b = sample_bundle(n as u8);
+            b.proof = vec![0xab; expected_proof_len(n)];
+            assert_eq!(b.to_bytes().len(), expected_wire_len(n), "wire length for {n} actions");
+        }
+        // The real-world datapoint: a 14-spend payment serialized to 47 021
+        // payload bytes (rejected at 188 460 transient mass = (payload + 94-byte
+        // tx envelope) × 4 against the 100 000 standard cap).
+        assert_eq!(expected_wire_len(14), 47_021);
     }
 
     #[test]

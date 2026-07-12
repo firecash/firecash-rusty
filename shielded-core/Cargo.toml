@@ -15,7 +15,7 @@ default = []
 # Enables Halo 2 proof verification (the `verify` module's circuit path, single
 # + batch). Pulls halo2_proofs via orchard plus the batch/reconstruction deps;
 # kept opt-in so non-verifying consumers stay light.
-circuit = ["orchard/circuit", "dep:nonempty"]
+circuit = ["orchard/circuit", "orchard/multicore", "dep:nonempty"]
 
 [dependencies]
 # Orchard primitives (Halo 2 / Pasta). `circuit` (halo2_proofs) is enabled via
