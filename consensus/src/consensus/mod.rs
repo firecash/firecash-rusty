@@ -1302,7 +1302,7 @@ impl ConsensusApi for Consensus {
         self.validate_block_exists(low)?;
         self.validate_block_exists(high)?;
 
-        Ok(self.services.sync_manager.antipast_hashes_between(low, high, Some(max_blocks)))
+        self.services.sync_manager.antipast_hashes_between(low, high, Some(max_blocks)).map_err(ConsensusError::SyncManagerError)
     }
 
     fn get_header(&self, hash: Hash) -> ConsensusResult<Arc<Header>> {

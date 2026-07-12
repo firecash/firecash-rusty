@@ -14,6 +14,9 @@ pub enum SyncManagerError {
 
     #[error("block locator low hash {0} is not on selected parent chain of high hash {1}")]
     LocatorLowHashNotInHighHashChain(Hash, Hash),
+
+    #[error("required chain data is missing for block {0} (pruned or corrupt store)")]
+    MissingChainData(Hash),
 }
 
 pub type SyncManagerResult<T> = std::result::Result<T, SyncManagerError>;

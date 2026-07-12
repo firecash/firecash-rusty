@@ -73,7 +73,7 @@ impl<
     /// Returns the hashes of the blocks between low's antipast and high's antipast, or up to `max_blocks`, if provided.
     /// The result excludes low and includes high. If low == high, returns nothing. If max_blocks is some then it MUST be >= MergeSetSizeLimit
     /// because it returns blocks with MergeSet granularity, so if MergeSet > max_blocks, the function will return nothing which is undesired behavior.
-    pub fn antipast_hashes_between(&self, low: Hash, high: Hash, max_blocks: Option<usize>) -> (Vec<Hash>, Hash) {
+    pub fn antipast_hashes_between(&self, low: Hash, high: Hash, max_blocks: Option<usize>) -> SyncManagerResult<(Vec<Hash>, Hash)> {
         let max_blocks = max_blocks.unwrap_or(usize::MAX);
         assert!(max_blocks >= self.mergeset_size_limit as usize);
 
@@ -82,16 +82,20 @@ impl<
         // high's chain.
         // We keep original_low to filter out blocks in its past later down the road
         let original_low = low;
-        let low = self.find_highest_common_chain_block(low, high);
+        let low = self.find_highest_common_chain_block(low, high)?;
 
-        let low_bs = self.ghostdag_store.get_blue_score(low).unwrap();
-        let high_bs = self.ghostdag_store.get_blue_score(high).unwrap();
+        // Store reads are fallible by design here: this path is reachable from the
+        // public `get_blocks` RPC, and a store hole (e.g. after an unclean node
+        // shutdown — observed live) must surface as an error, never a panic that
+        // takes the whole node down.
+        let low_bs = self.ghostdag_store.get_blue_score(low).map_err(|_| SyncManagerError::MissingChainData(low))?;
+        let high_bs = self.ghostdag_store.get_blue_score(high).map_err(|_| SyncManagerError::MissingChainData(high))?;
         assert!(low_bs <= high_bs);
 
         let mut highest_reached = low; // The highest chain block we reached before completing/reaching a limit
         let mut blocks = Vec::with_capacity(min(max_blocks, (high_bs - low_bs) as usize));
         for current in self.reachability_service.forward_chain_iterator(low, high, true).skip(1) {
-            let gd = self.ghostdag_store.get_data(current).unwrap();
+            let gd = self.ghostdag_store.get_data(current).map_err(|_| SyncManagerError::MissingChainData(current))?;
             if blocks.len() + gd.mergeset_size() > max_blocks {
                 break;
             }
@@ -107,14 +111,14 @@ impl<
             blocks.push(highest_reached);
         }
 
-        (blocks, highest_reached)
+        Ok((blocks, highest_reached))
     }
 
-    pub fn find_highest_common_chain_block(&self, low: Hash, high: Hash) -> Hash {
+    pub fn find_highest_common_chain_block(&self, low: Hash, high: Hash) -> SyncManagerResult<Hash> {
         self.reachability_service
             .default_backward_chain_iterator(low)
             .find(|candidate| self.reachability_service.is_chain_ancestor_of(*candidate, high))
-            .expect("because of the pruning rules such block has to exist")
+            .ok_or(SyncManagerError::MissingChainData(low))
     }
 
     /// Returns a logarithmic amount of blocks sampled from the virtual selected chain between `low` and `high`.
@@ -191,7 +195,7 @@ impl<
             return Ok(vec![]);
         };
 
-        let (mut hashes_between, _) = self.antipast_hashes_between(highest_with_body.unwrap(), high, None);
+        let (mut hashes_between, _) = self.antipast_hashes_between(highest_with_body.unwrap(), high, None)?;
         let statuses = self.statuses_store.read();
         hashes_between.retain(|&h| statuses.get(h).unwrap().is_header_only());
 
