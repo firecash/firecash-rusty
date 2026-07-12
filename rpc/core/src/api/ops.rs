@@ -146,6 +146,8 @@ pub enum RpcApiOps {
     GetSeqCommitLaneProof = 153,
     /// Get the shielded note-commitment tree frontier at a fast-sync checkpoint
     GetShieldedTreeState = 154,
+    /// Get the per-chain-block shielded effects (coinbase mint + accepted bundles) for wallet sync
+    GetShieldedBlocks = 155,
 }
 
 impl RpcApiOps {

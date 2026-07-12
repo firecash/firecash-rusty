@@ -27,6 +27,7 @@ use kaspa_rpc_core::{
     RpcContextualPeerAddress, RpcDataVerbosityLevel, RpcError, RpcExtraData, RpcHash, RpcIpAddress, RpcNetworkType, RpcPeerAddress,
     RpcResult, SubmitBlockRejectReason, SubmitBlockReport,
 };
+use kaspa_rpc_core::{FromRpcHex, ToRpcHex};
 use kaspa_utils::hex::*;
 use std::{str::FromStr, sync::Arc};
 
@@ -215,7 +216,9 @@ from!(item: RpcResult<&kaspa_rpc_core::GetSinkResponse>, protowire::GetSinkRespo
     Self { sink: item.sink.to_string(), error: None }
 });
 
-from!(&kaspa_rpc_core::GetShieldedTreeStateRequest, protowire::GetShieldedTreeStateRequestMessage);
+from!(item: &kaspa_rpc_core::GetShieldedTreeStateRequest, protowire::GetShieldedTreeStateRequestMessage, {
+    Self { block_hash: item.block_hash.map(|h| h.to_string()).unwrap_or_default() }
+});
 from!(item: RpcResult<&kaspa_rpc_core::GetShieldedTreeStateResponse>, protowire::GetShieldedTreeStateResponseMessage, {
     Self {
         block_hash: item.block_hash.to_string(),
@@ -225,6 +228,27 @@ from!(item: RpcResult<&kaspa_rpc_core::GetShieldedTreeStateResponse>, protowire:
         ommers: item.ommers.iter().map(|h| h.to_string()).collect(),
         error: None,
     }
+});
+
+from!(item: &kaspa_rpc_core::GetShieldedBlocksRequest, protowire::GetShieldedBlocksRequestMessage, {
+    Self { start_hash: item.start_hash.to_string(), limit: item.limit }
+});
+from!(item: &kaspa_rpc_core::RpcShieldedChainBlock, protowire::RpcShieldedChainBlock, {
+    Self {
+        hash: item.hash.to_string(),
+        blue_score: item.blue_score,
+        daa_score: item.daa_score,
+        coinbase_txid: item.coinbase_txid.to_string(),
+        coinbase_outputs: item
+            .coinbase_outputs
+            .iter()
+            .map(|o| protowire::RpcShieldedCoinbaseOutput { script_public_key: o.script_public_key.to_rpc_hex(), value: o.value })
+            .collect(),
+        accepted_bundles: item.accepted_bundles.iter().map(|b| b.to_rpc_hex()).collect(),
+    }
+});
+from!(item: RpcResult<&kaspa_rpc_core::GetShieldedBlocksResponse>, protowire::GetShieldedBlocksResponseMessage, {
+    Self { blocks: item.blocks.iter().map(|b| b.into()).collect(), reorged: item.reorged, sink_blue_score: item.sink_blue_score, error: None }
 });
 
 from!(item: &kaspa_rpc_core::GetMempoolEntryRequest, protowire::GetMempoolEntryRequestMessage, {
@@ -739,7 +763,9 @@ try_from!(item: &protowire::GetSinkResponseMessage, RpcResult<kaspa_rpc_core::Ge
     Self { sink: RpcHash::from_str(&item.sink)? }
 });
 
-try_from!(&protowire::GetShieldedTreeStateRequestMessage, kaspa_rpc_core::GetShieldedTreeStateRequest);
+try_from!(item: &protowire::GetShieldedTreeStateRequestMessage, kaspa_rpc_core::GetShieldedTreeStateRequest, {
+    Self { block_hash: if item.block_hash.is_empty() { None } else { Some(RpcHash::from_str(&item.block_hash)?) } }
+});
 try_from!(item: &protowire::GetShieldedTreeStateResponseMessage, RpcResult<kaspa_rpc_core::GetShieldedTreeStateResponse>, {
     Self {
         block_hash: RpcHash::from_str(&item.block_hash)?,
@@ -747,6 +773,33 @@ try_from!(item: &protowire::GetShieldedTreeStateResponseMessage, RpcResult<kaspa
         size: item.size,
         leaf: RpcHash::from_str(&item.leaf)?,
         ommers: item.ommers.iter().map(|s| RpcHash::from_str(s)).collect::<Result<Vec<_>, _>>()?,
+    }
+});
+
+try_from!(item: &protowire::GetShieldedBlocksRequestMessage, kaspa_rpc_core::GetShieldedBlocksRequest, {
+    Self { start_hash: RpcHash::from_str(&item.start_hash)?, limit: item.limit }
+});
+try_from!(item: &protowire::RpcShieldedChainBlock, kaspa_rpc_core::RpcShieldedChainBlock, {
+    Self {
+        hash: RpcHash::from_str(&item.hash)?,
+        blue_score: item.blue_score,
+        daa_score: item.daa_score,
+        coinbase_txid: RpcHash::from_str(&item.coinbase_txid)?,
+        coinbase_outputs: item
+            .coinbase_outputs
+            .iter()
+            .map(|o| {
+                Ok(kaspa_rpc_core::RpcShieldedCoinbaseOutput { script_public_key: Vec::from_rpc_hex(&o.script_public_key)?, value: o.value })
+            })
+            .collect::<Result<Vec<_>, Self::Error>>()?,
+        accepted_bundles: item.accepted_bundles.iter().map(|b| Vec::from_rpc_hex(b)).collect::<Result<Vec<_>, _>>()?,
+    }
+});
+try_from!(item: &protowire::GetShieldedBlocksResponseMessage, RpcResult<kaspa_rpc_core::GetShieldedBlocksResponse>, {
+    Self {
+        blocks: item.blocks.iter().map(kaspa_rpc_core::RpcShieldedChainBlock::try_from).collect::<Result<Vec<_>, _>>()?,
+        reorged: item.reorged,
+        sink_blue_score: item.sink_blue_score,
     }
 });
 

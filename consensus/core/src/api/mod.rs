@@ -34,6 +34,28 @@ pub mod args;
 pub mod counters;
 pub mod stats;
 
+/// The shielded effects of one chain block, as applied by the §2.4 transition —
+/// see [`ConsensusApi::get_shielded_chain_block_data`]. Plain types only, so
+/// `kaspa-shielded-core` stays off this API boundary.
+#[derive(Clone, Debug)]
+pub struct ShieldedChainBlockData {
+    /// The chain block.
+    pub hash: Hash,
+    /// Its blue score — the depth unit of shielded anchor maturity.
+    pub blue_score: u64,
+    /// Its DAA score (progress reporting).
+    pub daa_score: u64,
+    /// The block's own coinbase transaction id (coinbase note ρ/ψ derivation
+    /// seeds are `txid ‖ output_index`).
+    pub coinbase_txid: Hash,
+    /// The coinbase outputs in order: `(script_public_key bytes, value)`. A
+    /// 43-byte script is a raw Orchard recipient minting a coinbase note.
+    pub coinbase_outputs: Vec<(Vec<u8>, u64)>,
+    /// Accepted shielded bundle payloads in consensus accepted order, after the
+    /// anchor-finality retain (i.e. exactly the bundles that appended leaves).
+    pub accepted_bundles: Vec<Vec<u8>>,
+}
+
 pub type BlockValidationFuture = BoxFuture<'static, BlockProcessResult<BlockStatus>>;
 
 /// A struct returned by consensus for block validation processing calls
@@ -363,6 +385,18 @@ pub trait ConsensusApi: Send + Sync {
     /// `block`, yet still witnesses its notes against the live tip. Raw parts (rather
     /// than a `kaspa-shielded-core` type) keep that crate off this API boundary.
     fn get_shielded_tree_frontier(&self, _block: Hash) -> ConsensusResult<(u64, Option<[u8; 32]>, Vec<[u8; 32]>)> {
+        unimplemented!()
+    }
+
+    /// The shielded effects of one **chain block**, exactly as the §2.4 state
+    /// transition applied them: the block's own coinbase mint (txid + outputs)
+    /// and the accepted shielded transaction payloads in consensus accepted
+    /// order, with anchor-non-final spends already dropped (the same retain rule
+    /// the virtual processor ran at validation). This is the canonical stream a
+    /// wallet must ingest to mirror the note-commitment tree: scanning raw DAG
+    /// blocks (e.g. via `get_blocks`) counts non-chain coinbases that never mint
+    /// and mis-orders leaves once the DAG is wider than a chain.
+    fn get_shielded_chain_block_data(&self, _block: Hash) -> ConsensusResult<ShieldedChainBlockData> {
         unimplemented!()
     }
 

@@ -250,6 +250,7 @@ impl RpcApi for GrpcClient {
     route!(get_peer_addresses_call, GetPeerAddresses);
     route!(get_sink_call, GetSink);
     route!(get_shielded_tree_state_call, GetShieldedTreeState);
+    route!(get_shielded_blocks_call, GetShieldedBlocks);
     route!(get_mempool_entry_call, GetMempoolEntry);
     route!(get_mempool_entries_call, GetMempoolEntries);
     route!(get_connected_peer_info_call, GetConnectedPeerInfo);

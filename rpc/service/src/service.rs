@@ -715,20 +715,59 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     async fn get_shielded_tree_state_call(
         &self,
         _connection: Option<&DynRpcConnection>,
-        _: GetShieldedTreeStateRequest,
+        request: GetShieldedTreeStateRequest,
     ) -> RpcResult<GetShieldedTreeStateResponse> {
         let session = self.consensus_manager.consensus().unguarded_session();
-        // Checkpoint at the finality point: the most *recent* block that can never be
-        // reorged (so a wallet can safely base its tree there), and its per-block
-        // frontier snapshot is retained. Using the finality point rather than the
-        // pruning point lets a wallet skip almost the whole chain even before pruning
-        // has advanced past genesis.
-        let block_hash = session.async_finality_point().await;
+        // Default checkpoint = the finality point: the most *recent* block that can
+        // never be reorged (so a wallet can safely base its tree there), and its
+        // per-block frontier snapshot is retained. An explicit block (e.g. the
+        // pruning point) anchors a full-history scan at correct absolute positions.
+        let block_hash = match request.block_hash {
+            Some(h) => h,
+            None => session.async_finality_point().await,
+        };
         let daa_score = session.async_get_header(block_hash).await?.daa_score;
         let (size, leaf, ommers) = session.async_get_shielded_tree_frontier(block_hash).await?;
         let leaf = RpcHash::from_bytes(leaf.unwrap_or_default());
         let ommers = ommers.into_iter().map(RpcHash::from_bytes).collect();
         Ok(GetShieldedTreeStateResponse { block_hash, daa_score, size, leaf, ommers })
+    }
+
+    async fn get_shielded_blocks_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetShieldedBlocksRequest,
+    ) -> RpcResult<GetShieldedBlocksResponse> {
+        const DEFAULT_LIMIT: usize = 500;
+        const MAX_LIMIT: usize = 2000;
+        let limit = match request.limit as usize {
+            0 => DEFAULT_LIMIT,
+            l => l.min(MAX_LIMIT),
+        };
+        let session = self.consensus_manager.consensus().session().await;
+        let chain_path = session.async_get_virtual_chain_from_block(request.start_hash, Some(limit)).await?;
+        let reorged = !chain_path.removed.is_empty();
+        let sink = session.async_get_sink().await;
+        let sink_blue_score = session.async_get_ghostdag_data(sink).await?.blue_score;
+        let mut blocks = Vec::new();
+        if !reorged {
+            for hash in chain_path.added.iter().take(limit) {
+                let d = session.async_get_shielded_chain_block_data(*hash).await?;
+                blocks.push(RpcShieldedChainBlock {
+                    hash: d.hash,
+                    blue_score: d.blue_score,
+                    daa_score: d.daa_score,
+                    coinbase_txid: d.coinbase_txid,
+                    coinbase_outputs: d
+                        .coinbase_outputs
+                        .into_iter()
+                        .map(|(script_public_key, value)| RpcShieldedCoinbaseOutput { script_public_key, value })
+                        .collect(),
+                    accepted_bundles: d.accepted_bundles,
+                });
+            }
+        }
+        Ok(GetShieldedBlocksResponse { blocks, reorged, sink_blue_score })
     }
 
     async fn get_sink_blue_score_call(

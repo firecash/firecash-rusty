@@ -70,6 +70,7 @@ message KaspadRequest {
     GetBlockRewardInfoRequestMessage getBlockRewardInfoRequest = 1116;
     GetSeqCommitLaneProofRequestMessage getSeqCommitLaneProofRequest = 1118;
     GetShieldedTreeStateRequestMessage getShieldedTreeStateRequest = 1120;
+    GetShieldedBlocksRequestMessage getShieldedBlocksRequest = 1122;
   }
 }
 
@@ -140,6 +141,7 @@ message KaspadResponse {
     GetBlockRewardInfoResponseMessage getBlockRewardInfoResponse = 1117;
     GetSeqCommitLaneProofResponseMessage getSeqCommitLaneProofResponse = 1119;
     GetShieldedTreeStateResponseMessage getShieldedTreeStateResponse = 1121;
+    GetShieldedBlocksResponseMessage getShieldedBlocksResponse = 1123;
   }
 }
 

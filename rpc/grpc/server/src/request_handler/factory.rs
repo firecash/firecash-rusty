@@ -51,6 +51,7 @@ impl Factory {
                 GetPeerAddresses,
                 GetSink,
                 GetShieldedTreeState,
+                GetShieldedBlocks,
                 GetMempoolEntry,
                 GetMempoolEntries,
                 GetConnectedPeerInfo,

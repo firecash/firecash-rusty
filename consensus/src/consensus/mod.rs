@@ -666,6 +666,10 @@ impl ConsensusApi for Consensus {
         Ok((fs.size, fs.leaf, fs.ommers))
     }
 
+    fn get_shielded_chain_block_data(&self, block: Hash) -> ConsensusResult<kaspa_consensus_core::api::ShieldedChainBlockData> {
+        self.virtual_processor.shielded_chain_block_data(block).map_err(ConsensusError::GeneralOwned)
+    }
+
     fn validate_and_insert_trusted_block(&self, tb: TrustedBlock) -> BlockValidationFutures {
         let (block_task, virtual_state_task) = self.validate_and_insert_block_impl(BlockTask::Trusted { block: tb.block });
         BlockValidationFutures { block_task: Box::pin(block_task), virtual_state_task: Box::pin(virtual_state_task) }

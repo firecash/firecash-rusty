@@ -326,6 +326,71 @@ impl VirtualStateProcessor {
         self.shielded_state_manager.state_root_at(block)
     }
 
+    /// Reconstruct the shielded effects one **chain block** applied (PLAN §2.4),
+    /// for wallet sync (`GetShieldedBlocks` RPC): the block's own coinbase mint
+    /// plus its accepted shielded bundles in consensus accepted order, re-running
+    /// the anchor-finality retain with the block's own historical context — so the
+    /// result matches what `verify_expected_utxo_state` fed the transition, leaf
+    /// for leaf. Replayed entirely from immutable per-block data (acceptance
+    /// data, block transactions, ghostdag), valid for any unpruned chain block.
+    pub fn shielded_chain_block_data(
+        &self,
+        block: kaspa_hashes::Hash,
+    ) -> Result<kaspa_consensus_core::api::ShieldedChainBlockData, String> {
+        use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+        use kaspa_shielded_core::bundle::ShieldedBundle;
+        use kaspa_shielded_core::state::ShieldedTx;
+
+        let txs = self.block_transactions_store.get(block).map_err(|e| format!("block transactions for {block}: {e}"))?;
+        let coinbase = txs.first().ok_or_else(|| format!("block {block} has no coinbase"))?;
+        let coinbase_txid = coinbase.id();
+        let coinbase_outputs = coinbase.outputs.iter().map(|o| (o.script_public_key.script().to_vec(), o.value)).collect();
+
+        let ghostdag = self.ghostdag_store.get_data(block).map_err(|e| format!("ghostdag for {block}: {e}"))?;
+        let blue_score = ghostdag.blue_score;
+        let selected_parent = ghostdag.selected_parent;
+        let daa_score = self.headers_store.get_daa_score(block).map_err(|e| format!("daa score for {block}: {e}"))?;
+
+        // Walk the acceptance data in its stored (consensus) order: selected parent
+        // first, then the consensus-ordered mergeset — the same order
+        // `calculate_utxo_state` collected `ctx.shielded_txs` in. The id check
+        // skips the prepended coinbase entry (its id is this block's coinbase but
+        // its index points into the merged block's own slot 0).
+        let acceptance = self.acceptance_data_store.get(block).map_err(|e| format!("acceptance data for {block}: {e}"))?;
+        let mut accepted_bundles = Vec::new();
+        for mergeset_block in acceptance.iter() {
+            let merged_txs = self
+                .block_transactions_store
+                .get(mergeset_block.block_hash)
+                .map_err(|e| format!("merged block txs for {}: {e}", mergeset_block.block_hash))?;
+            for entry in &mergeset_block.accepted_transactions {
+                let Some(tx) = merged_txs.get(entry.index_within_block as usize) else { continue };
+                if tx.id() != entry.transaction_id || tx.version != TX_VERSION_SHIELDED {
+                    continue;
+                }
+                // Exactly the validation-time behavior: an unparseable bundle was
+                // dropped, and a spending bundle against a non-final anchor was
+                // dropped — neither appended leaves.
+                let Some(stx) = ShieldedBundle::from_bytes(&tx.payload).ok().and_then(|b| ShieldedTx::from_bundle(&b).ok()) else {
+                    continue;
+                };
+                if !stx.nullifiers.is_empty() && !self.is_shielded_anchor_final(&stx.anchor, selected_parent, blue_score) {
+                    continue;
+                }
+                accepted_bundles.push(tx.payload.clone());
+            }
+        }
+
+        Ok(kaspa_consensus_core::api::ShieldedChainBlockData {
+            hash: block,
+            blue_score,
+            daa_score,
+            coinbase_txid,
+            coinbase_outputs,
+            accepted_bundles,
+        })
+    }
+
     pub fn worker(self: &Arc<Self>) {
         'outer: while let Ok(msg) = self.receiver.recv() {
             if msg.is_exit_message() {

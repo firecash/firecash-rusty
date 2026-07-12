@@ -257,6 +257,15 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(move |c| c.get_shielded_tree_frontier(block)).await
     }
 
+    /// The shielded effects one chain block applied (coinbase mint + accepted
+    /// post-retain bundles, consensus order) — the wallet-sync stream.
+    pub async fn async_get_shielded_chain_block_data(
+        &self,
+        block: Hash,
+    ) -> ConsensusResult<kaspa_consensus_core::api::ShieldedChainBlockData> {
+        self.clone().spawn_blocking(move |c| c.get_shielded_chain_block_data(block)).await
+    }
+
     pub async fn async_get_sink_timestamp(&self) -> u64 {
         self.clone().spawn_blocking(|c| c.get_sink_timestamp()).await
     }

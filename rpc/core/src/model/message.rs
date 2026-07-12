@@ -447,21 +447,27 @@ impl Deserializer for GetSinkResponse {
 /// Request the shielded note-commitment tree **frontier** at a finality-safe
 /// checkpoint block, so a light wallet can fast-sync (start from the checkpoint and
 /// scan only later blocks) instead of scanning the whole chain.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GetShieldedTreeStateRequest {}
+pub struct GetShieldedTreeStateRequest {
+    /// Optional explicit chain block to checkpoint at; `None` = the node's
+    /// finality point. Pass the pruning point to anchor a full-history scan.
+    pub block_hash: Option<RpcHash>,
+}
 
 impl Serializer for GetShieldedTreeStateRequest {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
+        store!(Option<RpcHash>, &self.block_hash, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetShieldedTreeStateRequest {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
-        Ok(Self {})
+        let version = load!(u16, reader)?;
+        let block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        Ok(Self { block_hash })
     }
 }
 
@@ -500,6 +506,138 @@ impl Deserializer for GetShieldedTreeStateResponse {
         let leaf = load!(RpcHash, reader)?;
         let ommers = load!(Vec<RpcHash>, reader)?;
         Ok(Self { block_hash, daa_score, size, leaf, ommers })
+    }
+}
+
+/// Request the shielded effects applied by the chain blocks after `start_hash`
+/// (a canonical chain block), oldest first: per chain block, its own coinbase
+/// mint and its accepted (post-anchor-retain) shielded bundles in consensus
+/// order. This is the exact stream a wallet ingests to mirror the global
+/// note-commitment tree — scanning raw DAG blocks over `get_blocks` counts
+/// non-chain coinbases that never mint and mis-orders leaves on a wide DAG.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetShieldedBlocksRequest {
+    /// Resume cursor (exclusive); must be a chain block known to the node.
+    pub start_hash: RpcHash,
+    /// Max chain blocks returned (0 = server default).
+    pub limit: u64,
+}
+
+impl Serializer for GetShieldedBlocksRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcHash, &self.start_hash, writer)?;
+        store!(u64, &self.limit, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetShieldedBlocksRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let start_hash = load!(RpcHash, reader)?;
+        let limit = load!(u64, reader)?;
+        Ok(Self { start_hash, limit })
+    }
+}
+
+/// One coinbase output of a shielded chain block: `(script_public_key, value)`.
+/// A 43-byte script is a raw Orchard recipient minting a coinbase note.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcShieldedCoinbaseOutput {
+    pub script_public_key: Vec<u8>,
+    pub value: u64,
+}
+
+impl Serializer for RpcShieldedCoinbaseOutput {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<u8>, &self.script_public_key, writer)?;
+        store!(u64, &self.value, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcShieldedCoinbaseOutput {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let script_public_key = load!(Vec<u8>, reader)?;
+        let value = load!(u64, reader)?;
+        Ok(Self { script_public_key, value })
+    }
+}
+
+/// The shielded effects one chain block applied (see [`GetShieldedBlocksRequest`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcShieldedChainBlock {
+    pub hash: RpcHash,
+    pub blue_score: u64,
+    pub daa_score: u64,
+    pub coinbase_txid: RpcHash,
+    pub coinbase_outputs: Vec<RpcShieldedCoinbaseOutput>,
+    /// Accepted shielded bundle payloads, consensus accepted order, post-retain.
+    pub accepted_bundles: Vec<Vec<u8>>,
+}
+
+impl Serializer for RpcShieldedChainBlock {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcHash, &self.hash, writer)?;
+        store!(u64, &self.blue_score, writer)?;
+        store!(u64, &self.daa_score, writer)?;
+        store!(RpcHash, &self.coinbase_txid, writer)?;
+        serialize!(Vec<RpcShieldedCoinbaseOutput>, &self.coinbase_outputs, writer)?;
+        store!(Vec<Vec<u8>>, &self.accepted_bundles, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcShieldedChainBlock {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let hash = load!(RpcHash, reader)?;
+        let blue_score = load!(u64, reader)?;
+        let daa_score = load!(u64, reader)?;
+        let coinbase_txid = load!(RpcHash, reader)?;
+        let coinbase_outputs = deserialize!(Vec<RpcShieldedCoinbaseOutput>, reader)?;
+        let accepted_bundles = load!(Vec<Vec<u8>>, reader)?;
+        Ok(Self { hash, blue_score, daa_score, coinbase_txid, coinbase_outputs, accepted_bundles })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetShieldedBlocksResponse {
+    /// Chain blocks after the cursor, oldest first.
+    pub blocks: Vec<RpcShieldedChainBlock>,
+    /// True when `start_hash` was reorged off the selected chain — the caller's
+    /// view is stale and it must roll back / rescan.
+    pub reorged: bool,
+    /// The sink's blue score at reply time, so the caller can hold back a
+    /// maturity margin (ingest only blocks a safe depth below the tip).
+    pub sink_blue_score: u64,
+}
+
+impl Serializer for GetShieldedBlocksResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(Vec<RpcShieldedChainBlock>, &self.blocks, writer)?;
+        store!(bool, &self.reorged, writer)?;
+        store!(u64, &self.sink_blue_score, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetShieldedBlocksResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let blocks = deserialize!(Vec<RpcShieldedChainBlock>, reader)?;
+        let reorged = load!(bool, reader)?;
+        let sink_blue_score = load!(u64, reader)?;
+        Ok(Self { blocks, reorged, sink_blue_score })
     }
 }
 

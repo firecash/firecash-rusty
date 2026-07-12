@@ -238,8 +238,13 @@ message GetSinkResponseMessage {
 }
 
 // GetShieldedTreeStateRequestMessage requests the shielded note-commitment tree
-// frontier at a finality-safe checkpoint, letting a light wallet fast-sync.
-message GetShieldedTreeStateRequestMessage {}
+// frontier at a checkpoint block, letting a light wallet fast-sync. With no
+// blockHash the node picks its finality point; pass an explicit chain block
+// (e.g. the pruning point) to anchor a full-history scan at correct absolute
+// tree positions once pruning has moved past genesis.
+message GetShieldedTreeStateRequestMessage {
+  string blockHash = 1;                 // optional explicit chain block (hex); empty = finality point
+}
 
 message GetShieldedTreeStateResponseMessage {
   string blockHash = 1;                 // the checkpoint block (hex hash)
@@ -247,6 +252,36 @@ message GetShieldedTreeStateResponseMessage {
   uint64 size = 3;                      // leaves summarised by the frontier
   string leaf = 4;                      // last frontier leaf (hex); zero hash when size == 0
   repeated string ommers = 5;           // frontier ommers (hex)
+  RPCError error = 1000;
+}
+
+// GetShieldedBlocksRequestMessage requests the shielded effects applied by the
+// chain blocks after startHash (a canonical chain block), oldest first — the
+// exact per-chain-block stream a wallet ingests to mirror the note-commitment
+// tree (coinbase mint + accepted post-retain bundles in consensus order).
+message GetShieldedBlocksRequestMessage {
+  string startHash = 1;                 // resume cursor (exclusive); must be a chain block
+  uint64 limit = 2;                     // max chain blocks returned (0 = server default)
+}
+
+message RpcShieldedCoinbaseOutput {
+  string scriptPublicKey = 1;           // hex; a 43-byte script is a raw Orchard recipient
+  uint64 value = 2;
+}
+
+message RpcShieldedChainBlock {
+  string hash = 1;
+  uint64 blueScore = 2;
+  uint64 daaScore = 3;
+  string coinbaseTxid = 4;
+  repeated RpcShieldedCoinbaseOutput coinbaseOutputs = 5;
+  repeated string acceptedBundles = 6;  // hex shielded payloads, consensus accepted order
+}
+
+message GetShieldedBlocksResponseMessage {
+  repeated RpcShieldedChainBlock blocks = 1;
+  bool reorged = 2;                     // true: startHash reorged out; caller must rescan
+  uint64 sinkBlueScore = 3;             // lets the wallet hold back a maturity margin
   RPCError error = 1000;
 }
 
