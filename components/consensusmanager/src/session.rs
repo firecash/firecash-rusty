@@ -250,10 +250,7 @@ impl ConsensusSessionOwned {
 
     /// The shielded note-commitment tree frontier at `block`, as raw parts
     /// `(size, last_leaf, ommers)` — the fast-sync checkpoint a light wallet uses.
-    pub async fn async_get_shielded_tree_frontier(
-        &self,
-        block: Hash,
-    ) -> ConsensusResult<(u64, Option<[u8; 32]>, Vec<[u8; 32]>)> {
+    pub async fn async_get_shielded_tree_frontier(&self, block: Hash) -> ConsensusResult<(u64, Option<[u8; 32]>, Vec<[u8; 32]>)> {
         self.clone().spawn_blocking(move |c| c.get_shielded_tree_frontier(block)).await
     }
 

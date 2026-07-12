@@ -181,14 +181,22 @@ mod tests {
     #[test]
     fn commitment_extracted_when_present_once() {
         let cb = coinbase_committing(hfc());
-        let aux = AuxPow { parent_header: Header::from_precomputed_hash(Default::default(), vec![]), parent_coinbase: cb, coinbase_merkle_branch: vec![] };
+        let aux = AuxPow {
+            parent_header: Header::from_precomputed_hash(Default::default(), vec![]),
+            parent_coinbase: cb,
+            coinbase_merkle_branch: vec![],
+        };
         assert_eq!(aux.committed_hash(), Some(hfc()));
     }
 
     #[test]
     fn commitment_absent_returns_none() {
         let cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, vec![0u8; 40]);
-        let aux = AuxPow { parent_header: Header::from_precomputed_hash(Default::default(), vec![]), parent_coinbase: cb, coinbase_merkle_branch: vec![] };
+        let aux = AuxPow {
+            parent_header: Header::from_precomputed_hash(Default::default(), vec![]),
+            parent_coinbase: cb,
+            coinbase_merkle_branch: vec![],
+        };
         assert_eq!(aux.committed_hash(), None);
     }
 
@@ -201,7 +209,11 @@ mod tests {
         payload.extend_from_slice(&MERGE_MINE_MAGIC);
         payload.extend_from_slice(&hfc().as_bytes());
         let cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, payload);
-        let aux = AuxPow { parent_header: Header::from_precomputed_hash(Default::default(), vec![]), parent_coinbase: cb, coinbase_merkle_branch: vec![] };
+        let aux = AuxPow {
+            parent_header: Header::from_precomputed_hash(Default::default(), vec![]),
+            parent_coinbase: cb,
+            coinbase_merkle_branch: vec![],
+        };
         assert_eq!(aux.committed_hash(), None, "two commitments must be rejected as ambiguous");
     }
 
@@ -211,7 +223,11 @@ mod tests {
         payload.extend_from_slice(&MERGE_MINE_MAGIC);
         payload.extend_from_slice(&[0u8; 10]); // fewer than 32 bytes follow
         let cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, payload);
-        let aux = AuxPow { parent_header: Header::from_precomputed_hash(Default::default(), vec![]), parent_coinbase: cb, coinbase_merkle_branch: vec![] };
+        let aux = AuxPow {
+            parent_header: Header::from_precomputed_hash(Default::default(), vec![]),
+            parent_coinbase: cb,
+            coinbase_merkle_branch: vec![],
+        };
         assert_eq!(aux.committed_hash(), None);
     }
 

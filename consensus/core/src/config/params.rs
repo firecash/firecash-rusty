@@ -433,11 +433,7 @@ impl Params {
     #[inline]
     #[must_use]
     pub fn difficulty_ramp_end_blue_score(&self) -> u64 {
-        if self.difficulty_ramp_blocks == 0 {
-            0
-        } else {
-            self.low_difficulty_start_blocks.saturating_add(self.difficulty_ramp_blocks)
-        }
+        if self.difficulty_ramp_blocks == 0 { 0 } else { self.low_difficulty_start_blocks.saturating_add(self.difficulty_ramp_blocks) }
     }
     /// Returns the past median time sample rate
     #[inline]

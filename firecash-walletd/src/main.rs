@@ -47,7 +47,7 @@ use kaspa_shielded_core::message::{FVK_LEN, SIG_LEN, sign_message, verify_messag
 use kaspa_shielded_core::orchard_recipient_bytes;
 use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
-use kaspa_shielded_core::wallet::build::{build_wallet_payment, finalize_payment, prepare_payment, proving_key, PreparedPayment};
+use kaspa_shielded_core::wallet::build::{PreparedPayment, build_wallet_payment, finalize_payment, prepare_payment, proving_key};
 use kaspa_shielded_core::walletdb::WalletDb;
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 use serde::{Deserialize, Serialize};
@@ -561,10 +561,7 @@ fn ingest_shielded_chain_block(db: &mut WalletDb, blk: &RpcShieldedChainBlock) {
 async fn replay_matured(client: &GrpcClient, mut db: WalletDb) -> Result<WalletDb, String> {
     let dag = client.get_block_dag_info().await.map_err(|e| format!("get_block_dag_info failed: {e}"))?;
     let start = dag.pruning_point_hash;
-    let ts = client
-        .get_shielded_tree_state(Some(start))
-        .await
-        .map_err(|e| format!("get_shielded_tree_state({start}) failed: {e}"))?;
+    let ts = client.get_shielded_tree_state(Some(start)).await.map_err(|e| format!("get_shielded_tree_state({start}) failed: {e}"))?;
     if ts.block_hash != start {
         return Err("node does not support explicit tree-state checkpoints (update the node)".into());
     }
@@ -577,8 +574,7 @@ async fn replay_matured(client: &GrpcClient, mut db: WalletDb) -> Result<WalletD
 
     let mut low = start;
     loop {
-        let resp =
-            client.get_shielded_blocks(low, SHIELDED_PAGE).await.map_err(|e| format!("get_shielded_blocks failed: {e}"))?;
+        let resp = client.get_shielded_blocks(low, SHIELDED_PAGE).await.map_err(|e| format!("get_shielded_blocks failed: {e}"))?;
         if resp.reorged {
             return Err("chain reorged during the matured replay; retry".into());
         }
@@ -773,9 +769,16 @@ async fn sync_loop(state: Arc<AppState>) {
                 let advanced = e.scanned.saturating_sub(e.saved_scanned);
                 let just_caught_up = e.caught_up && !was_caught_up;
                 if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0)) {
-                    if let Err(err) =
-                        save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue)
-                    {
+                    if let Err(err) = save_checkpoint(
+                        &state.wallet_dir,
+                        &token,
+                        &e.genesis,
+                        &e.low,
+                        e.scanned as u64,
+                        &e.db,
+                        &e.boundaries,
+                        e.sink_blue,
+                    ) {
                         eprintln!("checkpoint write failed for {token}: {err}");
                     } else {
                         e.saved_scanned = e.scanned;
@@ -1163,10 +1166,9 @@ async fn wallet_send(
                         let mut inputs = Vec::with_capacity(n_notes);
                         let mut positions = Vec::with_capacity(n_notes);
                         for note in &candidates[idx..idx + n_notes] {
-                            let path = e
-                                .db
-                                .witness_path_at(note.position, matured)
-                                .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                            let path =
+                                e.db.witness_path_at(note.position, matured)
+                                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
                             inputs.push((note.note.clone(), path));
                             positions.push(note.position);
                         }
@@ -1225,11 +1227,7 @@ async fn wallet_send(
     let mut txids: Vec<String> = Vec::with_capacity(tx_count);
     let mut sent = 0u64;
     for (ci, (inputs, pay, positions)) in chunks.into_iter().enumerate() {
-        log::info!(
-            "send: building Orchard proof for tx {}/{tx_count} ({} spends, {pay} sompi + {fee} fee)...",
-            ci + 1,
-            inputs.len()
-        );
+        log::info!("send: building Orchard proof for tx {}/{tx_count} ({} spends, {pay} sompi + {fee} fee)...", ci + 1, inputs.len());
         let ctx2 = ctx.clone();
         let started = std::time::Instant::now();
         let payload = tokio::task::spawn_blocking(move || build_wallet_payment(seed, inputs, recipient, pay, fee, &net, &ctx2))

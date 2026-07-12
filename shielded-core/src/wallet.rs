@@ -488,8 +488,7 @@ pub mod build {
         use group::ff::PrimeField;
 
         let (first_note, first_path) = inputs.first().ok_or(BuildError::Empty)?;
-        let recipient =
-            Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
+        let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
         let change_addr = fvk.address_at(0u32, Scope::External);
         let total_in: u64 = inputs.iter().map(|(n, _)| n.value().inner()).sum();
         let change = total_in.checked_sub(amount).and_then(|v| v.checked_sub(fee)).ok_or(BuildError::Empty)?;
@@ -549,10 +548,7 @@ pub mod build {
 
     /// SERVER role: apply the device's spend-auth signatures, finalize IO, and emit the
     /// verifiable wire bundle. Still never touches the spend key.
-    pub fn finalize_payment(
-        mut prepared: PreparedPayment,
-        device_sigs: Vec<(usize, [u8; 64])>,
-    ) -> Result<ShieldedBundle, BuildError> {
+    pub fn finalize_payment(mut prepared: PreparedPayment, device_sigs: Vec<(usize, [u8; 64])>) -> Result<ShieldedBundle, BuildError> {
         let sighash = prepared.sighash;
         let mut rng = rand::rngs::OsRng;
         for (i, sig) in device_sigs {
@@ -637,8 +633,7 @@ pub mod build {
             // A note worth 10_000 owned by the wallet, alone at tree position 0.
             let rho = Option::<Rho>::from(Rho::from_bytes(&canon(1))).unwrap();
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(2), &rho)).unwrap();
-            let note =
-                Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
             let auth_path: [MerkleHashOrchard; 32] =
                 core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
             let merkle_path = MerklePath::from_parts(0, auth_path);
@@ -699,24 +694,16 @@ pub mod build {
 
             let rho = Option::<Rho>::from(Rho::from_bytes(&canon(3))).unwrap();
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(4), &rho)).unwrap();
-            let note =
-                Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
             let auth_path: [MerkleHashOrchard; 32] =
                 core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
             let merkle_path = MerklePath::from_parts(0, auth_path);
             let recipient = ShieldedKeys::from_seed([8u8; 32]).unwrap().address();
 
             // SERVER (viewing key only): pay 6_000, fee 1_000 → change 3_000.
-            let prepared = prepare_payment(
-                &keys.fvk,
-                vec![(note, merkle_path)],
-                recipient.to_raw_address_bytes(),
-                6_000,
-                1_000,
-                &net,
-                ctx,
-            )
-            .expect("prepare");
+            let prepared =
+                prepare_payment(&keys.fvk, vec![(note, merkle_path)], recipient.to_raw_address_bytes(), 6_000, 1_000, &net, ctx)
+                    .expect("prepare");
             assert_eq!(prepared.value_balance, 1_000);
             assert_eq!(prepared.spend_auth_requests.len(), 1, "exactly one real spend to authorize");
             let sh = prepared.sighash;
@@ -783,6 +770,6 @@ pub mod build {
 
 #[cfg(feature = "circuit")]
 pub use build::{
-    BuildError, PreparedPayment, ShieldedKeys, build_output_only_bundle, build_payment_bundle, build_spend_bundle,
-    finalize_payment, prepare_payment, sign_spend_auth, to_wire,
+    BuildError, PreparedPayment, ShieldedKeys, build_output_only_bundle, build_payment_bundle, build_spend_bundle, finalize_payment,
+    prepare_payment, sign_spend_auth, to_wire,
 };

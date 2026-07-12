@@ -11,18 +11,18 @@
 //! `/info/shielded` endpoint — all servable straight from the node.
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
-    Json, Router,
 };
 use clap::Parser;
 use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
 use kaspa_grpc_client::GrpcClient;
-use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode, RpcBlock, RpcHash};
+use kaspa_rpc_core::{RpcBlock, RpcHash, api::rpc::RpcApi, notify::mode::NotificationMode};
 use kaspa_shielded_core::bundle::ShieldedBundle;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     sync::Arc,
@@ -492,10 +492,7 @@ async fn transaction_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String
     // Find which recent block carries this tx id.
     let block_hash = {
         let recent = s.recent.read().await;
-        recent
-            .iter()
-            .find(|b| b.txs.iter().any(|t| t.tx_id == id))
-            .map(|b| b.block_hash.clone())
+        recent.iter().find(|b| b.txs.iter().any(|t| t.tx_id == id)).map(|b| b.block_hash.clone())
     };
     let Some(block_hash) = block_hash else {
         return err(format!("transaction {id} not found in the recent window"));
@@ -577,37 +574,47 @@ async fn transaction_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String
 /// `outputs[].verboseData.scriptPublicKeyAddress`). Shielded (43-byte) output scripts
 /// render their firecash: address.
 fn tx_json(tx: &kaspa_rpc_core::RpcTransaction) -> Value {
-    let outputs = tx.outputs.iter().map(|o| {
-        let script = o.script_public_key.script();
-        let shielded = script.len() == ORCHARD_SCRIPT_LEN;
-        let address = if shielded {
-            String::from(&kaspa_addresses::Address::new(
-                kaspa_addresses::Prefix::Mainnet,
-                kaspa_addresses::Version::ShieldedOrchard,
-                script,
-            ))
-        } else {
-            String::new()
-        };
-        json!({
-            "amount": o.value,
-            "scriptPublicKey": { "version": o.script_public_key.version(), "scriptPublicKey": hexs(script) },
-            "verboseData": {
-                "scriptPublicKeyType": if shielded { "shielded" } else { "pubkey" },
-                "scriptPublicKeyAddress": address,
-            },
+    let outputs = tx
+        .outputs
+        .iter()
+        .map(|o| {
+            let script = o.script_public_key.script();
+            let shielded = script.len() == ORCHARD_SCRIPT_LEN;
+            let address = if shielded {
+                String::from(&kaspa_addresses::Address::new(
+                    kaspa_addresses::Prefix::Mainnet,
+                    kaspa_addresses::Version::ShieldedOrchard,
+                    script,
+                ))
+            } else {
+                String::new()
+            };
+            json!({
+                "amount": o.value,
+                "scriptPublicKey": { "version": o.script_public_key.version(), "scriptPublicKey": hexs(script) },
+                "verboseData": {
+                    "scriptPublicKeyType": if shielded { "shielded" } else { "pubkey" },
+                    "scriptPublicKeyAddress": address,
+                },
+            })
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
 
-    let inputs = tx.inputs.iter().map(|i| json!({
-        "previousOutpoint": {
-            "transactionId": i.previous_outpoint.transaction_id.to_string(),
-            "index": i.previous_outpoint.index,
-        },
-        "signatureScript": hexs(&i.signature_script),
-        "sequence": i.sequence,
-        "sigOpCount": i.sig_op_count,
-    })).collect::<Vec<_>>();
+    let inputs = tx
+        .inputs
+        .iter()
+        .map(|i| {
+            json!({
+                "previousOutpoint": {
+                    "transactionId": i.previous_outpoint.transaction_id.to_string(),
+                    "index": i.previous_outpoint.index,
+                },
+                "signatureScript": hexs(&i.signature_script),
+                "sequence": i.sequence,
+                "sigOpCount": i.sig_op_count,
+            })
+        })
+        .collect::<Vec<_>>();
 
     json!({
         "version": tx.version,
@@ -683,9 +690,8 @@ async fn main() {
         .layer(cors)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&cli.listen)
-        .await
-        .unwrap_or_else(|e| fatal(format!("failed to bind {}: {e}", cli.listen)));
+    let listener =
+        tokio::net::TcpListener::bind(&cli.listen).await.unwrap_or_else(|e| fatal(format!("failed to bind {}: {e}", cli.listen)));
     log::info!("FireCash explorer API listening on http://{}", cli.listen);
     axum::serve(listener, app).await.unwrap_or_else(|e| fatal(format!("server error: {e}")));
 }
