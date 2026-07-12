@@ -17,7 +17,7 @@
 //! `context_is_payload_independent` test pins that these agree.
 
 use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
-use kaspa_consensus_core::tx::{Transaction, TX_VERSION_SHIELDED};
+use kaspa_consensus_core::tx::{TX_VERSION_SHIELDED, Transaction};
 
 /// Build the canonical shielded payment transaction shape carrying `payload` (the
 /// bundle wire bytes from `create_payment`): version-2, native subnetwork, no
@@ -61,5 +61,17 @@ mod tests {
         let ctx = payment_tx_context();
         let finished = payment_tx(vec![0xab; 900]);
         assert_eq!(ctx, finished.shielded_sighash_context());
+    }
+
+    /// The on-device signer (`firecash-signer`, compiled to WASM) cannot depend on
+    /// consensus, so it PINS this context as a byte constant to recompute the sighash
+    /// itself and refuse a malicious prover. If the shielded tx envelope ever changes,
+    /// this fails — and `PAYMENT_TX_CONTEXT` in firecash-signer/src/lib.rs must be
+    /// updated in lockstep, or on-device verification silently breaks every send.
+    #[test]
+    fn context_matches_the_pinned_signer_constant() {
+        let mut pinned = [0u8; 38];
+        pinned[0] = 2; // shielded tx version, LE u16; the rest of the envelope is zero
+        assert_eq!(payment_tx_context(), pinned.to_vec(), "update PAYMENT_TX_CONTEXT in firecash-signer");
     }
 }

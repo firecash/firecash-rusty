@@ -17,7 +17,7 @@
 
 use kaspa_consensus_core::tx::Transaction;
 use kaspa_shielded_core::bundle::ShieldedBundle;
-use kaspa_shielded_core::coinbase::{derive_coinbase_note_desc, CoinbaseNoteDesc};
+use kaspa_shielded_core::coinbase::{CoinbaseNoteDesc, derive_coinbase_note_desc};
 
 /// Length of the raw Orchard address a shielded coinbase output carries in its
 /// script (the recipient of the mining reward). Matches consensus.
@@ -109,7 +109,7 @@ pub fn block_effects(coinbase_tx: &Transaction, accepted_txs: &[&Transaction]) -
 mod tests {
     use super::*;
     use kaspa_consensus_core::subnets::{SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_NATIVE};
-    use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput, TX_VERSION_SHIELDED};
+    use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec, TX_VERSION_SHIELDED, Transaction, TransactionOutput};
 
     /// A 43-byte carrier script for a raw Orchard address, as `pay_to_shielded_address` produces.
     fn orchard_script(recipient: [u8; 43]) -> ScriptPublicKey {

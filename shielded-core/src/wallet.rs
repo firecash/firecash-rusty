@@ -115,6 +115,8 @@ pub mod build {
     use rand::{CryptoRng, RngCore};
     use std::sync::OnceLock;
 
+    pub use crate::payment_check::{ActionDisclosure, PaymentCheckError, check_prepared_payment};
+
     /// The process-wide Orchard [`ProvingKey`], built once and reused.
     ///
     /// `ProvingKey::build()` is a multi-minute Halo 2 keygen; rebuilding it per
@@ -467,6 +469,12 @@ pub mod build {
         pczt: orchard::pczt::Bundle,
         /// The 32-byte sighash the device signs.
         pub sighash: [u8; 32],
+        /// The unsigned bundle (proof + effects, no spend-auth signatures) the device
+        /// must verify and recompute the sighash from — never trust a supplied hash.
+        pub effects: ShieldedBundle,
+        /// Per-action plaintext so the device can check what it is authorizing
+        /// ([`check_prepared_payment`]).
+        pub disclosure: Vec<ActionDisclosure>,
         /// Public fee / value balance of the payment.
         pub value_balance: i64,
         /// One `(action_index, alpha)` per real spend the device must authorize.
@@ -533,7 +541,22 @@ pub mod build {
             pczt.actions_mut()[i].sign(sighash, &ask, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
         }
 
-        Ok(PreparedPayment { pczt, sighash, value_balance, spend_auth_requests })
+        // Disclose each action's plaintext so the device can verify the payment instead
+        // of blind-signing a hash it cannot interpret.
+        let mut disclosure = Vec::with_capacity(pczt.actions().len());
+        for action in pczt.actions().iter() {
+            let out = action.output();
+            let spend = action.spend();
+            disclosure.push(ActionDisclosure {
+                spend_value: spend.value().map(|v| v.inner()).unwrap_or(0),
+                out_value: out.value().ok_or(BuildError::Empty)?.inner(),
+                out_recipient: out.recipient().ok_or(BuildError::Empty)?.to_raw_address_bytes(),
+                out_rseed: *out.rseed().ok_or(BuildError::Empty)?.as_bytes(),
+                rcv: action.rcv().clone().ok_or(BuildError::Empty)?.to_bytes(),
+            });
+        }
+
+        Ok(PreparedPayment { pczt, sighash, effects: effects_wire, value_balance, spend_auth_requests, disclosure })
     }
 
     /// DEVICE role (spend key only): produce the RedPallas spend-auth signature for one
@@ -686,6 +709,85 @@ pub mod build {
 
         /// The reusable non-custodial API end to end, WITH change (so the bundle carries
         /// a padding dummy the server signs and a real spend the device signs).
+        #[test]
+        /// THE ANTI-BLIND-SIGNING GUARD. A device must never sign a hash it cannot
+        /// interpret: a malicious prover would simply hand back the sighash of a payment
+        /// to *itself*. Here the prover is hostile — it prepares a payment to an attacker
+        /// while claiming the user's recipient — and the device catches it with nothing
+        /// but its own viewing key and the prover's disclosure.
+        #[test]
+        fn device_refuses_a_payment_it_did_not_ask_for() {
+            let keys = ShieldedKeys::from_seed([12u8; 32]).unwrap();
+            let net = [0x66u8; 32];
+            let ctx = b"firecash-blind-sign";
+
+            let rho = Option::<Rho>::from(Rho::from_bytes(&canon(5))).unwrap();
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(6), &rho)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
+            let auth_path: [MerkleHashOrchard; 32] =
+                core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+            let merkle_path = MerklePath::from_parts(0, auth_path);
+
+            let intended = ShieldedKeys::from_seed([13u8; 32]).unwrap().address().to_raw_address_bytes();
+            let attacker = ShieldedKeys::from_seed([66u8; 32]).unwrap().address().to_raw_address_bytes();
+
+            // The HOSTILE prover: the user asked to pay `intended` 6_000, but it builds a
+            // bundle paying `attacker` instead. (Everything else is honest, so only the
+            // device's checks stand between the user and the theft.)
+            let evil =
+                prepare_payment(&keys.fvk, vec![(note.clone(), merkle_path.clone())], attacker, 6_000, 1_000, &net, ctx).unwrap();
+
+            // The device checks the bundle against what the USER asked for, and refuses.
+            // (Which action index carries the theft depends on the builder's shuffle.)
+            let verdict = check_prepared_payment(&evil.effects, &evil.disclosure, &keys.fvk, &intended, 6_000, 1_000);
+            assert!(
+                matches!(verdict, Err(PaymentCheckError::UnexpectedRecipient(_))),
+                "device must refuse to pay the attacker, got {verdict:?}"
+            );
+
+            // And the honest payment it DID ask for passes.
+            let good = prepare_payment(&keys.fvk, vec![(note, merkle_path)], intended, 6_000, 1_000, &net, ctx).unwrap();
+            check_prepared_payment(&good.effects, &good.disclosure, &keys.fvk, &intended, 6_000, 1_000)
+                .expect("the payment the user asked for must verify");
+
+            // A prover that lies in its disclosure to make a bad bundle look good is caught
+            // by the commitments, which are in the bundle and bind the real note.
+            for i in 0..good.disclosure.len() {
+                let mut lying = good.disclosure.clone();
+                lying[i].out_value = lying[i].out_value.wrapping_add(1); // "it's smaller than it looks"
+                assert!(
+                    matches!(
+                        check_prepared_payment(&good.effects, &lying, &keys.fvk, &intended, 6_000, 1_000),
+                        Err(PaymentCheckError::CommitmentMismatch(_)) | Err(PaymentCheckError::Malformed(_))
+                    ),
+                    "a lie about an amount must break the note commitment (action {i})"
+                );
+
+                let mut lying = good.disclosure.clone();
+                lying[i].out_recipient = attacker; // "it went to them, but call it the recipient"
+                assert!(
+                    matches!(
+                        check_prepared_payment(&good.effects, &lying, &keys.fvk, &intended, 6_000, 1_000),
+                        Err(PaymentCheckError::CommitmentMismatch(_))
+                    ),
+                    "a lie about a recipient must break the note commitment (action {i})"
+                );
+            }
+
+            // A prover that inflates the fee (skimming the difference) is caught too.
+            assert!(matches!(
+                check_prepared_payment(&good.effects, &good.disclosure, &keys.fvk, &intended, 6_000, 999),
+                Err(PaymentCheckError::FeeMismatch { .. })
+            ));
+
+            // As is one that quietly drops the payment the user wanted to make.
+            let other = ShieldedKeys::from_seed([77u8; 32]).unwrap().address().to_raw_address_bytes();
+            assert!(matches!(
+                check_prepared_payment(&good.effects, &good.disclosure, &keys.fvk, &other, 6_000, 1_000),
+                Err(PaymentCheckError::UnexpectedRecipient(_))
+            ));
+        }
+
         #[test]
         fn non_custodial_payment_api_roundtrip() {
             let keys = ShieldedKeys::from_seed([7u8; 32]).unwrap();

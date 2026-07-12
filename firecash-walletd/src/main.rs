@@ -1642,6 +1642,24 @@ struct PrepareResp {
     fee_sompi: u64,
     /// One randomizer per real spend the device must sign.
     spend_auth: Vec<SpendAuthReq>,
+    /// The unsigned bundle (hex). The device MUST recompute the sighash from this
+    /// itself rather than trust `sighash` above, and MUST verify the bundle against
+    /// `disclosure` before signing — otherwise it is blind-signing whatever this
+    /// daemon says, and a compromised daemon could have it authorize a payment to
+    /// the attacker (`kaspa_shielded_core::wallet::build::check_prepared_payment`).
+    bundle_hex: String,
+    /// Per-action plaintext of the payment, so the device can check what it signs.
+    disclosure: Vec<ActionDisclosureJson>,
+}
+
+/// [`kaspa_shielded_core::wallet::build::ActionDisclosure`] over the wire.
+#[derive(Serialize)]
+struct ActionDisclosureJson {
+    spend_value: u64,
+    out_value: u64,
+    out_recipient: String,
+    out_rseed: String,
+    rcv: String,
 }
 
 async fn wallet_prepare(
@@ -1763,6 +1781,22 @@ async fn wallet_prepare(
     let sighash_hex = hex(&payment.sighash);
     let value_balance = payment.value_balance;
 
+    // Hand the device everything it needs to check this payment for itself: the
+    // unsigned bundle and the plaintext of every action. Anything we lie about here
+    // fails the device's commitment checks, so it can refuse to sign.
+    let bundle_hex = hex(&payment.effects.to_bytes());
+    let disclosure: Vec<ActionDisclosureJson> = payment
+        .disclosure
+        .iter()
+        .map(|d| ActionDisclosureJson {
+            spend_value: d.spend_value,
+            out_value: d.out_value,
+            out_recipient: hex(&d.out_recipient),
+            out_rseed: hex(&d.out_rseed),
+            rcv: hex(&d.rcv),
+        })
+        .collect();
+
     // Park the awaiting-signature payment under a random, unguessable session id.
     let mut sid = [0u8; 24];
     rand::rngs::OsRng.fill_bytes(&mut sid);
@@ -1774,7 +1808,16 @@ async fn wallet_prepare(
         map.insert(session.clone(), PreparedSession { payment, amount, fee, created: now });
     }
 
-    Ok(Json(PrepareResp { session, sighash: sighash_hex, value_balance, amount_sompi: amount, fee_sompi: fee, spend_auth }))
+    Ok(Json(PrepareResp {
+        session,
+        sighash: sighash_hex,
+        value_balance,
+        amount_sompi: amount,
+        fee_sompi: fee,
+        spend_auth,
+        bundle_hex,
+        disclosure,
+    }))
 }
 
 #[derive(Deserialize)]

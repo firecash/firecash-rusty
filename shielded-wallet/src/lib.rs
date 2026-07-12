@@ -22,7 +22,7 @@
 pub mod effects;
 pub mod tx;
 
-pub use effects::{block_effects, coinbase_note_descs, shielded_bundle, BlockShieldedEffects, EffectsError};
+pub use effects::{BlockShieldedEffects, EffectsError, block_effects, coinbase_note_descs, shielded_bundle};
 pub use tx::{payment_tx, payment_tx_context};
 
 use kaspa_shielded_core::ShieldedAccount;
@@ -47,13 +47,13 @@ pub fn ingest_block_effects(account: &mut ShieldedAccount, effects: &BlockShield
 #[cfg(all(test, feature = "circuit"))]
 mod circuit_tests {
     use super::*;
+    use kaspa_addresses::Prefix;
     use kaspa_consensus_core::subnets::SUBNETWORK_ID_COINBASE;
     use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput};
     use kaspa_shielded_core::bundle::ShieldedBundle;
     use kaspa_shielded_core::state::{ShieldedState, ShieldedTx};
     use kaspa_shielded_core::verify::{sighash, verify_bundle};
-    use kaspa_shielded_core::{coinbase::coinbase_mint, ShieldedAccount};
-    use kaspa_addresses::Prefix;
+    use kaspa_shielded_core::{ShieldedAccount, coinbase::coinbase_mint};
 
     #[test]
     fn full_payment_through_real_transactions() {
@@ -79,9 +79,7 @@ mod circuit_tests {
         // Consensus applies the mint; the wallet extracts the SAME effects and scans.
         let eff = block_effects(&cb_tx, &[]).unwrap();
         let mut state = ShieldedState::new();
-        state
-            .apply_chain_block(Some(&coinbase_mint(&eff.coinbase).unwrap()), &[])
-            .unwrap();
+        state.apply_chain_block(Some(&coinbase_mint(&eff.coinbase).unwrap()), &[]).unwrap();
         ingest_block_effects(&mut alice, &eff);
         assert_eq!(alice.balance(), value as u128, "Alice discovered her coinbase note via block extraction");
 
