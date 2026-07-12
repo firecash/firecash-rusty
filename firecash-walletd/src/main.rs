@@ -226,6 +226,61 @@ struct WalletFile {
     /// wallet is born at the current tip, so it needs no historical scan.
     #[serde(default)]
     birthday: u64,
+    /// Non-custodial wallets store their 96-byte FULL VIEWING KEY here and leave
+    /// `seed_hex` empty: the daemon can scan and build proofs, but holds no spend
+    /// authority. Absent in v1 files, which are all seed wallets.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    fvk_hex: String,
+}
+
+/// What key material the daemon holds for a wallet.
+///
+/// `Fvk` is the non-custodial (mobile) case: the device generated the seed, kept it,
+/// and registered only its viewing key. Every spend path is refused for such a wallet
+/// — signatures must come from the device (`/prepare` + `/submit`).
+#[derive(Clone, Copy)]
+enum WalletKey {
+    Seed([u8; 32]),
+    Fvk([u8; 96]),
+}
+
+impl WalletKey {
+    fn is_watch_only(&self) -> bool {
+        matches!(self, WalletKey::Fvk(_))
+    }
+
+    /// The seed, or a 403 telling the caller where spend authority actually lives.
+    fn seed(&self) -> Result<[u8; 32], (StatusCode, Json<serde_json::Value>)> {
+        match self {
+            WalletKey::Seed(s) => Ok(*s),
+            WalletKey::Fvk(_) => Err(err(
+                StatusCode::FORBIDDEN,
+                "this wallet is watch-only: the daemon holds no seed and cannot spend or sign for it. \
+                 Use /api/wallet/prepare + /api/wallet/submit and sign on the device that holds the seed.",
+            )),
+        }
+    }
+
+    fn empty_db(&self) -> Option<WalletDb> {
+        match self {
+            WalletKey::Seed(s) => WalletDb::from_seed(*s),
+            WalletKey::Fvk(f) => WalletDb::from_fvk(f),
+        }
+    }
+
+    fn db_from_checkpoint(&self, bytes: &[u8]) -> Option<WalletDb> {
+        match self {
+            WalletKey::Seed(s) => WalletDb::from_checkpoint(*s, bytes),
+            WalletKey::Fvk(f) => WalletDb::from_checkpoint_fvk(f, bytes),
+        }
+    }
+
+    /// A wallet view fast-synced onto a pruning-point frontier.
+    fn db_from_frontier(&self, fs: &kaspa_shielded_core::tree::FrontierState) -> Option<WalletDb> {
+        let mut db = self.empty_db()?;
+        db.apply_frontier(fs)?;
+        Some(db)
+    }
 }
 
 fn wallet_path(dir: &str, token: &str) -> String {
@@ -265,11 +320,16 @@ fn decrypt_seed(blob: &[u8], secret: &str) -> Result<[u8; 32], String> {
     <[u8; 32]>::try_from(pt.as_slice()).map_err(|_| "decrypted seed is not 32 bytes".to_string())
 }
 
-/// Load a wallet's (seed, birthday) from disk, decrypting the seed with `secret`
-/// when the file is encrypted.
-fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<([u8; 32], u64)> {
+/// Load a wallet's (key, birthday) from disk, decrypting the seed with `secret`
+/// when the file is encrypted. A file carrying an `fvk_hex` is a watch-only
+/// (non-custodial) wallet: there is no seed on this machine to decrypt.
+fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<(WalletKey, u64)> {
     let bytes = std::fs::read(wallet_path(dir, token)).ok()?;
     let wf: WalletFile = serde_json::from_slice(&bytes).ok()?;
+    if !wf.fvk_hex.is_empty() {
+        let fvk = unhex(&wf.fvk_hex).and_then(|b| <[u8; 96]>::try_from(b.as_slice()).ok())?;
+        return Some((WalletKey::Fvk(fvk), wf.birthday));
+    }
     let seed = if wf.encrypted {
         let blob = unhex(&wf.seed_hex)?;
         let secret = secret.or_else(|| {
@@ -280,7 +340,7 @@ fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<([u8
     } else {
         unhex(&wf.seed_hex).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())?
     };
-    Some((seed, wf.birthday))
+    Some((WalletKey::Seed(seed), wf.birthday))
 }
 
 fn wallet_exists(dir: &str, token: &str) -> bool {
@@ -288,7 +348,6 @@ fn wallet_exists(dir: &str, token: &str) -> bool {
 }
 
 fn save_seed(dir: &str, token: &str, network: &str, seed: &[u8; 32], birthday: u64, secret: Option<&str>) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
     let (seed_hex, encrypted) = match secret {
         Some(s) => {
             let blob = encrypt_seed(seed, s).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -296,9 +355,29 @@ fn save_seed(dir: &str, token: &str, network: &str, seed: &[u8; 32], birthday: u
         }
         None => (hex(seed), false),
     };
-    let wf = WalletFile { version: 1, network: network.to_string(), seed_hex, encrypted, birthday };
+    let wf = WalletFile { version: 1, network: network.to_string(), seed_hex, encrypted, birthday, fvk_hex: String::new() };
+    write_wallet_file(dir, token, &wf)
+}
+
+/// Persist a **watch-only** wallet: only the full viewing key is written — there is
+/// no seed to protect, so `--wallet-secret` encryption is moot. A compromise of this
+/// file leaks the ability to *see* the wallet, never to spend it.
+fn save_fvk(dir: &str, token: &str, network: &str, fvk: &[u8; 96], birthday: u64) -> std::io::Result<()> {
+    let wf = WalletFile {
+        version: 2,
+        network: network.to_string(),
+        seed_hex: String::new(),
+        encrypted: false,
+        birthday,
+        fvk_hex: hex(fvk),
+    };
+    write_wallet_file(dir, token, &wf)
+}
+
+fn write_wallet_file(dir: &str, token: &str, wf: &WalletFile) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
     let path = wallet_path(dir, token);
-    std::fs::write(&path, serde_json::to_vec_pretty(&wf).expect("serializes"))?;
+    std::fs::write(&path, serde_json::to_vec_pretty(wf).expect("serializes"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -383,7 +462,7 @@ fn save_checkpoint(
 fn load_checkpoint(
     dir: &str,
     token: &str,
-    seed: [u8; 32],
+    key: WalletKey,
     current_genesis: &RpcHash,
 ) -> Option<(WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64)> {
     let buf = std::fs::read(scan_path(dir, token)).ok()?;
@@ -404,7 +483,7 @@ fn load_checkpoint(
         Some(s)
     };
     let db_len = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?) as usize;
-    let db = WalletDb::from_checkpoint(seed, take(&mut pos, db_len)?)?;
+    let db = key.db_from_checkpoint(take(&mut pos, db_len)?)?;
     let ring_len = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?) as usize;
     let mut boundaries = VecDeque::with_capacity(ring_len.min(MATURED_RING));
     for _ in 0..ring_len {
@@ -476,7 +555,8 @@ async fn fetch_shielded_page(
 // ---------------------------------------------------------------------------
 
 struct WalletEntry {
-    seed: [u8; 32],
+    /// Spend authority (seed) — or, for a non-custodial wallet, viewing key only.
+    key: WalletKey,
     db: WalletDb,
     /// The network genesis hash — guards the persisted checkpoint against a chain
     /// relaunch (and is also the shielded sighash network domain).
@@ -526,7 +606,7 @@ impl WalletEntry {
     /// `saved_scanned == scanned` so the next checkpoint write waits for
     /// genuinely new blocks.
     fn from_parts(
-        seed: [u8; 32],
+        key: WalletKey,
         db: WalletDb,
         genesis: RpcHash,
         low: RpcHash,
@@ -535,7 +615,7 @@ impl WalletEntry {
         sink_blue: u64,
     ) -> Self {
         Self {
-            seed,
+            key,
             db,
             genesis,
             low,
@@ -717,7 +797,13 @@ struct PreparedSession {
 const PREPARED_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl AppState {
-    fn address_for(&self, seed: &[u8; 32]) -> Option<String> {
+    /// The wallet's receive address, taken from its view (works for seed and
+    /// watch-only wallets alike — both know the address).
+    fn address_of(&self, db: &WalletDb) -> String {
+        String::from(&Address::new(self.prefix, Version::ShieldedOrchard, &db.my_address_bytes()))
+    }
+
+    fn address_for_seed(&self, seed: &[u8; 32]) -> Option<String> {
         let raw = address_bytes_from_seed(*seed)?;
         Some(String::from(&Address::new(self.prefix, Version::ShieldedOrchard, &raw)))
     }
@@ -738,7 +824,7 @@ impl AppState {
     /// gate was a live bug: imported wallets silently showed less than their real
     /// balance ("fully synced but missing coins") because their older notes were
     /// behind the fast-sync base.
-    async fn fast_sync_entry(&self, seed: [u8; 32], guard: RpcHash, birthday: u64) -> Option<WalletEntry> {
+    async fn fast_sync_entry(&self, key: WalletKey, guard: RpcHash, birthday: u64) -> Option<WalletEntry> {
         // Bound the checkpoint RPC: on a healthy chain it returns immediately, but the
         // node's finality-point walk can be pathologically slow on a degenerate DAG
         // (e.g. difficulty collapsed to the floor). Time it out and fall back to a full
@@ -756,10 +842,10 @@ impl AppState {
             leaf: (cp.size > 0).then(|| cp.leaf.as_bytes()),
             ommers: cp.ommers.iter().map(|h| h.as_bytes()).collect(),
         };
-        let db = WalletDb::from_frontier(seed, &fs)?;
+        let db = key.db_from_frontier(&fs)?;
         // low = the checkpoint chain block; sync resumes strictly after it.
         // Progress is proxied by its DAA score so status reads "near tip".
-        Some(WalletEntry::from_parts(seed, db, guard, cp.block_hash, cp.daa_score as usize, VecDeque::new(), 0))
+        Some(WalletEntry::from_parts(key, db, guard, cp.block_hash, cp.daa_score as usize, VecDeque::new(), 0))
     }
 
     /// Full-history wallet entry: the tree is anchored at the **pruning-point
@@ -767,7 +853,7 @@ impl AppState {
     /// after pruning advances past genesis) and every later chain block is
     /// scanned. Used when the wallet may hold funds older than the fast-sync
     /// checkpoint (birthday 0 / early birthday).
-    async fn full_scan_entry(&self, seed: [u8; 32], guard: RpcHash) -> Option<WalletEntry> {
+    async fn full_scan_entry(&self, key: WalletKey, guard: RpcHash) -> Option<WalletEntry> {
         let start = self.client.get_block_dag_info().await.ok()?.pruning_point_hash;
         let ts = self.client.get_shielded_tree_state(Some(start)).await.ok()?;
         if ts.block_hash != start {
@@ -779,8 +865,8 @@ impl AppState {
             leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
             ommers: ts.ommers.iter().map(|h| h.as_bytes()).collect(),
         };
-        let db = WalletDb::from_frontier(seed, &fs)?;
-        Some(WalletEntry::from_parts(seed, db, guard, start, ts.daa_score as usize, VecDeque::new(), 0))
+        let db = key.db_from_frontier(&fs)?;
+        Some(WalletEntry::from_parts(key, db, guard, start, ts.daa_score as usize, VecDeque::new(), 0))
     }
 
     /// Fetch a loaded wallet for a token, loading it from disk on first use.
@@ -791,18 +877,18 @@ impl AppState {
                 return Some(w.clone());
             }
         }
-        let (seed, birthday) = load_wallet_meta(&self.wallet_dir, token, self.wallet_secret.as_deref())?;
+        let (key, birthday) = load_wallet_meta(&self.wallet_dir, token, self.wallet_secret.as_deref())?;
         let genesis = self.genesis;
         // Resume from a persisted checkpoint when one is present and version/genesis
         // valid; otherwise fast-sync (birthday-gated: a fast-synced wallet is blind
         // to notes older than its base) or the pruning-point full scan.
-        let entry = match load_checkpoint(&self.wallet_dir, token, seed, &genesis) {
+        let entry = match load_checkpoint(&self.wallet_dir, token, key, &genesis) {
             Some((db, low, scanned, boundaries, sink_blue)) => {
-                WalletEntry::from_parts(seed, db, genesis, low, scanned, boundaries, sink_blue)
+                WalletEntry::from_parts(key, db, genesis, low, scanned, boundaries, sink_blue)
             }
-            None => match self.fast_sync_entry(seed, genesis, birthday).await {
+            None => match self.fast_sync_entry(key, genesis, birthday).await {
                 Some(e) => e,
-                None => self.full_scan_entry(seed, genesis).await?,
+                None => self.full_scan_entry(key, genesis).await?,
             },
         };
         let w = Arc::new(Mutex::new(entry));
@@ -924,6 +1010,10 @@ struct StatusResp {
     note_count: usize,
     updated_unix: u64,
     error: Option<String>,
+    /// True when the daemon holds only this wallet's viewing key: it can show the
+    /// balance but cannot spend. Sends must go through /prepare + /submit with the
+    /// signature produced on the device that holds the seed.
+    watch_only: bool,
 }
 
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<StatusResp> {
@@ -947,13 +1037,15 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         note_count: 0,
         updated_unix: 0,
         error: None,
+        watch_only: false,
     };
 
     if let Some(token) = token {
         if let Some(w) = state.get_wallet(&token).await {
             let e = w.lock().await;
             resp.has_wallet = true;
-            resp.address = state.address_for(&e.seed);
+            resp.address = Some(state.address_of(&e.db));
+            resp.watch_only = e.key.is_watch_only();
             let tip = e.chain_len.max(daa_score);
             resp.synced = e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip;
             resp.scanned_blocks = e.scanned;
@@ -988,7 +1080,7 @@ async fn wallet_create(
     let mut seed = [0u8; 32];
     let address = loop {
         rand::rngs::OsRng.fill_bytes(&mut seed);
-        if let Some(addr) = state.address_for(&seed) {
+        if let Some(addr) = state.address_for_seed(&seed) {
             break addr;
         }
     };
@@ -1025,7 +1117,8 @@ async fn wallet_import(
     }
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&bytes);
-    let address = state.address_for(&seed).ok_or_else(|| err(StatusCode::BAD_REQUEST, "seed is not a valid Orchard spending key"))?;
+    let address =
+        state.address_for_seed(&seed).ok_or_else(|| err(StatusCode::BAD_REQUEST, "seed is not a valid Orchard spending key"))?;
     load_new_wallet(&state, &token, seed, req.birthday).await?;
     Ok(Json(CreateResp {
         address,
@@ -1050,10 +1143,10 @@ async fn load_new_wallet(
     let _ = std::fs::remove_file(scan_path(&state.wallet_dir, token));
     // Fast-sync from the node's frontier when the wallet is born after the
     // checkpoint (complete by construction); otherwise the pruning-point full scan.
-    let entry = match state.fast_sync_entry(seed, state.genesis, birthday).await {
+    let entry = match state.fast_sync_entry(WalletKey::Seed(seed), state.genesis, birthday).await {
         Some(e) => e,
         None => state
-            .full_scan_entry(seed, state.genesis)
+            .full_scan_entry(WalletKey::Seed(seed), state.genesis)
             .await
             .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "cannot anchor a full scan (node unreachable or too old)"))?,
     };
@@ -1073,7 +1166,7 @@ async fn wallet_address(
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
-    let address = state.address_for(&e.seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?;
+    let address = state.address_of(&e.db);
     Ok(Json(AddressResp { address }))
 }
 
@@ -1095,8 +1188,56 @@ async fn wallet_reveal(
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
-    let address = state.address_for(&e.seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?;
-    Ok(Json(RevealResp { address, seed_hex: hex(&e.seed), network: state.network.clone() }))
+    let address = state.address_of(&e.db);
+    let seed = e.key.seed()?;
+    Ok(Json(RevealResp { address, seed_hex: hex(&seed), network: state.network.clone() }))
+}
+
+#[derive(Deserialize)]
+struct WatchReq {
+    /// 96-byte full viewing key (hex), derived on the device from a seed the daemon
+    /// never sees.
+    fvk_hex: String,
+    /// Birth DAA score. A wallet generated on-device right now is born at the tip and
+    /// needs no historical scan; 0 means "may hold funds from any height" → full scan.
+    #[serde(default)]
+    birthday: u64,
+}
+
+/// Register a **watch-only** wallet for this token: the daemon syncs it, shows its
+/// balance and builds spend *proofs* for it, but never holds spend authority. This is
+/// the non-custodial (mobile) registration path — the device keeps the seed, sends only
+/// the viewing key, and signs every spend itself via `/prepare` + `/submit`.
+///
+/// A daemon compromise then leaks *visibility* into these wallets, never their coins.
+async fn wallet_watch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<WatchReq>,
+) -> Result<Json<AddressResp>, (StatusCode, Json<serde_json::Value>)> {
+    let token = token_from(&headers, state.allow_default_token)?;
+    let fvk = unhex(&req.fvk_hex)
+        .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex must be 96 bytes of hex"))?;
+    let key = WalletKey::Fvk(fvk);
+    let db = key.empty_db().ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?;
+    let address = state.address_of(&db);
+
+    save_fvk(&state.wallet_dir, &token, &state.network, &fvk, req.birthday)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
+    // A re-registered key must rescan from its own birthday, not resume another
+    // wallet's checkpoint stream.
+    let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
+    let entry = match state.fast_sync_entry(key, state.genesis, req.birthday).await {
+        Some(e) => e,
+        None => state
+            .full_scan_entry(key, state.genesis)
+            .await
+            .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "cannot anchor a full scan (node unreachable or too old)"))?,
+    };
+    state.wallets.lock().await.insert(token.clone(), Arc::new(Mutex::new(entry)));
+    log::info!("registered watch-only wallet for token {token} (birthday {})", req.birthday);
+    Ok(Json(AddressResp { address }))
 }
 
 #[derive(Serialize)]
@@ -1186,7 +1327,7 @@ async fn wallet_send(
 ) -> Result<Json<SendResp>, (StatusCode, Json<serde_json::Value>)> {
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
-    let seed = { w.lock().await.seed };
+    let seed = { w.lock().await.key.seed()? };
 
     let amount = match (req.amount_sompi, req.amount_fc) {
         (Some(s), _) => s,
@@ -1377,7 +1518,7 @@ async fn wallet_consolidate(
 ) -> Result<Json<ConsolidateResp>, (StatusCode, Json<serde_json::Value>)> {
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
-    let seed = { w.lock().await.seed };
+    let seed = { w.lock().await.key.seed()? };
     let fee = body.and_then(|Json(b)| b.fee).unwrap_or(3_000_000);
     let own_recipient =
         address_bytes_from_seed(seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "seed is not a valid spending key"))?;
@@ -1484,6 +1625,7 @@ struct PrepareResp {
 
 async fn wallet_prepare(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<PrepareReq>,
 ) -> Result<Json<PrepareResp>, (StatusCode, Json<serde_json::Value>)> {
     use rand::RngCore;
@@ -1509,33 +1651,64 @@ async fn wallet_prepare(
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "recipient is not a shielded Orchard address"))?;
     let need = amount.checked_add(fee).ok_or_else(|| err(StatusCode::BAD_REQUEST, "amount + fee overflows"))?;
 
-    // Watch-only scan: the note set is recovered from the FVK alone (no seed),
-    // over the settled matured chain prefix so every witness roots at a matured
-    // canonical anchor.
-    let db = WalletDb::from_fvk(&fvk_bytes).ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?;
-    log::info!("non-custodial prepare: watch-only matured chain replay...");
-    let db = replay_matured(client, db).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    // Select matured notes (all scanned notes are past the maturity cutoff),
-    // bounded by the standard-mass spend cap: a prepared tx that needs more
-    // notes than fit one transaction would burn a long proof only to be
-    // rejected, so refuse it up front with the actionable maximum.
     let max_per_tx = max_spends_per_tx();
-    let mut candidates = db.notes().to_vec();
-    candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+
+    // Fast path: if the caller also presents the wallet token this key is registered
+    // under (the app always does), the sync loop is already holding a live, matured
+    // view of exactly this wallet — reuse it and spend straight from it. Without this
+    // every send re-walked the chain watch-only first (measured: 3m24s on a 174K-block
+    // chain), which on a phone reads as a hung app; the proof itself is ~7s.
     let mut inputs = Vec::new();
     let mut selected = 0u64;
-    for n in &candidates {
-        if selected >= need || inputs.len() == max_per_tx {
-            break;
+    let mut have_total: Option<u64> = None;
+    if let Ok(token) = token_from(&headers, state.allow_default_token) {
+        if let Some(w) = state.get_wallet(&token).await {
+            let e = w.lock().await;
+            if e.db.fvk().to_bytes() == fvk_bytes {
+                let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
+                if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
+                    let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
+                    candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+                    have_total = Some(candidates.iter().map(|n| n.value()).sum());
+                    for n in &candidates {
+                        if selected >= need || inputs.len() == max_per_tx {
+                            break;
+                        }
+                        let path =
+                            e.db.witness_path_at(n.position, matured)
+                                .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                        inputs.push((n.note.clone(), path));
+                        selected += n.value();
+                    }
+                }
+            }
         }
-        let path =
-            db.witness_path(n.position).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
-        inputs.push((n.note.clone(), path));
-        selected += n.value();
+    }
+
+    // Slow path (no token, unsynced wallet, or a key we don't track): recover the note
+    // set from the FVK alone over the settled matured chain prefix, so every witness
+    // still roots at a matured canonical anchor.
+    if have_total.is_none() {
+        let db =
+            WalletDb::from_fvk(&fvk_bytes).ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?;
+        log::info!("non-custodial prepare: watch-only matured chain replay...");
+        let db = replay_matured(client, db).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let mut candidates = db.notes().to_vec();
+        candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+        have_total = Some(candidates.iter().map(|n| n.value()).sum());
+        for n in &candidates {
+            if selected >= need || inputs.len() == max_per_tx {
+                break;
+            }
+            let path = db
+                .witness_path(n.position)
+                .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+            inputs.push((n.note.clone(), path));
+            selected += n.value();
+        }
     }
     if selected < need {
-        let have: u64 = candidates.iter().map(|n| n.value()).sum();
+        let have: u64 = have_total.unwrap_or(0);
         return Err(if have >= need {
             err(
                 StatusCode::CONFLICT,
@@ -1554,7 +1727,10 @@ async fn wallet_prepare(
 
     let ctx = payment_tx_context();
     log::info!("non-custodial prepare: building Orchard payment proof (Halo 2) for {} spends...", inputs.len());
-    let fvk = db.fvk().clone();
+    let fvk = WalletDb::from_fvk(&fvk_bytes)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?
+        .fvk()
+        .clone();
     let payment = tokio::task::spawn_blocking(move || prepare_payment(&fvk, inputs, recipient, amount, fee, &net, &ctx))
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
@@ -1649,7 +1825,7 @@ async fn wallet_sign(
 ) -> Result<Json<SignResp>, (StatusCode, Json<serde_json::Value>)> {
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
-    let seed = { w.lock().await.seed };
+    let seed = { w.lock().await.key.seed()? };
     let tag = state.prefix.to_string();
     let signed = sign_message(seed, tag.as_bytes(), req.message.as_bytes(), rand::rngs::OsRng)
         .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "seed is not a valid spending key"))?;
@@ -1760,8 +1936,9 @@ async fn main() {
     // params (identical to what consensus signs against); resolving it over RPC
     // (`get_blocks(None)`) fails on any pruned node, whose genesis chain data is
     // gone.
-    let genesis =
-        RpcHash::from_bytes(kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cli.network)).genesis.hash.as_bytes());
+    let genesis = RpcHash::from_bytes(
+        kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cli.network)).genesis.hash.as_bytes(),
+    );
     log::info!("network genesis (shielded sighash domain): {genesis}");
 
     let state = Arc::new(AppState {
@@ -1813,6 +1990,7 @@ async fn main() {
         .route("/api/status", get(status))
         .route("/api/wallet/create", post(wallet_create))
         .route("/api/wallet/import", post(wallet_import))
+        .route("/api/wallet/watch", post(wallet_watch))
         .route("/api/wallet/address", get(wallet_address))
         .route("/api/wallet/reveal", get(wallet_reveal))
         .route("/api/wallet/balance", get(wallet_balance))

@@ -32,7 +32,6 @@
 //! [`crate::wallet::build::build_spend_bundle`] to actually spend.
 
 use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
-use std::collections::HashSet;
 use incrementalmerkletree::witness::IncrementalWitness;
 use orchard::{
     Address,
@@ -41,6 +40,7 @@ use orchard::{
     tree::{MerkleHashOrchard, MerklePath},
     value::NoteValue,
 };
+use std::collections::HashSet;
 
 use crate::bundle::ShieldedBundle;
 use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};
@@ -169,6 +169,12 @@ impl WalletDb {
     /// non-custodial payment builder needs it to construct the proof.
     pub fn fvk(&self) -> &FullViewingKey {
         &self.fvk
+    }
+
+    /// This wallet's receive address, as raw Orchard address bytes. Derived from the
+    /// viewing key, so a watch-only wallet knows it too.
+    pub fn my_address_bytes(&self) -> [u8; 43] {
+        self.my_address
     }
 
     /// Build a wallet that **fast-syncs** from a checkpoint frontier: the tree starts
@@ -436,7 +442,18 @@ impl WalletDb {
     /// mirror `tree` is reconstructed from the base frontier + `leaves` (O(N) hashing,
     /// no network and no trial-decryption — far cheaper than re-fetching the chain).
     pub fn from_checkpoint(seed: [u8; 32], bytes: &[u8]) -> Option<Self> {
-        let mut db = Self::from_seed(seed)?;
+        Self::restore(Self::from_seed(seed)?, bytes)
+    }
+
+    /// [`Self::from_checkpoint`] for a **watch-only** wallet: the checkpoint blob holds
+    /// no key material (only tree + notes), so it restores identically under a full
+    /// viewing key. This is what lets a daemon resume syncing a non-custodial wallet
+    /// across restarts without ever having seen the seed.
+    pub fn from_checkpoint_fvk(fvk_bytes: &[u8; 96], bytes: &[u8]) -> Option<Self> {
+        Self::restore(Self::from_fvk(fvk_bytes)?, bytes)
+    }
+
+    fn restore(mut db: Self, bytes: &[u8]) -> Option<Self> {
         let mut r = Cursor { buf: bytes, pos: 0 };
         if r.u8()? != CHECKPOINT_VERSION {
             return None;
@@ -602,6 +619,35 @@ mod tests {
         }
         // The FVK the watch-only wallet exposes matches the seed's FVK.
         assert_eq!(watch_db.fvk().to_bytes(), fvk_bytes);
+    }
+
+    /// A checkpoint carries tree + notes but no key material, so a watch-only wallet
+    /// resumes from one exactly as the seed wallet does. This is what lets a daemon
+    /// that has never seen the seed restart without rescanning the chain.
+    #[test]
+    fn watch_only_resumes_from_checkpoint() {
+        let mine = [11u8; 32];
+        let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(mine)).unwrap();
+        let fvk_bytes = FullViewingKey::from(&sk).to_bytes();
+
+        let mut db = WalletDb::from_fvk(&fvk_bytes).unwrap();
+        db.ingest_block(&[coinbase_for(address_of([3u8; 32]), b"c||0", 500), coinbase_for(address_of(mine), b"c||1", 7_000)], &[]);
+        db.ingest_block(&[coinbase_for(address_of(mine), b"d||0", 1_500)], &[]);
+
+        let restored = WalletDb::from_checkpoint_fvk(&fvk_bytes, &db.to_checkpoint()).expect("watch-only checkpoint restores");
+
+        assert_eq!(restored.balance(), db.balance());
+        assert_eq!(restored.balance(), 8_500);
+        assert_eq!(restored.size(), db.size());
+        assert_eq!(restored.anchor(), db.anchor(), "same tree state");
+        for (r, o) in restored.notes().iter().zip(db.notes()) {
+            assert_eq!(r.position, o.position);
+            assert_eq!(r.value(), o.value());
+        }
+        // A seed-keyed restore of the same blob agrees — the blob is key-agnostic.
+        let as_seed = WalletDb::from_checkpoint(mine, &db.to_checkpoint()).expect("seed restore");
+        assert_eq!(as_seed.balance(), restored.balance());
+        assert_eq!(as_seed.anchor(), restored.anchor());
     }
 
     /// The wallet's mirrored anchor tracks the consensus `GlobalTree` anchor leaf
