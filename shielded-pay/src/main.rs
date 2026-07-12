@@ -450,11 +450,11 @@ fn ingest_shielded_chain_block(db: &mut WalletDb, blk: &RpcShieldedChainBlock) {
 }
 
 /// The shielded sighash **network domain**: the chain's genesis hash — what
-/// consensus verifies signatures against (`params.genesis.hash`). NOT the moving
-/// pruning point (they only coincide on a young, unpruned chain).
-async fn resolve_genesis(client: &GrpcClient) -> RpcHash {
-    let resp = client.get_blocks(None, false, false).await.unwrap_or_else(|e| fatal(format!("cannot resolve genesis: {e}")));
-    *resp.block_hashes.first().unwrap_or_else(|| fatal("cannot resolve genesis: empty response".into()))
+/// consensus verifies signatures against (`params.genesis.hash`). Read from the
+/// compile-time mainnet params: an RPC walk to genesis fails on pruned nodes.
+async fn resolve_genesis(_client: &GrpcClient) -> RpcHash {
+    use kaspa_consensus_core::{config::params::Params, network::NetworkType};
+    RpcHash::from_bytes(Params::from(NetworkType::Mainnet).genesis.hash.as_bytes())
 }
 
 async fn balance(rpc_server: String, seed: [u8; 32]) {

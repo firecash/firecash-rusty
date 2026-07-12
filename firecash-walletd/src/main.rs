@@ -151,6 +151,18 @@ struct Cli {
     wallet_secret: Option<String>,
 }
 
+/// Map the `--network` string to the consensus [`NetworkType`] the compile-time
+/// params are keyed by.
+fn state_prefix_network(network: &str) -> kaspa_consensus_core::network::NetworkType {
+    use kaspa_consensus_core::network::NetworkType;
+    match network.to_ascii_lowercase().as_str() {
+        "testnet" => NetworkType::Testnet,
+        "devnet" => NetworkType::Devnet,
+        "simnet" => NetworkType::Simnet,
+        _ => NetworkType::Mainnet,
+    }
+}
+
 fn prefix_from(network: &str) -> Prefix {
     match network.to_ascii_lowercase().as_str() {
         "mainnet" => Prefix::Mainnet,
@@ -1688,17 +1700,12 @@ async fn main() {
     }
 
     // The network genesis hash — the shielded sighash domain consensus verifies
-    // against, and the checkpoint guard. `get_blocks(None)` resolves low=None to
-    // genesis and returns it as the first hash.
-    let genesis = loop {
-        match client.get_blocks(None, false, false).await {
-            Ok(r) if !r.block_hashes.is_empty() => break r.block_hashes[0],
-            other => {
-                log::warn!("cannot resolve genesis hash yet ({other:?}); retrying in 3s...");
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            }
-        }
-    };
+    // against, and the checkpoint guard. Taken from the compile-time network
+    // params (identical to what consensus signs against); resolving it over RPC
+    // (`get_blocks(None)`) fails on any pruned node, whose genesis chain data is
+    // gone.
+    let genesis =
+        RpcHash::from_bytes(kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cli.network)).genesis.hash.as_bytes());
     log::info!("network genesis (shielded sighash domain): {genesis}");
 
     let state = Arc::new(AppState {
