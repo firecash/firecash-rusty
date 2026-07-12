@@ -318,12 +318,14 @@ fn scan_path(dir: &str, token: &str) -> String {
 }
 
 const SCAN_MAGIC: &[u8; 4] = b"FCWS";
+/// v3: WalletDb v3 (spent-nullifier drop rule) — v2 trees may hold
+/// double-applied bundles (phantom notes + shifted positions), so they rescan.
 /// v2: chain-ordered sync (cursor = last ingested *chain* block), guarded by the
 /// network genesis hash, with the matured-anchor ring + sink blue score appended.
 /// Bumping from v1 deliberately invalidates every v1 checkpoint: those were built
 /// from DAG-ordered `get_blocks` ingestion, which double-counts non-chain
 /// coinbases and mis-orders leaves on a wide DAG (the live balance-mismatch bug).
-const SCAN_VERSION: u8 = 2;
+const SCAN_VERSION: u8 = 3;
 /// magic(4) + version(1) + genesis(32) + low(32) + scanned(8).
 const SCAN_HEADER_LEN: usize = 77;
 /// Rewrite the checkpoint after this many newly-scanned blocks (and once a wallet
@@ -418,6 +420,58 @@ fn load_checkpoint(
 }
 
 // ---------------------------------------------------------------------------
+// Shared sync page cache
+//
+// During a mass rescan every wallet walks the same chain-block stream from the
+// same start (the pruning point), so without sharing, N wallets cost N full
+// chain fetches (~170 x 169K blocks observed live). Caching each
+// `GetShieldedBlocks` page by its start cursor for a few seconds means one
+// fetch serves the whole cohort — fetch cost becomes O(chain), leaving only
+// per-wallet trial decryption. The short TTL keeps near-tip pages fresh (the
+// same cursor returns more blocks as the chain grows).
+// ---------------------------------------------------------------------------
+
+struct PageCache {
+    map: HashMap<RpcHash, (std::time::Instant, Arc<kaspa_rpc_core::GetShieldedBlocksResponse>)>,
+    order: VecDeque<RpcHash>,
+}
+
+const PAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+const PAGE_CACHE_CAP: usize = 64;
+
+impl PageCache {
+    fn new() -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new() }
+    }
+}
+
+/// Fetch one `GetShieldedBlocks` page through the shared cache.
+async fn fetch_shielded_page(
+    client: &GrpcClient,
+    cache: &Mutex<PageCache>,
+    low: RpcHash,
+) -> Result<Arc<kaspa_rpc_core::GetShieldedBlocksResponse>, kaspa_rpc_core::RpcError> {
+    {
+        let c = cache.lock().await;
+        if let Some((at, resp)) = c.map.get(&low) {
+            if at.elapsed() < PAGE_CACHE_TTL {
+                return Ok(resp.clone());
+            }
+        }
+    }
+    let resp = Arc::new(client.get_shielded_blocks(low, SHIELDED_PAGE).await?);
+    let mut c = cache.lock().await;
+    c.map.insert(low, (std::time::Instant::now(), resp.clone()));
+    c.order.push_back(low);
+    if c.order.len() > PAGE_CACHE_CAP {
+        if let Some(old) = c.order.pop_front() {
+            c.map.remove(&old);
+        }
+    }
+    Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
 // In-memory wallet + incremental sync
 // ---------------------------------------------------------------------------
 
@@ -502,9 +556,9 @@ impl WalletEntry {
     /// (own coinbase mint + accepted post-retain bundles, consensus order), and
     /// only once a block is `SYNC_TIP_MARGIN` blue units below the sink (the
     /// append-only tree must not ingest anything a routine reorg could replace).
-    async fn sync_chunk(&mut self, client: &GrpcClient) {
+    async fn sync_chunk(&mut self, client: &GrpcClient, cache: &Mutex<PageCache>) {
         for _ in 0..PAGES_PER_CHUNK {
-            let resp = match client.get_shielded_blocks(self.low, SHIELDED_PAGE).await {
+            let resp = match fetch_shielded_page(client, cache, self.low).await {
                 Ok(r) => r,
                 Err(e) => {
                     // Distinguish "cursor no longer known" (pruned / relaunched —
@@ -641,6 +695,8 @@ struct AppState {
     /// consensus signs against — `params.genesis.hash`, NOT the moving pruning
     /// point) and the guard persisted checkpoints are keyed by.
     genesis: RpcHash,
+    /// Shared `GetShieldedBlocks` page cache for the sync loop (see [`PageCache`]).
+    page_cache: Mutex<PageCache>,
     /// In-flight **non-custodial** payments: a `/api/wallet/prepare` builds the proof
     /// from a viewing key and parks the awaiting-signature bundle here, keyed by a
     /// random session id; `/api/wallet/submit` pops it, applies the device's spend-auth
@@ -773,7 +829,7 @@ async fn sync_loop(state: Arc<AppState>) {
                 // once already synced).
                 let was_caught_up = e.caught_up;
                 e.caught_up = false;
-                e.sync_chunk(&state.client).await;
+                e.sync_chunk(&state.client, &state.page_cache).await;
                 if e.reorged_strikes >= REORG_STRIKES {
                     // The append-only tree cannot roll back a deep reorg: discard
                     // the checkpoint and evict the wallet; the next request reloads
@@ -1717,6 +1773,7 @@ async fn main() {
         allow_default_token: cli.allow_default_token,
         wallet_secret,
         genesis,
+        page_cache: Mutex::new(PageCache::new()),
         prepared: Mutex::new(HashMap::new()),
     });
 

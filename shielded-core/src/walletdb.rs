@@ -32,6 +32,7 @@
 //! [`crate::wallet::build::build_spend_bundle`] to actually spend.
 
 use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
+use std::collections::HashSet;
 use incrementalmerkletree::witness::IncrementalWitness;
 use orchard::{
     Address,
@@ -106,6 +107,14 @@ pub struct WalletDb {
     /// Number of leaves ingested so far, absolute (`base_size + leaves.len()`) — the
     /// next leaf's position.
     size: u64,
+    /// Every nullifier revealed by an **applied** bundle in this wallet's stream.
+    /// Mirrors the consensus drop rule (PLAN §2.4): a bundle any of whose
+    /// nullifiers was already spent is DROPPED — it appends no leaves. Without
+    /// this, a shielded tx that the UTXO layer accepted twice (it has no
+    /// transparent inputs, so nothing conflicts there — observed live when two
+    /// parallel DAG blocks both carried the same tx) double-counts its outputs
+    /// and shifts every later leaf position off the consensus tree.
+    spent_nullifiers: HashSet<[u8; 32]>,
 }
 
 impl WalletDb {
@@ -126,6 +135,7 @@ impl WalletDb {
             leaves: Vec::new(),
             notes: Vec::new(),
             size: 0,
+            spent_nullifiers: HashSet::new(),
         })
     }
 
@@ -151,6 +161,7 @@ impl WalletDb {
             leaves: Vec::new(),
             notes: Vec::new(),
             size: 0,
+            spent_nullifiers: HashSet::new(),
         })
     }
 
@@ -255,14 +266,20 @@ impl WalletDb {
             self.append_leaf(cmx, owned);
         }
 
-        // Then every accepted transaction's actions, in order.
+        // Then every accepted transaction's actions, in order — applying the same
+        // drop rule as the consensus transition: a bundle whose nullifier was
+        // already spent in this stream appends nothing (see `spent_nullifiers`).
         for bundle in txs {
+            if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+                continue;
+            }
             let received = scan_bundle(&self.ivk, bundle);
             for (i, action) in bundle.actions.iter().enumerate() {
                 // Each action reveals the nullifier of the note it spends. If that is
                 // one of ours, the note is now spent — drop it from the unspent set so
                 // balance and spend-selection never count or re-offer it.
                 self.notes.retain(|n| n.nullifier != action.nullifier);
+                self.spent_nullifiers.insert(action.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&action.cmx)) else {
                     continue;
@@ -402,6 +419,13 @@ impl WalletDb {
             out.extend_from_slice(&n.note.rho().to_bytes());
             out.extend_from_slice(n.note.rseed().as_bytes());
         }
+        // v3: the spent-nullifier set, sorted for a canonical encoding.
+        let mut nfs: Vec<&[u8; 32]> = self.spent_nullifiers.iter().collect();
+        nfs.sort();
+        out.extend_from_slice(&(nfs.len() as u64).to_le_bytes());
+        for nf in nfs {
+            out.extend_from_slice(nf);
+        }
         out
     }
 
@@ -458,6 +482,10 @@ impl WalletDb {
             let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed))?;
             db.notes.push(OwnedNote { note, position, nullifier });
         }
+        let n_nfs = r.u64()? as usize;
+        for _ in 0..n_nfs {
+            db.spent_nullifiers.insert(r.arr::<32>()?);
+        }
         if !r.done() {
             return None;
         }
@@ -468,8 +496,9 @@ impl WalletDb {
 
 /// Checkpoint format version. Bump on any layout change so an old blob is rejected
 /// (triggering a clean rescan) rather than silently misread. v2 added the fast-sync
-/// base frontier.
-const CHECKPOINT_VERSION: u8 = 2;
+/// base frontier; v3 the spent-nullifier set (bundle drop rule) — v2 trees may have
+/// double-applied bundles, so they must rescan.
+const CHECKPOINT_VERSION: u8 = 3;
 
 /// A minimal forward byte-reader for [`WalletDb::from_checkpoint`]: every read is
 /// bounds-checked and returns `None` past the end, so a truncated or corrupt blob
@@ -613,6 +642,52 @@ mod tests {
         assert_eq!(owned.value(), 2_000);
         let path = db.witness_path(owned.position).expect("a spendable Orchard path is available");
         assert_eq!(u64::from(path.position()), owned.position, "path is for the owned leaf");
+    }
+
+    /// A bundle the UTXO layer accepted twice (same tx carried by two parallel
+    /// DAG blocks — it has no transparent inputs, so nothing conflicts there)
+    /// must be APPLIED once: the second occurrence's nullifiers are already
+    /// spent, so the consensus transition drops it. The wallet mirrors that —
+    /// no phantom balance, no extra leaves shifting later positions.
+    #[test]
+    fn double_accepted_bundle_is_dropped() {
+        use crate::bundle::{ActionWire, sizes};
+
+        let mine = [7u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+
+        // A synthetic spending bundle (opaque to this wallet — decrypt finds
+        // nothing, which is irrelevant to the drop rule).
+        let action = ActionWire {
+            nullifier: [9u8; 32],
+            rk: [1u8; sizes::FIELD],
+            cmx: [2u8; sizes::FIELD],
+            cv_net: [3u8; sizes::FIELD],
+            ephemeral_key: [4u8; sizes::FIELD],
+            enc_ciphertext: [5u8; sizes::ENC_CIPHERTEXT],
+            out_ciphertext: [6u8; sizes::OUT_CIPHERTEXT],
+            spend_auth_sig: [7u8; sizes::SIG],
+        };
+        let bundle = ShieldedBundle {
+            actions: vec![action],
+            flags: 0b11,
+            value_balance: 0,
+            anchor: [0u8; 32],
+            proof: vec![],
+            binding_sig: [0u8; sizes::SIG],
+        };
+
+        // First acceptance appends its commitment; the duplicate appends nothing.
+        db.ingest_block(&[], &[&bundle]);
+        assert_eq!(db.size(), 1, "first acceptance appended one leaf");
+        db.ingest_block(&[], &[&bundle]);
+        assert_eq!(db.size(), 1, "duplicate acceptance dropped (no extra leaf)");
+
+        // The drop rule survives a checkpoint round-trip (v3 persists the set).
+        let blob = db.to_checkpoint();
+        let mut restored = WalletDb::from_checkpoint(mine, &blob).expect("v3 checkpoint reloads");
+        restored.ingest_block(&[], &[&bundle]);
+        assert_eq!(restored.size(), 1, "drop rule persists across restarts");
     }
 
     /// A checkpoint round-trips: reloading a wallet from `to_checkpoint` reproduces
