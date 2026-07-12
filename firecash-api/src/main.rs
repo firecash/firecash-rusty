@@ -257,7 +257,15 @@ async fn follow(state: Arc<AppState>) {
     }
     log::info!("seeded {} recent blocks; following tip...", backfill.len());
 
-    // Poll forward from the last block we have.
+    // Poll forward from the last block we have. `get_blocks` pages over a DAG
+    // overlap heavily (each page re-covers the previous cursor's anticone), so
+    // every block is deduplicated before it touches the ring or the aggregate —
+    // without this the ring filled with duplicates (96 unique of 200 observed
+    // live), inflating the explorer's block-rate stat to 9–26 "bps" and
+    // double-counting the shielded aggregate.
+    let mut seen: std::collections::HashSet<RpcHash> = backfill.iter().filter_map(|b| Some(b.header.hash)).collect();
+    let mut seen_order: VecDeque<RpcHash> = backfill.iter().map(|b| b.header.hash).collect();
+    const SEEN_CAP: usize = 8 * RECENT_CAP;
     let mut low = sink;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -270,8 +278,14 @@ async fn follow(state: Arc<AppState>) {
         };
         let mut advanced = false;
         for (hash, block) in resp.block_hashes.iter().zip(resp.blocks.iter()) {
-            if *hash == low {
-                continue; // page anchor re-sent as first element
+            if *hash == low || !seen.insert(*hash) {
+                continue; // page anchor or an already-ingested block
+            }
+            seen_order.push_back(*hash);
+            if seen_order.len() > SEEN_CAP {
+                if let Some(old) = seen_order.pop_front() {
+                    seen.remove(&old);
+                }
             }
             let mut agg = state.shielded.write().await;
             let summary = ingest(block, &mut agg);

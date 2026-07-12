@@ -40,14 +40,14 @@ use clap::Parser;
 use kaspa_addresses::{Address, Prefix, Version};
 use kaspa_consensus_core::tx::{TX_VERSION_SHIELDED, Transaction};
 use kaspa_grpc_client::GrpcClient;
-use kaspa_rpc_core::{RpcHash, RpcTransaction, api::rpc::RpcApi, notify::mode::NotificationMode};
-use kaspa_shielded_core::bundle::ShieldedBundle;
+use kaspa_rpc_core::{RpcHash, RpcShieldedChainBlock, RpcTransaction, api::rpc::RpcApi, notify::mode::NotificationMode};
+use kaspa_shielded_core::bundle::{ShieldedBundle, expected_wire_len};
 use kaspa_shielded_core::coinbase::derive_coinbase_note_desc;
 use kaspa_shielded_core::message::{FVK_LEN, SIG_LEN, sign_message, verify_message};
 use kaspa_shielded_core::orchard_recipient_bytes;
 use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
-use kaspa_shielded_core::wallet::build::{build_wallet_payment, finalize_payment, prepare_payment, PreparedPayment};
+use kaspa_shielded_core::wallet::build::{build_wallet_payment, finalize_payment, prepare_payment, proving_key, PreparedPayment};
 use kaspa_shielded_core::walletdb::WalletDb;
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 use serde::{Deserialize, Serialize};
@@ -60,10 +60,53 @@ const ORCHARD_SCRIPT_LEN: usize = 43;
 /// Anchor maturity depth (blocks) — must match consensus `shielded_anchor_depth`
 /// (600 * BPS = 600 at 1 BPS, ~10 min). A note is spendable once this deep.
 const DEFAULT_ANCHOR_DEPTH: u64 = 600;
-/// Max `get_blocks` pages a wallet advances per sync chunk. Kept small so the
-/// per-wallet lock is released frequently (status stays responsive); speed comes
-/// from looping back immediately instead of the old 1s pause between chunks.
-const PAGES_PER_CHUNK: usize = 32;
+/// Max `GetShieldedBlocks` pages a wallet advances per sync chunk. Kept small so
+/// the per-wallet lock is released frequently (status stays responsive); speed
+/// comes from looping back immediately instead of pausing between chunks.
+const PAGES_PER_CHUNK: usize = 4;
+/// Chain blocks requested per `GetShieldedBlocks` page.
+const SHIELDED_PAGE: u64 = 200;
+/// Blue-score margin the sync holds back from the sink before ingesting a chain
+/// block. The wallet's tree is append-only (no rollback), so it must not ingest a
+/// block that a routine near-tip reorg could still replace; anything deeper is
+/// settled. A reorg deeper than this margin sets `reorged` and triggers a clean
+/// rescan instead of silent divergence.
+const SYNC_TIP_MARGIN: u64 = 20;
+/// Extra blue-score slack under the consensus anchor-maturity depth when picking
+/// the anchor a spend roots at, so it stays matured while the tx awaits merging.
+const ANCHOR_SLACK: u64 = 30;
+
+// ---------------------------------------------------------------------------
+// Standard-mass budget: how many notes one shielded tx may spend.
+//
+// The mempool rejects any tx whose per-dimension mass exceeds 100 000, and
+// transient mass = serialized bytes × 4 — so a standard shielded tx must fit in
+// ~25 000 bytes. Each spent note adds one 884-byte action PLUS 2 272 proof
+// bytes, which caps spends per tx at SIX. A send that needs more notes must be
+// split into several transactions; previously walletd would happily build a
+// 14-spend bundle (a 106-minute proof!) only to have the node reject it at
+// 188 460 transient mass.
+// ---------------------------------------------------------------------------
+
+/// Mempool `MAXIMUM_STANDARD_TRANSACTION_MASS` (per dimension).
+const STANDARD_TX_MASS_CAP: u64 = 100_000;
+/// Consensus `TRANSIENT_BYTE_TO_MASS_FACTOR` (transient mass per serialized byte).
+const TRANSIENT_BYTE_TO_MASS_FACTOR: u64 = 4;
+/// Bytes of transaction envelope outside the bundle payload (~94 observed live;
+/// padded for safety).
+const TX_ENVELOPE_MARGIN: usize = 256;
+
+/// Largest number of spent notes whose bundle still fits the standard transient
+/// mass cap. A payment bundle carries `max(spends, 2)` actions (recipient +
+/// change outputs are padded in). Evaluates to 6 with today's constants.
+fn max_spends_per_tx() -> usize {
+    let budget = (STANDARD_TX_MASS_CAP / TRANSIENT_BYTE_TO_MASS_FACTOR) as usize - TX_ENVELOPE_MARGIN;
+    let mut n = 1usize;
+    while expected_wire_len((n + 1).max(2)) <= budget {
+        n += 1;
+    }
+    n
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "firecash-walletd", about = "FireCash shielded wallet daemon (self-hosted or hosted)")]
@@ -256,7 +299,12 @@ fn scan_path(dir: &str, token: &str) -> String {
 }
 
 const SCAN_MAGIC: &[u8; 4] = b"FCWS";
-const SCAN_VERSION: u8 = 1;
+/// v2: chain-ordered sync (cursor = last ingested *chain* block), guarded by the
+/// network genesis hash, with the matured-anchor ring + sink blue score appended.
+/// Bumping from v1 deliberately invalidates every v1 checkpoint: those were built
+/// from DAG-ordered `get_blocks` ingestion, which double-counts non-chain
+/// coinbases and mis-orders leaves on a wide DAG (the live balance-mismatch bug).
+const SCAN_VERSION: u8 = 2;
 /// magic(4) + version(1) + genesis(32) + low(32) + scanned(8).
 const SCAN_HEADER_LEN: usize = 77;
 /// Rewrite the checkpoint after this many newly-scanned blocks (and once a wallet
@@ -264,18 +312,36 @@ const SCAN_HEADER_LEN: usize = 77;
 /// blob on every tiny sync pass; a restart re-scans at most this many cheap blocks.
 const CHECKPOINT_EVERY: usize = 5000;
 
-/// Persist a wallet's scan checkpoint atomically (write-tmp + rename). `genesis` is
-/// the pruning-point hash the scan is anchored to; a moved pruning point invalidates
-/// the checkpoint on load (the note-commitment tree would no longer line up), forcing
-/// a clean rescan.
-fn save_checkpoint(dir: &str, token: &str, genesis: &RpcHash, low: &RpcHash, scanned: u64, db: &WalletDb) -> std::io::Result<()> {
-    let mut buf = Vec::with_capacity(SCAN_HEADER_LEN + db.leaf_count() * 32);
+/// Persist a wallet's scan checkpoint atomically (write-tmp + rename). `genesis`
+/// is the network genesis hash (a chain relaunch invalidates the checkpoint);
+/// `low` is the last ingested chain block, from which sync resumes. The
+/// matured-anchor ring and sink blue score ride along so a restarted wallet can
+/// select a matured spend anchor without a replay.
+fn save_checkpoint(
+    dir: &str,
+    token: &str,
+    genesis: &RpcHash,
+    low: &RpcHash,
+    scanned: u64,
+    db: &WalletDb,
+    boundaries: &VecDeque<(u64, u64)>,
+    sink_blue: u64,
+) -> std::io::Result<()> {
+    let db_blob = db.to_checkpoint();
+    let mut buf = Vec::with_capacity(SCAN_HEADER_LEN + 8 + db_blob.len() + 4 + boundaries.len() * 16 + 8);
     buf.extend_from_slice(SCAN_MAGIC);
     buf.push(SCAN_VERSION);
     buf.extend_from_slice(&genesis.as_bytes());
     buf.extend_from_slice(&low.as_bytes());
     buf.extend_from_slice(&scanned.to_le_bytes());
-    buf.extend_from_slice(&db.to_checkpoint());
+    buf.extend_from_slice(&(db_blob.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&db_blob);
+    buf.extend_from_slice(&(boundaries.len() as u32).to_le_bytes());
+    for (blue, leaves) in boundaries {
+        buf.extend_from_slice(&blue.to_le_bytes());
+        buf.extend_from_slice(&leaves.to_le_bytes());
+    }
+    buf.extend_from_slice(&sink_blue.to_le_bytes());
     let path = scan_path(dir, token);
     let tmp = format!("{path}.tmp");
     std::fs::write(&tmp, &buf)?;
@@ -287,23 +353,49 @@ fn save_checkpoint(dir: &str, token: &str, genesis: &RpcHash, low: &RpcHash, sca
     std::fs::rename(&tmp, &path)
 }
 
-/// Load a wallet's scan checkpoint if present and still valid for `current_genesis`.
-/// Returns the reconstructed `(db, low_cursor, scanned)`, or `None` on any
-/// absence / corruption / version or pruning-point mismatch — the caller then falls
-/// back to a birthday scan, so a stale checkpoint can never yield a wrong tree.
-fn load_checkpoint(dir: &str, token: &str, seed: [u8; 32], current_genesis: &RpcHash) -> Option<(WalletDb, RpcHash, usize)> {
+/// Load a wallet's scan checkpoint if present and still valid for
+/// `current_genesis` (the network genesis hash). Returns the reconstructed
+/// `(db, low_cursor, scanned, boundaries, sink_blue)`, or `None` on any absence /
+/// corruption / version or genesis mismatch — the caller then rescans, so a stale
+/// checkpoint can never yield a wrong tree.
+#[allow(clippy::type_complexity)]
+fn load_checkpoint(
+    dir: &str,
+    token: &str,
+    seed: [u8; 32],
+    current_genesis: &RpcHash,
+) -> Option<(WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64)> {
     let buf = std::fs::read(scan_path(dir, token)).ok()?;
     if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || buf[4] != SCAN_VERSION {
         return None;
     }
     let saved_genesis = RpcHash::from_bytes(buf[5..37].try_into().ok()?);
     if saved_genesis != *current_genesis {
-        return None; // chain pruned/relaunched past our anchor → rescan
+        return None; // chain relaunched → rescan
     }
     let low = RpcHash::from_bytes(buf[37..69].try_into().ok()?);
     let scanned = u64::from_le_bytes(buf[69..77].try_into().ok()?) as usize;
-    let db = WalletDb::from_checkpoint(seed, &buf[SCAN_HEADER_LEN..])?;
-    Some((db, low, scanned))
+    let mut pos = SCAN_HEADER_LEN;
+    let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
+        let end = pos.checked_add(n)?;
+        let s = buf.get(*pos..end)?;
+        *pos = end;
+        Some(s)
+    };
+    let db_len = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?) as usize;
+    let db = WalletDb::from_checkpoint(seed, take(&mut pos, db_len)?)?;
+    let ring_len = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?) as usize;
+    let mut boundaries = VecDeque::with_capacity(ring_len.min(MATURED_RING));
+    for _ in 0..ring_len {
+        let blue = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
+        let leaves = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
+        boundaries.push_back((blue, leaves));
+    }
+    let sink_blue = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
+    if pos != buf.len() {
+        return None;
+    }
+    Some((db, low, scanned, boundaries, sink_blue))
 }
 
 // ---------------------------------------------------------------------------
@@ -313,10 +405,14 @@ fn load_checkpoint(dir: &str, token: &str, seed: [u8; 32], current_genesis: &Rpc
 struct WalletEntry {
     seed: [u8; 32],
     db: WalletDb,
+    /// The network genesis hash — guards the persisted checkpoint against a chain
+    /// relaunch (and is also the shielded sighash network domain).
     genesis: RpcHash,
-    /// Paging cursor: next `get_blocks` resumes from here.
+    /// Sync cursor: the last ingested **chain** block; `GetShieldedBlocks`
+    /// resumes strictly after it.
     low: RpcHash,
     caught_up: bool,
+    /// DAA score of the last ingested chain block (progress display).
     scanned: usize,
     chain_len: u64,
     updated_unix: u64,
@@ -324,18 +420,25 @@ struct WalletEntry {
     /// `scanned` at the last persisted checkpoint — the sync loop rewrites the
     /// checkpoint once enough new blocks accrue past this.
     saved_scanned: usize,
-    /// Recent per-block **absolute** leaf counts (`db.size()` after each ingested
-    /// block), oldest→newest, capped at [`MATURED_RING`]. `send` reads the entry
-    /// `anchor_depth + 2` blocks back to root a spend at a matured anchor without a
-    /// full-chain rescan. In-memory only (not part of the persisted checkpoint), so
-    /// it is empty right after a load and refills as the sync loop advances; `send`
-    /// falls back to a one-off matured replay until it covers the maturity depth.
-    block_leaf_counts: VecDeque<u64>,
+    /// `(blue_score, absolute leaf count)` after each ingested chain block,
+    /// oldest→newest, capped at [`MATURED_RING`]. `send` picks the newest entry
+    /// at least `anchor_depth + slack` blue units below the sink to root a spend
+    /// at a matured, canonical chain-block anchor without a rescan. Persisted in
+    /// the v2 checkpoint, so it survives restarts.
+    boundaries: VecDeque<(u64, u64)>,
+    /// The sink's blue score from the latest sync response — the reference the
+    /// matured cutoff is measured against.
+    sink_blue: u64,
+    /// Set when the chain reorged below `low` (deeper than [`SYNC_TIP_MARGIN`]):
+    /// the append-only wallet tree cannot roll back, so the sync loop discards
+    /// the checkpoint and reloads this wallet from scratch.
+    reorged: bool,
 }
 
-/// How many recent block→leaf boundaries [`WalletEntry`] keeps: enough to look back
-/// `DEFAULT_ANCHOR_DEPTH + 2` blocks (the matured-anchor cutoff) with a small margin.
-const MATURED_RING: usize = DEFAULT_ANCHOR_DEPTH as usize + 16;
+/// How many chain-block→leaf boundaries [`WalletEntry`] keeps. Anchor maturity is
+/// measured in *blue score*, which advances at least one per chain block, so
+/// `depth + slack` entries always reach the cutoff, with room to spare.
+const MATURED_RING: usize = (DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK) as usize + 64;
 
 /// How close (in DAA/blue score) the wallet's latest ingested block must be to the
 /// node tip to report `synced: true`. On a live ~1-block/s chain the strict
@@ -344,30 +447,19 @@ const MATURED_RING: usize = DEFAULT_ANCHOR_DEPTH as usize + 16;
 const SYNC_MARGIN: u64 = 32;
 
 impl WalletEntry {
-    /// `start_low` is the block hash the display scan resumes from (genesis for a
-    /// full scan, or the birthday-height block for a fast start). `base_scanned` is
-    /// how many blocks that start skips, so progress reporting stays meaningful.
-    fn new(seed: [u8; 32], genesis: RpcHash, start_low: RpcHash, base_scanned: usize) -> Option<Self> {
-        Some(Self {
-            seed,
-            db: WalletDb::from_seed(seed)?,
-            genesis,
-            low: start_low,
-            caught_up: false,
-            scanned: base_scanned,
-            chain_len: 0,
-            updated_unix: 0,
-            error: None,
-            saved_scanned: base_scanned,
-            block_leaf_counts: VecDeque::new(),
-        })
-    }
-
-    /// Rebuild an entry from a persisted checkpoint: the commitment stream, owned
-    /// notes, cursor and progress are restored, so the background sync resumes from
-    /// `low` with no rescan. `saved_scanned == scanned` so the next checkpoint write
-    /// waits for genuinely new blocks.
-    fn from_checkpoint(seed: [u8; 32], db: WalletDb, genesis: RpcHash, low: RpcHash, scanned: usize) -> Self {
+    /// Rebuild an entry from a wallet view + cursor (a fresh frontier start or a
+    /// persisted checkpoint): the background sync resumes strictly after `low`.
+    /// `saved_scanned == scanned` so the next checkpoint write waits for
+    /// genuinely new blocks.
+    fn from_parts(
+        seed: [u8; 32],
+        db: WalletDb,
+        genesis: RpcHash,
+        low: RpcHash,
+        scanned: usize,
+        boundaries: VecDeque<(u64, u64)>,
+        sink_blue: u64,
+    ) -> Self {
         Self {
             seed,
             db,
@@ -379,41 +471,59 @@ impl WalletEntry {
             updated_unix: 0,
             error: None,
             saved_scanned: scanned,
-            block_leaf_counts: VecDeque::new(),
+            boundaries,
+            sink_blue,
+            reorged: false,
         }
     }
 
-    /// Advance this wallet by up to `PAGES_PER_CHUNK` pages of new blocks.
+    /// Advance this wallet by up to `PAGES_PER_CHUNK` pages of new **chain**
+    /// blocks, ingesting exactly the shielded effects consensus applied per block
+    /// (own coinbase mint + accepted post-retain bundles, consensus order), and
+    /// only once a block is `SYNC_TIP_MARGIN` blue units below the sink (the
+    /// append-only tree must not ingest anything a routine reorg could replace).
     async fn sync_chunk(&mut self, client: &GrpcClient) {
         for _ in 0..PAGES_PER_CHUNK {
-            let resp = match client.get_blocks(Some(self.low), true, true).await {
+            let resp = match client.get_shielded_blocks(self.low, SHIELDED_PAGE).await {
                 Ok(r) => r,
                 Err(e) => {
-                    self.error = Some(format!("get_blocks failed: {e}"));
+                    // Distinguish "cursor no longer known" (pruned / relaunched —
+                    // needs a rescan) from a transient node failure.
+                    if client.get_block(self.low, false).await.is_err() && client.get_block_dag_info().await.is_ok() {
+                        self.reorged = true;
+                        self.error = Some("wallet cursor no longer known to the node; rescanning".into());
+                    } else {
+                        self.error = Some(format!("get_shielded_blocks failed: {e}"));
+                    }
                     return;
                 }
             };
-            let mut advanced = false;
-            for (hash, block) in resp.block_hashes.iter().zip(resp.blocks.iter()) {
-                if *hash == self.low || *hash == self.genesis {
-                    continue;
-                }
-                ingest_rpc_block(&mut self.db, block);
-                self.scanned += 1;
-                advanced = true;
-                // Record the block→leaf boundary so `send` can root a spend at a
-                // matured anchor (a real block's tree root) without a rescan.
-                self.block_leaf_counts.push_back(self.db.size());
-                if self.block_leaf_counts.len() > MATURED_RING {
-                    self.block_leaf_counts.pop_front();
-                }
+            if resp.reorged {
+                self.reorged = true;
+                self.error = Some("chain reorged below the wallet cursor; rescanning".into());
+                return;
             }
-            match resp.block_hashes.last().copied() {
-                Some(h) if h != self.low && advanced => self.low = h,
-                _ => {
-                    self.caught_up = true;
+            self.sink_blue = resp.sink_blue_score;
+            let settled = resp.sink_blue_score.saturating_sub(SYNC_TIP_MARGIN);
+            let mut advanced = false;
+            let mut at_margin = false;
+            for b in &resp.blocks {
+                if b.blue_score > settled {
+                    at_margin = true;
                     break;
                 }
+                ingest_shielded_chain_block(&mut self.db, b);
+                self.low = b.hash;
+                self.scanned = b.daa_score as usize;
+                self.boundaries.push_back((b.blue_score, self.db.size()));
+                if self.boundaries.len() > MATURED_RING {
+                    self.boundaries.pop_front();
+                }
+                advanced = true;
+            }
+            if !advanced || at_margin {
+                self.caught_up = true;
+                break;
             }
         }
         self.error = None;
@@ -421,93 +531,70 @@ impl WalletEntry {
     }
 }
 
-fn ingest_rpc_block(db: &mut WalletDb, block: &kaspa_rpc_core::RpcBlock) {
+/// Ingest one chain block's shielded effects — the node already assembled them
+/// (`GetShieldedBlocks`) exactly as the consensus §2.4 transition applied them:
+/// the block's own coinbase notes first, then each accepted (post-retain)
+/// shielded bundle's actions in consensus order.
+fn ingest_shielded_chain_block(db: &mut WalletDb, blk: &RpcShieldedChainBlock) {
     let mut coinbase_notes = Vec::new();
-    if let Some(cb) = block.transactions.first() {
-        if let Some(vd) = cb.verbose_data.as_ref() {
-            let txid = vd.transaction_id;
-            for (i, out) in cb.outputs.iter().enumerate() {
-                let script = out.script_public_key.script();
-                if script.len() >= ORCHARD_SCRIPT_LEN {
-                    let mut recipient = [0u8; ORCHARD_SCRIPT_LEN];
-                    recipient.copy_from_slice(&script[..ORCHARD_SCRIPT_LEN]);
-                    let mut note_seed = Vec::with_capacity(36);
-                    note_seed.extend_from_slice(&txid.as_bytes());
-                    note_seed.extend_from_slice(&(i as u32).to_le_bytes());
-                    coinbase_notes.push((derive_coinbase_note_desc(recipient, &note_seed), out.value));
-                }
-            }
+    for (i, out) in blk.coinbase_outputs.iter().enumerate() {
+        if out.script_public_key.len() >= ORCHARD_SCRIPT_LEN {
+            let mut recipient = [0u8; ORCHARD_SCRIPT_LEN];
+            recipient.copy_from_slice(&out.script_public_key[..ORCHARD_SCRIPT_LEN]);
+            let mut note_seed = Vec::with_capacity(36);
+            note_seed.extend_from_slice(&blk.coinbase_txid.as_bytes());
+            note_seed.extend_from_slice(&(i as u32).to_le_bytes());
+            coinbase_notes.push((derive_coinbase_note_desc(recipient, &note_seed), out.value));
         }
     }
-    let mut bundles = Vec::new();
-    for tx in block.transactions.iter().skip(1) {
-        if tx.version == TX_VERSION_SHIELDED {
-            if let Ok(b) = ShieldedBundle::from_bytes(&tx.payload) {
-                bundles.push(b);
-            }
-        }
-    }
+    let bundles: Vec<ShieldedBundle> = blk.accepted_bundles.iter().filter_map(|p| ShieldedBundle::from_bytes(p).ok()).collect();
     let bundle_refs: Vec<&ShieldedBundle> = bundles.iter().collect();
     db.ingest_block(&coinbase_notes, &bundle_refs);
 }
 
-/// One-off full replay up to `ingest_limit` blocks (used by send to root a spend to
-/// a matured anchor, independent of the live tip db).
-async fn scan_to_limit(client: &GrpcClient, seed: [u8; 32], ingest_limit: usize) -> Result<WalletDb, String> {
-    let db = WalletDb::from_seed(seed).ok_or("seed is not a valid Orchard spending key")?;
-    scan_db_to_limit(client, db, ingest_limit).await
-}
-
-/// Scan the chain into a **pre-built** wallet view up to `ingest_limit` blocks past
-/// the pruning point. Shared by the seed ([`scan_to_limit`]) and watch-only (FVK,
-/// non-custodial `/prepare`) paths — the only difference is which key built `db`.
-async fn scan_db_to_limit(client: &GrpcClient, mut db: WalletDb, ingest_limit: usize) -> Result<WalletDb, String> {
+/// One-off replay of the settled **matured** chain prefix into a fresh wallet
+/// view (send fallback + non-custodial `/prepare`): anchors the tree at the
+/// pruning-point frontier (all recoverable history, correct absolute positions),
+/// then ingests chain blocks up to `sink_blue − (anchor_depth + slack)` — so
+/// every recovered note is matured and `witness_path` roots at a matured,
+/// canonical chain-block anchor. `db` must be freshly constructed (seed or FVK).
+async fn replay_matured(client: &GrpcClient, mut db: WalletDb) -> Result<WalletDb, String> {
     let dag = client.get_block_dag_info().await.map_err(|e| format!("get_block_dag_info failed: {e}"))?;
-    let genesis = dag.pruning_point_hash;
-    let mut low = genesis;
-    let mut count = 0usize;
+    let start = dag.pruning_point_hash;
+    let ts = client
+        .get_shielded_tree_state(Some(start))
+        .await
+        .map_err(|e| format!("get_shielded_tree_state({start}) failed: {e}"))?;
+    if ts.block_hash != start {
+        return Err("node does not support explicit tree-state checkpoints (update the node)".into());
+    }
+    let fs = FrontierState {
+        size: ts.size,
+        leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+        ommers: ts.ommers.iter().map(|h| h.as_bytes()).collect(),
+    };
+    db.apply_frontier(&fs).ok_or("inconsistent pruning-point frontier")?;
+
+    let mut low = start;
     loop {
-        if count >= ingest_limit {
-            break;
+        let resp =
+            client.get_shielded_blocks(low, SHIELDED_PAGE).await.map_err(|e| format!("get_shielded_blocks failed: {e}"))?;
+        if resp.reorged {
+            return Err("chain reorged during the matured replay; retry".into());
         }
-        let resp = client.get_blocks(Some(low), true, true).await.map_err(|e| format!("get_blocks failed: {e}"))?;
+        let cutoff = resp.sink_blue_score.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
         let mut advanced = false;
-        for (hash, block) in resp.block_hashes.iter().zip(resp.blocks.iter()) {
-            if *hash == low || *hash == genesis {
-                continue;
+        for b in &resp.blocks {
+            if b.blue_score > cutoff {
+                return Ok(db);
             }
-            if count >= ingest_limit {
-                break;
-            }
-            ingest_rpc_block(&mut db, block);
-            count += 1;
+            ingest_shielded_chain_block(&mut db, b);
+            low = b.hash;
             advanced = true;
         }
-        match resp.block_hashes.last().copied() {
-            Some(h) if h != low && advanced => low = h,
-            _ => break,
+        if !advanced {
+            return Ok(db);
         }
-    }
-    Ok(db)
-}
-
-/// Resolve a wallet birthday (block height) to the block hash the scan should start
-/// from, plus how many blocks that skips. `birthday == 0` means scan from genesis.
-/// Falls back to genesis if the chain can't be walked.
-async fn resolve_start(client: &GrpcClient, genesis: RpcHash, birthday: u64) -> (RpcHash, usize) {
-    if birthday == 0 {
-        return (genesis, 0);
-    }
-    match client.get_virtual_chain_from_block(genesis, false, None).await {
-        Ok(chain) => {
-            let hashes = chain.added_chain_block_hashes;
-            if hashes.is_empty() {
-                return (genesis, 0);
-            }
-            let idx = (birthday as usize).min(hashes.len()).saturating_sub(1);
-            (hashes[idx], idx + 1)
-        }
-        Err(_) => (genesis, 0),
     }
 }
 
@@ -531,6 +618,10 @@ struct AppState {
     allow_default_token: bool,
     /// Secret for encrypting seed files at rest. `None` → seeds stored in plaintext.
     wallet_secret: Option<String>,
+    /// The network genesis hash: the shielded sighash **network domain** (what
+    /// consensus signs against — `params.genesis.hash`, NOT the moving pruning
+    /// point) and the guard persisted checkpoints are keyed by.
+    genesis: RpcHash,
     /// In-flight **non-custodial** payments: a `/api/wallet/prepare` builds the proof
     /// from a viewing key and parks the awaiting-signature bundle here, keyed by a
     /// random session id; `/api/wallet/submit` pops it, applies the device's spend-auth
@@ -563,27 +654,58 @@ impl AppState {
     /// leaf positions once pruning is active) and the *fast* one — sync is O(blocks
     /// since the pruning point), not O(chain). Returns `None` if the node lacks the
     /// RPC or a frontier yet, so the caller falls back to a full pruning-point scan.
-    async fn fast_sync_entry(&self, seed: [u8; 32], guard: RpcHash) -> Option<WalletEntry> {
+    ///
+    /// **Completeness gate:** a fast-synced wallet is blind to notes minted before
+    /// the checkpoint, so this path is only sound for a wallet *born at or after*
+    /// it. `birthday` is the wallet's birth DAA score; when it precedes the
+    /// checkpoint (and in particular `birthday == 0`, "may hold funds from any
+    /// height"), this returns `None` and the caller must full-scan. Skipping this
+    /// gate was a live bug: imported wallets silently showed less than their real
+    /// balance ("fully synced but missing coins") because their older notes were
+    /// behind the fast-sync base.
+    async fn fast_sync_entry(&self, seed: [u8; 32], guard: RpcHash, birthday: u64) -> Option<WalletEntry> {
         // Bound the checkpoint RPC: on a healthy chain it returns immediately, but the
         // node's finality-point walk can be pathologically slow on a degenerate DAG
         // (e.g. difficulty collapsed to the floor). Time it out and fall back to a full
         // scan rather than hanging the wallet.
-        let cp = match tokio::time::timeout(std::time::Duration::from_secs(5), self.client.get_shielded_tree_state()).await {
+        let cp = match tokio::time::timeout(std::time::Duration::from_secs(5), self.client.get_shielded_tree_state(None)).await {
             Ok(Ok(cp)) => cp,
             _ => return None,
         };
+        if birthday < cp.daa_score {
+            log::info!("wallet birthday {birthday} precedes fast-sync checkpoint (daa {}); full scan required", cp.daa_score);
+            return None;
+        }
         let fs = FrontierState {
             size: cp.size,
             leaf: (cp.size > 0).then(|| cp.leaf.as_bytes()),
             ommers: cp.ommers.iter().map(|h| h.as_bytes()).collect(),
         };
         let db = WalletDb::from_frontier(seed, &fs)?;
-        // genesis = `guard` (the pruning point) keeps the persisted checkpoint stable
-        // across restarts (the finality-point base moves every block, so guarding on it
-        // would drop notes on resume). low = the finality-point checkpoint block we
-        // actually scan from; sync_chunk skips it. Progress is proxied by its DAA score
-        // so status reads "near tip", not "scanning from 0".
-        Some(WalletEntry::from_checkpoint(seed, db, guard, cp.block_hash, cp.daa_score as usize))
+        // low = the checkpoint chain block; sync resumes strictly after it.
+        // Progress is proxied by its DAA score so status reads "near tip".
+        Some(WalletEntry::from_parts(seed, db, guard, cp.block_hash, cp.daa_score as usize, VecDeque::new(), 0))
+    }
+
+    /// Full-history wallet entry: the tree is anchored at the **pruning-point
+    /// frontier** (all recoverable history, correct absolute leaf positions even
+    /// after pruning advances past genesis) and every later chain block is
+    /// scanned. Used when the wallet may hold funds older than the fast-sync
+    /// checkpoint (birthday 0 / early birthday).
+    async fn full_scan_entry(&self, seed: [u8; 32], guard: RpcHash) -> Option<WalletEntry> {
+        let start = self.client.get_block_dag_info().await.ok()?.pruning_point_hash;
+        let ts = self.client.get_shielded_tree_state(Some(start)).await.ok()?;
+        if ts.block_hash != start {
+            log::error!("node ignored the explicit tree-state checkpoint (update the node)");
+            return None;
+        }
+        let fs = FrontierState {
+            size: ts.size,
+            leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+            ommers: ts.ommers.iter().map(|h| h.as_bytes()).collect(),
+        };
+        let db = WalletDb::from_frontier(seed, &fs)?;
+        Some(WalletEntry::from_parts(seed, db, guard, start, ts.daa_score as usize, VecDeque::new(), 0))
     }
 
     /// Fetch a loaded wallet for a token, loading it from disk on first use.
@@ -595,19 +717,17 @@ impl AppState {
             }
         }
         let (seed, birthday) = load_wallet_meta(&self.wallet_dir, token, self.wallet_secret.as_deref())?;
-        let genesis = self.client.get_block_dag_info().await.ok()?.pruning_point_hash;
-        // Resume from a persisted checkpoint when one is present and still anchored to
-        // the current pruning point; otherwise do the (birthday-bounded) chain scan.
+        let genesis = self.genesis;
+        // Resume from a persisted checkpoint when one is present and version/genesis
+        // valid; otherwise fast-sync (birthday-gated: a fast-synced wallet is blind
+        // to notes older than its base) or the pruning-point full scan.
         let entry = match load_checkpoint(&self.wallet_dir, token, seed, &genesis) {
-            Some((db, low, scanned)) => WalletEntry::from_checkpoint(seed, db, genesis, low, scanned),
-            // No persisted checkpoint: fast-sync from the node's pruning-point frontier,
-            // falling back to a full pruning-point-onward scan only if that RPC fails.
-            None => match self.fast_sync_entry(seed, genesis).await {
+            Some((db, low, scanned, boundaries, sink_blue)) => {
+                WalletEntry::from_parts(seed, db, genesis, low, scanned, boundaries, sink_blue)
+            }
+            None => match self.fast_sync_entry(seed, genesis, birthday).await {
                 Some(e) => e,
-                None => {
-                    let (low, base) = resolve_start(&self.client, genesis, birthday).await;
-                    WalletEntry::new(seed, genesis, low, base)?
-                }
+                None => self.full_scan_entry(seed, genesis).await?,
             },
         };
         let w = Arc::new(Mutex::new(entry));
@@ -624,6 +744,7 @@ async fn sync_loop(state: Arc<AppState>) {
     loop {
         let wallets: Vec<(String, Wallet)> = { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
         let mut any_behind = false;
+        let mut reorged_tokens: Vec<String> = Vec::new();
         if !wallets.is_empty() {
             let chain_len = state.client.get_block_dag_info().await.map(|d| d.virtual_daa_score).unwrap_or(0);
             for (token, w) in wallets {
@@ -634,6 +755,15 @@ async fn sync_loop(state: Arc<AppState>) {
                 let was_caught_up = e.caught_up;
                 e.caught_up = false;
                 e.sync_chunk(&state.client).await;
+                if e.reorged {
+                    // The append-only tree cannot roll back a deep reorg: discard
+                    // the checkpoint and evict the wallet; the next request reloads
+                    // it cleanly (fast-sync or full scan).
+                    log::warn!("wallet '{token}': deep reorg below cursor — discarding checkpoint and rescanning");
+                    let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
+                    reorged_tokens.push(token.clone());
+                    continue;
+                }
                 if !e.caught_up {
                     any_behind = true;
                 }
@@ -643,12 +773,20 @@ async fn sync_loop(state: Arc<AppState>) {
                 let advanced = e.scanned.saturating_sub(e.saved_scanned);
                 let just_caught_up = e.caught_up && !was_caught_up;
                 if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0)) {
-                    if let Err(err) = save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db) {
+                    if let Err(err) =
+                        save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue)
+                    {
                         eprintln!("checkpoint write failed for {token}: {err}");
                     } else {
                         e.saved_scanned = e.scanned;
                     }
                 }
+            }
+        }
+        if !reorged_tokens.is_empty() {
+            let mut map = state.wallets.lock().await;
+            for t in reorged_tokens {
+                map.remove(&t);
             }
         }
         // While catching up a big initial scan, loop back immediately (only a
@@ -824,20 +962,14 @@ async fn load_new_wallet(
     // Drop any prior scan checkpoint: a (re)imported seed must rescan from its own
     // birthday, not resume a different wallet's stream.
     let _ = std::fs::remove_file(scan_path(&state.wallet_dir, token));
-    let genesis = state
-        .client
-        .get_block_dag_info()
-        .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("get_block_dag_info failed: {e}")))?
-        .pruning_point_hash;
-    // Fast-sync from the node's pruning-point frontier (correct + O(blocks since
-    // pruning)); fall back to a full pruning-point scan only if that RPC is absent.
-    let entry = match state.fast_sync_entry(seed, genesis).await {
+    // Fast-sync from the node's frontier when the wallet is born after the
+    // checkpoint (complete by construction); otherwise the pruning-point full scan.
+    let entry = match state.fast_sync_entry(seed, state.genesis, birthday).await {
         Some(e) => e,
-        None => {
-            let (low, base) = resolve_start(&state.client, genesis, birthday).await;
-            WalletEntry::new(seed, genesis, low, base).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?
-        }
+        None => state
+            .full_scan_entry(seed, state.genesis)
+            .await
+            .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "cannot anchor a full scan (node unreachable or too old)"))?,
     };
     state.wallets.lock().await.insert(token.to_string(), Arc::new(Mutex::new(entry)));
     Ok(())
@@ -923,9 +1055,42 @@ struct SendReq {
 
 #[derive(Serialize)]
 struct SendResp {
+    /// First transaction id (kept for callers that expect a single txid).
     txid: String,
     amount_sompi: u64,
+    /// Total fees paid across all transactions.
     fee_sompi: u64,
+    /// Every transaction id: a large send is split across several
+    /// standard-size transactions (at most [`max_spends_per_tx`] spends each).
+    txids: Vec<String>,
+    tx_count: usize,
+}
+
+/// Greedy chunk planning over **value-descending** candidate notes: each
+/// transaction spends at most `max_per` notes and pays `min(remaining,
+/// chunk_sum − fee)` to the recipient, until `amount` is covered. Returns the
+/// per-chunk `(note_count, pay)` plan, or `None` if the notes run out
+/// (insufficient funds once per-tx fees are accounted).
+fn plan_chunks(values: &[u64], amount: u64, fee: u64, max_per: usize) -> Option<Vec<(usize, u64)>> {
+    let mut chunks = Vec::new();
+    let mut remaining = amount;
+    let mut i = 0usize;
+    while remaining > 0 {
+        let mut sum = 0u64;
+        let mut n = 0usize;
+        while n < max_per && i < values.len() && sum < remaining.saturating_add(fee) {
+            sum = sum.saturating_add(values[i]);
+            i += 1;
+            n += 1;
+        }
+        if sum <= fee {
+            return None;
+        }
+        let pay = remaining.min(sum - fee);
+        chunks.push((n, pay));
+        remaining -= pay;
+    }
+    Some(chunks)
 }
 
 async fn wallet_send(
@@ -943,118 +1108,250 @@ async fn wallet_send(
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "specify amount_sompi or amount_fc")),
     };
     let fee = req.fee.unwrap_or(3_000_000);
-    let anchor_depth = DEFAULT_ANCHOR_DEPTH;
 
     let client = &state.client;
-    let dag =
-        client.get_block_dag_info().await.map_err(|e| err(StatusCode::BAD_GATEWAY, format!("get_block_dag_info failed: {e}")))?;
-    let net: [u8; 32] = dag.pruning_point_hash.as_bytes();
-
-    let chain_len = dag.virtual_daa_score as usize;
-    let need_len = anchor_depth as usize + 2;
-    if chain_len <= need_len {
-        return Err(err(
-            StatusCode::CONFLICT,
-            format!("chain too short ({chain_len} blocks): no note has matured past depth {anchor_depth} yet"),
-        ));
-    }
-    let ingest_limit = chain_len - need_len;
+    // The shielded sighash network domain: the GENESIS hash — what consensus
+    // verifies signatures against (`params.genesis.hash`). The moving pruning
+    // point only coincides with it on a young, unpruned chain.
+    let net: [u8; 32] = state.genesis.as_bytes();
 
     let to_addr =
         Address::try_from(req.to.as_str()).map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid recipient address: {e}")))?;
     let recipient = orchard_recipient_bytes(&to_addr)
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "recipient is not a shielded Orchard address"))?;
     let need = amount.checked_add(fee).ok_or_else(|| err(StatusCode::BAD_REQUEST, "amount + fee overflows"))?;
-    // The matured cutoff: `anchor_depth + 2` blocks back from the tip (mirrors the
-    // block count `scan_to_limit` would replay to).
-    let need_back = need_len;
 
+    if amount == 0 {
+        return Err(err(StatusCode::BAD_REQUEST, "amount must be positive"));
+    }
+    let max_per_tx = max_spends_per_tx();
     let insufficient = |have: u64| {
         err(
             StatusCode::CONFLICT,
-            format!("insufficient matured funds: have {have}, need amount+fee={need} (funds must be ~10 min old to spend)"),
+            format!(
+                "insufficient matured funds: have {have}, need {need}+ (amount {amount} + a {fee} fee per tx; funds must be ~10 min old to spend)"
+            ),
         )
     };
 
-    // Fast path: reuse the wallet state the sync loop already maintains, instead of
-    // replaying the whole chain into a throwaway db. Root the spend at the leaf count
-    // recorded `need_back` blocks back from the wallet's latest scanned block — always a
-    // matured, canonical block root (a wallet that is behind the tip simply roots at an
-    // even deeper anchor, still valid), which consensus accepts as a finalized anchor
-    // (`is_shielded_anchor_final`). Selection + witness build run under the entry lock
-    // (CPU-only, no await); the lock is dropped before the slow proof build below. We do
-    // NOT gate on `caught_up` — on a fast chain that flag is rarely set, and the ring
-    // anchor is valid regardless; `caught_up` is only used to decide whether an
-    // insufficient result is authoritative (see the match below).
-    let mut fast: Option<(Vec<_>, u64, bool)> = None;
+    // Gather ALL matured candidates and plan the transactions. A standard tx fits
+    // at most `max_per_tx` spends (transient-mass cap), so a large send is split
+    // into several transactions, each paying part of the amount. Everything —
+    // candidates, plan, witnesses — is materialized before any proving starts, so
+    // an over-cap or underfunded request fails in milliseconds, not after a
+    // multi-minute (or, live, 106-minute) proof.
+    //
+    // Fast path: reuse the wallet state the sync loop already maintains, rooting
+    // each spend at the newest chain-block boundary at least `anchor_depth +
+    // slack` blue units below the sink — a matured, canonical chain-block root
+    // consensus accepts (`is_shielded_anchor_final`; maturity is measured in blue
+    // score). The entry lock is held only for selection + witness building.
+    let mut planned: Option<(Vec<(Vec<_>, u64, Vec<u64>)>, u64, bool)> = None;
     {
         let e = w.lock().await;
-        if e.block_leaf_counts.len() > need_back {
-            let matured = e.block_leaf_counts[e.block_leaf_counts.len() - 1 - need_back];
-            let caught_up = e.caught_up;
+        let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
+        if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
             let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
             candidates.sort_by(|a, b| b.value().cmp(&a.value()));
-            let mut ins = Vec::new();
-            let mut selected = 0u64;
-            for n in candidates {
-                if selected >= need {
-                    break;
+            let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
+            let have: u64 = values.iter().sum();
+            match plan_chunks(&values, amount, fee, max_per_tx) {
+                Some(plan) => {
+                    let mut chunks = Vec::with_capacity(plan.len());
+                    let mut idx = 0usize;
+                    for (n_notes, pay) in plan {
+                        let mut inputs = Vec::with_capacity(n_notes);
+                        let mut positions = Vec::with_capacity(n_notes);
+                        for note in &candidates[idx..idx + n_notes] {
+                            let path = e
+                                .db
+                                .witness_path_at(note.position, matured)
+                                .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                            inputs.push((note.note.clone(), path));
+                            positions.push(note.position);
+                        }
+                        idx += n_notes;
+                        chunks.push((inputs, pay, positions));
+                    }
+                    planned = Some((chunks, have, e.caught_up));
                 }
-                let path =
-                    e.db.witness_path_at(n.position, matured)
-                        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
-                ins.push((n.note.clone(), path));
-                selected += n.value();
+                None => planned = Some((Vec::new(), have, e.caught_up)),
             }
-            fast = Some((ins, selected, caught_up));
         }
     }
 
-    let inputs = match fast {
-        // Enough matured funds at the wallet's own anchor — the fast, no-rescan path.
-        Some((ins, selected, _)) if selected >= need => ins,
-        // Not enough, but the wallet is caught up to the tip, so a full replay would see
-        // the exact same matured notes: report insufficient without the slow scan.
-        Some((_, selected, true)) => return Err(insufficient(selected)),
-        // Either the ring has not reached the maturity depth yet (cold start, right after
-        // a checkpoint load), or the wallet is still behind the tip and may be missing
-        // recently-matured notes. Fall back to the one-off matured replay — correct, just
-        // slow, and only transient until the sync loop catches up and fills the ring.
+    let chunks = match planned {
+        // A complete plan at the wallet's own anchor — the fast, no-rescan path.
+        Some((chunks, _, _)) if !chunks.is_empty() => chunks,
+        // Planning failed but the wallet is caught up to the tip, so a full replay
+        // would see the exact same matured notes: authoritative insufficient.
+        Some((_, have, true)) => return Err(insufficient(have)),
+        // Ring not filled yet (cold start) or wallet behind the tip: one-off matured
+        // replay — correct, just slow, and transient until the sync loop catches up.
         _ => {
-            log::warn!(
-                "send: fast path unavailable/insufficient (ring or sync not caught up); falling back to full matured scan (slow, one-off)"
-            );
-            let db = scan_to_limit(client, seed, ingest_limit).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            log::warn!("send: fast path unavailable/insufficient; falling back to a matured chain replay (slow, one-off)");
+            let fresh = WalletDb::from_seed(seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?;
+            let db = replay_matured(client, fresh).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             let mut candidates = db.notes().to_vec();
             candidates.sort_by(|a, b| b.value().cmp(&a.value()));
-            let mut ins = Vec::new();
-            let mut selected = 0u64;
-            for n in &candidates {
-                if selected >= need {
-                    break;
+            let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
+            let have: u64 = values.iter().sum();
+            let plan = plan_chunks(&values, amount, fee, max_per_tx).ok_or_else(|| insufficient(have))?;
+            let mut chunks = Vec::with_capacity(plan.len());
+            let mut idx = 0usize;
+            for (n_notes, pay) in plan {
+                let mut inputs = Vec::with_capacity(n_notes);
+                let mut positions = Vec::with_capacity(n_notes);
+                for note in &candidates[idx..idx + n_notes] {
+                    let path = db
+                        .witness_path(note.position)
+                        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                    inputs.push((note.note.clone(), path));
+                    positions.push(note.position);
                 }
-                let path = db
-                    .witness_path(n.position)
-                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
-                ins.push((n.note.clone(), path));
-                selected += n.value();
+                idx += n_notes;
+                chunks.push((inputs, pay, positions));
             }
-            if selected < need {
-                return Err(insufficient(selected));
-            }
-            ins
+            chunks
         }
     };
 
+    // Prove + submit each chunk sequentially. Proving runs on a blocking thread so
+    // the daemon (status/balance endpoints, other wallets) stays responsive; each
+    // accepted chunk's notes are marked spent immediately so a concurrent or
+    // follow-up send cannot re-select them before the scan loop observes the tx.
     let ctx = payment_tx_context();
-    log::info!("building Orchard payment proof (Halo 2) for {amount} sompi + {fee} fee...");
-    let payload = build_wallet_payment(seed, inputs, recipient, amount, fee, &net, &ctx)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build payment: {e:?}")))?;
+    let tx_count = chunks.len();
+    let mut txids: Vec<String> = Vec::with_capacity(tx_count);
+    let mut sent = 0u64;
+    for (ci, (inputs, pay, positions)) in chunks.into_iter().enumerate() {
+        log::info!(
+            "send: building Orchard proof for tx {}/{tx_count} ({} spends, {pay} sompi + {fee} fee)...",
+            ci + 1,
+            inputs.len()
+        );
+        let ctx2 = ctx.clone();
+        let started = std::time::Instant::now();
+        let payload = tokio::task::spawn_blocking(move || build_wallet_payment(seed, inputs, recipient, pay, fee, &net, &ctx2))
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build payment: {e:?}")))?;
+        log::info!("send: tx {}/{tx_count} proven in {:.0?}", ci + 1, started.elapsed());
+
+        let tx: Transaction = payment_tx(payload);
+        match client.submit_transaction(RpcTransaction::from(&tx), false).await {
+            Ok(accepted) => {
+                txids.push(accepted.to_string());
+                sent += pay;
+                let mut e = w.lock().await;
+                for p in positions {
+                    e.db.mark_spent(p);
+                }
+            }
+            Err(e) if txids.is_empty() => return Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payment: {e}"))),
+            Err(e) => {
+                // Partial success: report what actually went through.
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": format!("payment partially sent: {}/{tx_count} txs accepted, then the node rejected: {e}", txids.len()),
+                        "txids": txids,
+                        "sent_sompi": sent,
+                    })),
+                ));
+            }
+        }
+    }
+
+    let total_fee = fee * tx_count as u64;
+    Ok(Json(SendResp { txid: txids[0].clone(), amount_sompi: amount, fee_sompi: total_fee, txids, tx_count }))
+}
+
+#[derive(Deserialize, Default)]
+struct ConsolidateReq {
+    fee: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ConsolidateResp {
+    txid: String,
+    /// How many notes were merged into one.
+    consolidated: usize,
+    /// Value of the resulting note (inputs minus fee).
+    value_sompi: u64,
+    /// Unspent notes the wallet still tracks after this merge.
+    notes_remaining: usize,
+}
+
+/// Merge the wallet's **smallest matured notes** into a single note paid back to
+/// its own address. Mining wallets accumulate one ~60 FC coinbase note per block;
+/// since a standard transaction spends at most [`max_spends_per_tx`] notes
+/// (transient-mass cap), a fragmented wallet needs many chunked transactions per
+/// large send. Calling this periodically (each call folds up to 6 notes → 1, the
+/// result spendable after ~10 min maturity) keeps big payouts down to a single tx.
+async fn wallet_consolidate(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Option<Json<ConsolidateReq>>,
+) -> Result<Json<ConsolidateResp>, (StatusCode, Json<serde_json::Value>)> {
+    let token = token_from(&headers, state.allow_default_token)?;
+    let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
+    let seed = { w.lock().await.seed };
+    let fee = body.and_then(|Json(b)| b.fee).unwrap_or(3_000_000);
+    let own_recipient =
+        address_bytes_from_seed(seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "seed is not a valid spending key"))?;
+
+    let net: [u8; 32] = state.genesis.as_bytes();
+
+    // Select up to a tx-full of the smallest matured notes under the entry lock.
+    let (inputs, positions, sum) = {
+        let e = w.lock().await;
+        let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
+        let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) else {
+            return Err(err(StatusCode::CONFLICT, "wallet is still syncing the maturity window; try again shortly"));
+        };
+        let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
+        candidates.sort_by_key(|n| n.value());
+        candidates.truncate(max_spends_per_tx());
+        let sum: u64 = candidates.iter().map(|n| n.value()).sum();
+        if candidates.len() < 2 {
+            return Err(err(StatusCode::CONFLICT, "nothing to consolidate: fewer than 2 matured notes"));
+        }
+        if sum <= fee {
+            return Err(err(StatusCode::CONFLICT, format!("smallest notes sum to {sum}, not more than the {fee} fee")));
+        }
+        let mut inputs = Vec::with_capacity(candidates.len());
+        let mut positions = Vec::with_capacity(candidates.len());
+        for n in &candidates {
+            let path =
+                e.db.witness_path_at(n.position, matured)
+                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+            inputs.push((n.note.clone(), path));
+            positions.push(n.position);
+        }
+        (inputs, positions, sum)
+    };
+
+    let consolidated = inputs.len();
+    let value = sum - fee;
+    let ctx = payment_tx_context();
+    log::info!("consolidate: merging {consolidated} notes ({sum} sompi) into one...");
+    let payload = tokio::task::spawn_blocking(move || build_wallet_payment(seed, inputs, own_recipient, value, fee, &net, &ctx))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build consolidation: {e:?}")))?;
 
     let tx: Transaction = payment_tx(payload);
-    match client.submit_transaction(RpcTransaction::from(&tx), false).await {
-        Ok(accepted) => Ok(Json(SendResp { txid: accepted.to_string(), amount_sompi: amount, fee_sompi: fee })),
-        Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payment: {e}"))),
+    match state.client.submit_transaction(RpcTransaction::from(&tx), false).await {
+        Ok(accepted) => {
+            let mut e = w.lock().await;
+            for p in positions {
+                e.db.mark_spent(p);
+            }
+            let notes_remaining = e.db.notes().len();
+            Ok(Json(ConsolidateResp { txid: accepted.to_string(), consolidated, value_sompi: value, notes_remaining }))
+        }
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the consolidation: {e}"))),
     }
 }
 
@@ -1123,18 +1420,7 @@ async fn wallet_prepare(
     let fee = req.fee.unwrap_or(3_000_000);
 
     let client = &state.client;
-    let dag =
-        client.get_block_dag_info().await.map_err(|e| err(StatusCode::BAD_GATEWAY, format!("get_block_dag_info failed: {e}")))?;
-    let net: [u8; 32] = dag.pruning_point_hash.as_bytes();
-    let chain_len = dag.virtual_daa_score as usize;
-    let need_len = DEFAULT_ANCHOR_DEPTH as usize + 2;
-    if chain_len <= need_len {
-        return Err(err(
-            StatusCode::CONFLICT,
-            format!("chain too short ({chain_len} blocks): no note has matured past depth {DEFAULT_ANCHOR_DEPTH} yet"),
-        ));
-    }
-    let ingest_limit = chain_len - need_len;
+    let net: [u8; 32] = state.genesis.as_bytes();
 
     let to_addr =
         Address::try_from(req.to.as_str()).map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid recipient address: {e}")))?;
@@ -1142,18 +1428,24 @@ async fn wallet_prepare(
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "recipient is not a shielded Orchard address"))?;
     let need = amount.checked_add(fee).ok_or_else(|| err(StatusCode::BAD_REQUEST, "amount + fee overflows"))?;
 
-    // Watch-only scan: the note set is recovered from the FVK alone (no seed).
+    // Watch-only scan: the note set is recovered from the FVK alone (no seed),
+    // over the settled matured chain prefix so every witness roots at a matured
+    // canonical anchor.
     let db = WalletDb::from_fvk(&fvk_bytes).ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?;
-    log::info!("non-custodial prepare: watch-only scan of up to {ingest_limit} matured blocks...");
-    let db = scan_db_to_limit(client, db, ingest_limit).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    log::info!("non-custodial prepare: watch-only matured chain replay...");
+    let db = replay_matured(client, db).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // Select matured notes (all scanned notes are past the maturity cutoff).
+    // Select matured notes (all scanned notes are past the maturity cutoff),
+    // bounded by the standard-mass spend cap: a prepared tx that needs more
+    // notes than fit one transaction would burn a long proof only to be
+    // rejected, so refuse it up front with the actionable maximum.
+    let max_per_tx = max_spends_per_tx();
     let mut candidates = db.notes().to_vec();
     candidates.sort_by(|a, b| b.value().cmp(&a.value()));
     let mut inputs = Vec::new();
     let mut selected = 0u64;
     for n in &candidates {
-        if selected >= need {
+        if selected >= need || inputs.len() == max_per_tx {
             break;
         }
         let path =
@@ -1162,15 +1454,29 @@ async fn wallet_prepare(
         selected += n.value();
     }
     if selected < need {
-        return Err(err(
-            StatusCode::CONFLICT,
-            format!("insufficient matured funds: have {selected}, need amount+fee={need} (funds must be ~10 min old to spend)"),
-        ));
+        let have: u64 = candidates.iter().map(|n| n.value()).sum();
+        return Err(if have >= need {
+            err(
+                StatusCode::CONFLICT,
+                format!(
+                    "amount needs more than {max_per_tx} input notes (standard tx size cap): max sendable in one tx is {} sompi; send in smaller chunks",
+                    selected.saturating_sub(fee)
+                ),
+            )
+        } else {
+            err(
+                StatusCode::CONFLICT,
+                format!("insufficient matured funds: have {have}, need amount+fee={need} (funds must be ~10 min old to spend)"),
+            )
+        });
     }
 
     let ctx = payment_tx_context();
-    log::info!("non-custodial prepare: building Orchard payment proof (Halo 2)...");
-    let payment = prepare_payment(db.fvk(), inputs, recipient, amount, fee, &net, &ctx)
+    log::info!("non-custodial prepare: building Orchard payment proof (Halo 2) for {} spends...", inputs.len());
+    let fvk = db.fvk().clone();
+    let payment = tokio::task::spawn_blocking(move || prepare_payment(&fvk, inputs, recipient, amount, fee, &net, &ctx))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to prepare payment: {e:?}")))?;
 
     let spend_auth: Vec<SpendAuthReq> =
@@ -1234,7 +1540,10 @@ async fn wallet_submit(
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("could not finalize payment (bad/missing signatures?): {e:?}")))?;
     let tx: Transaction = payment_tx(bundle.to_bytes());
     match state.client.submit_transaction(RpcTransaction::from(&tx), false).await {
-        Ok(accepted) => Ok(Json(SendResp { txid: accepted.to_string(), amount_sompi: amount, fee_sompi: fee })),
+        Ok(accepted) => {
+            let txid = accepted.to_string();
+            Ok(Json(SendResp { txid: txid.clone(), amount_sompi: amount, fee_sompi: fee, txids: vec![txid], tx_count: 1 }))
+        }
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payment: {e}"))),
     }
 }
@@ -1365,6 +1674,20 @@ async fn main() {
         );
     }
 
+    // The network genesis hash — the shielded sighash domain consensus verifies
+    // against, and the checkpoint guard. `get_blocks(None)` resolves low=None to
+    // genesis and returns it as the first hash.
+    let genesis = loop {
+        match client.get_blocks(None, false, false).await {
+            Ok(r) if !r.block_hashes.is_empty() => break r.block_hashes[0],
+            other => {
+                log::warn!("cannot resolve genesis hash yet ({other:?}); retrying in 3s...");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    };
+    log::info!("network genesis (shielded sighash domain): {genesis}");
+
     let state = Arc::new(AppState {
         client,
         wallet_dir,
@@ -1373,10 +1696,19 @@ async fn main() {
         wallets: Mutex::new(HashMap::new()),
         allow_default_token: cli.allow_default_token,
         wallet_secret,
+        genesis,
         prepared: Mutex::new(HashMap::new()),
     });
 
     tokio::spawn(sync_loop(state.clone()));
+
+    // Build the (deterministic, process-wide) Orchard proving key now, off the
+    // async runtime, so the first send doesn't eat the multi-minute keygen.
+    std::thread::spawn(|| {
+        let started = std::time::Instant::now();
+        let _ = proving_key();
+        log::info!("Orchard proving key ready in {:.0?} (max {} spends per standard tx)", started.elapsed(), max_spends_per_tx());
+    });
 
     // Lock CORS to an explicit browser-origin allowlist. With no --allow-origin given
     // the list is empty, so cross-origin browser reads are refused (same-origin only):
@@ -1408,6 +1740,7 @@ async fn main() {
         .route("/api/wallet/reveal", get(wallet_reveal))
         .route("/api/wallet/balance", get(wallet_balance))
         .route("/api/wallet/send", post(wallet_send))
+        .route("/api/wallet/consolidate", post(wallet_consolidate))
         .route("/api/wallet/prepare", post(wallet_prepare))
         .route("/api/wallet/submit", post(wallet_submit))
         .route("/api/wallet/sign", post(wallet_sign))
