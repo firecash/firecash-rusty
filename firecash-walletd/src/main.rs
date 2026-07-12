@@ -63,7 +63,7 @@ const DEFAULT_ANCHOR_DEPTH: u64 = 600;
 /// Max `GetShieldedBlocks` pages a wallet advances per sync chunk. Kept small so
 /// the per-wallet lock is released frequently (status stays responsive); speed
 /// comes from looping back immediately instead of pausing between chunks.
-const PAGES_PER_CHUNK: usize = 4;
+const PAGES_PER_CHUNK: usize = 16;
 /// Chain blocks requested per `GetShieldedBlocks` page.
 const SHIELDED_PAGE: u64 = 200;
 /// Blue-score margin the sync holds back from the sink before ingesting a chain
