@@ -778,9 +778,16 @@ impl WalletEntry {
         // catch-up is small and, once done, stays incremental.
         if self.caught_up {
             if let Some(matured) = self.matured_leaves() {
-                while self.db.advance_witnesses_capped(matured, WITNESS_ADVANCE_CAP) {
-                    tokio::task::yield_now().await;
-                }
+                // Advance witnesses by AT MOST one capped step per sync pass. Draining
+                // the whole catch-up here (the old `while` loop) let a single heavy
+                // wallet monopolize the shared sync loop for minutes — on a CPU-pinned
+                // runtime `yield_now` hands the core straight back, so the loop never
+                // returned and every *other* wallet's scan froze (the "stuck at N%"
+                // outage). One bounded step keeps sync_chunk short so the loop round-
+                // robins the fleet; the remaining witness work continues on later
+                // passes, and any note whose live witness isn't ready yet is rebuilt
+                // on demand at spend time (`witness_path_at`).
+                let _ = self.db.advance_witnesses_capped(matured, WITNESS_ADVANCE_CAP);
             }
         }
         self.error = None;
