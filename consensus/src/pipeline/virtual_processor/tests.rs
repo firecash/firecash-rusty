@@ -501,6 +501,7 @@ async fn immature_shielded_anchor_spend_is_dropped_not_fatal() {
     // transactions are *accepted* by the block that merges it, not by itself, so B's
     // body validity does not yet exercise the anchor-finality gate.
     let spend_block = ctx.mine_real_pow_block_with(vec![spend_tx]);
+    let spend_block_hash = spend_block.header.hash;
     assert_eq!(spend_block.transactions.len(), 2, "the immature spend was included in the block body");
     ctx.consensus.validate_and_insert_block(spend_block).virtual_state_task.await.unwrap();
 
@@ -512,6 +513,17 @@ async fn immature_shielded_anchor_spend_is_dropped_not_fatal() {
     // chain keeps advancing. This is the fix for the observed mainnet halt.
     let child = ctx.mine_real_pow_block();
     let child_hash = child.header.hash;
+
+    // ANTI-INFLATION (the F-01 regression): the dropped spend's fee (2_000) never
+    // left the pool, so C's coinbase — which pays B's reward — must re-mint the
+    // bare subsidy and NOT the dropped fee. `note_value` is a fee-less block's
+    // subsidy at the same emission phase, so it is the exact expected value.
+    let child_coinbase_total: u64 = child.transactions[0].outputs.iter().map(|o| o.value).sum();
+    assert_eq!(
+        child_coinbase_total, note_value,
+        "the merging block's coinbase must not re-mint a dropped spend's fee (would be +2_000 unbacked)"
+    );
+
     ctx.consensus.validate_and_insert_block(child).virtual_state_task.await.unwrap();
 
     // LIVENESS: the block merging an immature-anchor spend is NOT disqualified — it is
@@ -524,6 +536,17 @@ async fn immature_shielded_anchor_spend_is_dropped_not_fatal() {
     );
     assert_eq!(ctx.consensus.get_sink(), child_hash, "the sink advances to the child — the chain did not halt");
     assert_ne!(ctx.consensus.get_sink(), sink_before, "the chain advanced past the pre-spend sink");
+
+    // ANTI-INFLATION, ledger side: across the block that dropped the spend, the
+    // pool grew by exactly the subsidy — cumulative_coinbase minted the coinbase
+    // note, cumulative_fees collected nothing (the spend was never applied).
+    // Before the fix this delta was subsidy + 2_000: silent unbacked supply.
+    let vp = ctx.consensus.virtual_processor();
+    let before = vp.shielded_supply_totals_at(spend_block_hash).unwrap();
+    let after = vp.shielded_supply_totals_at(child_hash).unwrap();
+    let pool_delta = (after.cumulative_coinbase - before.cumulative_coinbase) as i128
+        - (after.cumulative_fees - before.cumulative_fees) as i128;
+    assert_eq!(pool_delta, note_value as i128, "the pool must grow by exactly the subsidy when a spend is dropped");
 }
 
 /// NEGATIVE / soundness (PLAN §2.5, task #29 — the shallow-anchor value-creation

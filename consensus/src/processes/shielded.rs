@@ -20,7 +20,7 @@ use kaspa_consensus_core::tx::Transaction;
 use kaspa_database::prelude::{CachePolicy, DB, StoreError, StoreResult};
 use kaspa_hashes::Hash;
 use kaspa_shielded_core::coinbase::{coinbase_note, derive_coinbase_note_desc};
-use kaspa_shielded_core::nullifier::{MemNullifierSet, NullifierBytes, NullifierSet};
+use kaspa_shielded_core::nullifier::{MemNullifierSet, NullifierBytes, NullifierConflictResolver, NullifierSet};
 #[cfg(test)]
 use kaspa_shielded_core::state::CoinbaseNote;
 use kaspa_shielded_core::state::{BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx, apply_chain_block_to};
@@ -211,6 +211,35 @@ impl ShieldedStateManager {
     fn load_supply(&self, block: Hash) -> StoreResult<SupplyLedger> {
         let t = self.supply_store.get(block)?;
         Ok(SupplyLedger::from_totals(t.cumulative_coinbase, t.cumulative_fees))
+    }
+
+    /// The turnstile cumulative totals as of a given chain block (zero totals for
+    /// blocks with no shielded state). Used by the pool-delta consensus check.
+    pub fn supply_totals_at(&self, block: Hash) -> StoreResult<SupplyTotals> {
+        self.supply_store.get(block)
+    }
+
+    /// Decide, in accepted order, which candidate shielded txs a chain block will
+    /// actually APPLY — mirroring exactly the drop rules of the state transition:
+    /// a spending tx whose anchor fails the caller's finality predicate (PLAN §2.5)
+    /// is dropped, then first-in-accepted-order nullifier conflict resolution runs
+    /// against the finalized set (PLAN §2.4). Returns a keep-mask aligned with `txs`.
+    ///
+    /// This exists so the coinbase can be built/verified from the *applied* fees
+    /// only: a dropped spend never left the pool, so re-minting its fee in the
+    /// coinbase would create unbacked supply (the F-01 inflation vector). It must
+    /// be called against the same persisted nullifier state `compute` will see —
+    /// i.e. with the selected-parent chain committed — which is the invariant the
+    /// virtual processor already maintains for `compute` itself.
+    pub fn partition_applied<F: FnMut(&ShieldedTx) -> bool>(&self, txs: &[ShieldedTx], mut anchor_final: F) -> Vec<bool> {
+        let pending = MemNullifierSet::new();
+        let finalized = LayeredNullifierSet { store: &self.nullifiers, pending: &pending };
+        let mut resolver = NullifierConflictResolver::new(&finalized);
+        txs.iter()
+            .map(|stx| {
+                (stx.nullifiers.is_empty() || anchor_final(stx)) && resolver.try_accept(stx.nullifiers.iter().copied()).is_ok()
+            })
+            .collect()
     }
 
     fn load_nullifier_muhash(&self, block: Hash) -> StoreResult<MuHash> {
@@ -599,6 +628,84 @@ mod tests {
         assert_eq!(a.supply_totals.cumulative_coinbase - a.supply_totals.cumulative_fees, 100 - 10);
         // Determinism: two independent nodes compute the identical anchor.
         assert_eq!(a.anchor(), b.anchor(), "identical anchor across nodes from identical accepted order");
+    }
+
+    /// F-01 regression, the partition rules: `partition_applied` must drop exactly
+    /// what the state transition drops — spends against non-final anchors, and
+    /// nullifier conflicts both against the persisted set and within the batch
+    /// (first in accepted order wins) — while pure-output txs are always kept.
+    #[test]
+    fn partition_applied_mirrors_transition_drop_rules() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+
+        // Persist a block spending nf(1) so the finalized set contains it.
+        commit_block(&mgr, &db, h(1), h(0), Some(coinbase(100, 10)), vec![stx(&[1], &[100], 5)]);
+
+        let bad_anchor = [0xbb; 32];
+        let mut immature = stx(&[4], &[400], 9);
+        immature.anchor = bad_anchor;
+        let candidates = vec![
+            stx(&[2], &[200], 5),  // fresh spend — kept
+            stx(&[1], &[201], 5),  // conflicts with the PERSISTED nf(1) — dropped
+            stx(&[2], &[202], 7),  // conflicts with the batch's first tx — dropped
+            immature,              // spend against a non-final anchor — dropped
+            stx(&[], &[203], 0),   // pure-output (no nullifiers): anchor rule exempt — kept
+            stx(&[3], &[204], 2),  // independent spend — kept
+        ];
+        let keep = mgr.partition_applied(&candidates, |stx| stx.anchor != bad_anchor);
+        assert_eq!(keep, vec![true, false, false, false, true, true]);
+
+        // The transition applied to the FULL set accepts exactly the kept indices —
+        // the partition is a faithful precomputation of the transition's drops.
+        let computed = mgr.compute(h(1), None, &candidates).unwrap();
+        let kept_indices: Vec<usize> = keep.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect();
+        // `compute` has no anchor predicate (the caller pre-filters), so exclude
+        // the anchor-dropped tx from the comparison by feeding the pre-filtered set.
+        let anchor_ok: Vec<ShieldedTx> = candidates.iter().filter(|s| s.anchor != bad_anchor).cloned().collect();
+        let computed_filtered = mgr.compute(h(1), None, &anchor_ok).unwrap();
+        assert_eq!(computed_filtered.outcome.accepted.len(), kept_indices.len());
+        // And on the full set the nullifier-only drops agree (indices 1 and 2 dropped).
+        assert_eq!(computed.outcome.accepted, vec![0, 3, 4, 5], "nullifier rules agree with the mask (anchor rule aside)");
+    }
+
+    /// F-01 regression, the accounting: when a spend is dropped, the coinbase must
+    /// re-mint only the APPLIED fees — then the pool grows by exactly the subsidy.
+    /// The counterfactual shows the pre-fix behavior (coinbase re-mints the dropped
+    /// fee too) inflates the pool by exactly that fee — which the new pool-delta
+    /// consensus check rejects.
+    #[test]
+    fn dropped_spend_fee_is_not_reminted() {
+        const SUBSIDY: u64 = 100;
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+
+        // Fund the pool.
+        let c1 = commit_block(&mgr, &db, h(1), h(0), Some(coinbase(SUBSIDY, 10)), vec![]);
+        let pool_before = c1.supply_totals.cumulative_coinbase - c1.supply_totals.cumulative_fees;
+
+        // Two conflicting spends of nf(1) arrive in one mergeset: fees 5 and 7.
+        let candidates = vec![stx(&[1], &[100], 5), stx(&[1], &[200], 7)];
+        let keep = mgr.partition_applied(&candidates, |_| true);
+        assert_eq!(keep, vec![true, false]);
+        let applied: Vec<ShieldedTx> = candidates.iter().zip(&keep).filter(|(_, k)| **k).map(|(s, _)| s.clone()).collect();
+        let applied_fees: u64 = applied.iter().map(|s| s.fee).sum();
+        assert_eq!(applied_fees, 5);
+
+        // COUNTERFACTUAL (the pre-fix coinbase), computed first — before h(2) is
+        // committed, so nf(1) is not yet in the persisted set (`compute` does not
+        // persist): re-minting the dropped fee too (subsidy + 5 + 7) inflates the
+        // pool by the dropped 7 — silent unbacked supply. This is what
+        // verify_expected_utxo_state's pool-delta check now turns into an
+        // InvalidShieldedState rejection.
+        let c_bad = mgr.compute(h(1), Some(&coinbase(SUBSIDY + 5 + 7, 21)), &applied).unwrap();
+        let bad_pool = c_bad.supply_totals.cumulative_coinbase - c_bad.supply_totals.cumulative_fees;
+        assert_eq!(bad_pool - pool_before, (SUBSIDY + 7) as u128, "the old behavior mints the dropped fee unbacked");
+
+        // FIXED coinbase: subsidy + applied fees only. Pool grows by the subsidy.
+        let c2 = commit_block(&mgr, &db, h(2), h(1), Some(coinbase(SUBSIDY + applied_fees, 20)), applied);
+        let pool_after = c2.supply_totals.cumulative_coinbase - c2.supply_totals.cumulative_fees;
+        assert_eq!(pool_after - pool_before, SUBSIDY as u128, "pool must grow by exactly the subsidy");
     }
 
     /// The anchor→block index records a block's tree root so a spend can later be

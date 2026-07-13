@@ -326,6 +326,15 @@ impl VirtualStateProcessor {
         self.shielded_state_manager.state_root_at(block)
     }
 
+    /// The turnstile cumulative totals (PLAN §2.6) as of a given chain block.
+    /// Exposed for supply queries and the pool-accounting tests.
+    pub fn shielded_supply_totals_at(
+        &self,
+        block: kaspa_hashes::Hash,
+    ) -> Result<crate::model::stores::shielded::SupplyTotals, kaspa_database::prelude::StoreError> {
+        self.shielded_state_manager.supply_totals_at(block)
+    }
+
     /// Reconstruct the shielded effects one **chain block** applied (PLAN §2.4),
     /// for wallet sync (`GetShieldedBlocks` RPC): the block's own coinbase mint
     /// plus its accepted shielded bundles in consensus accepted order, re-running

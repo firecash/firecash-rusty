@@ -142,6 +142,11 @@ impl VirtualStateProcessor {
         ctx.accepted_tx_ids.push(validated_coinbase_id);
         ctx.accepted_tx_versions.push(validated_coinbase.version());
 
+        // Source (merged) block of each entry in `ctx.shielded_txs`, index-aligned.
+        // Needed below to attribute a dropped spend's fee back to the one mergeset
+        // reward that would otherwise re-mint it.
+        let mut shielded_tx_sources: Vec<Hash> = Vec::new();
+
         for (i, (merged_block, txs)) in once((ctx.selected_parent(), selected_parent_transactions))
             .chain(
                 ctx.ghostdag_data
@@ -195,6 +200,11 @@ impl VirtualStateProcessor {
                         ShieldedBundle::from_bytes(&validated_tx.tx().payload).ok().and_then(|b| ShieldedTx::from_bundle(&b).ok())
                     {
                         ctx.shielded_txs.push(stx);
+                        shielded_tx_sources.push(merged_block);
+                    } else {
+                        // The transition will never apply this tx, so its fee never
+                        // leaves the pool — the coinbase must not re-mint it.
+                        block_fee -= validated_tx.calculated_fee;
                     }
                 }
             }
@@ -218,6 +228,43 @@ impl VirtualStateProcessor {
                 merged_block,
                 BlockRewardData::new(coinbase_data.subsidy, block_fee, coinbase_data.miner_data.script_public_key),
             );
+        }
+
+        // Anti-inflation (PLAN §2.6): decide NOW — before the coinbase is built
+        // (template path) or verified (validation path) from `mergeset_rewards` —
+        // which shielded txs the state transition will actually apply, and deduct
+        // every dropped spend's fee from its source block's reward. A dropped spend
+        // never left the pool, so a coinbase re-minting its fee would create
+        // unbacked supply. Both the template builder and the coinbase verifier read
+        // the rewards computed here, so honest mining and verification stay
+        // byte-for-byte symmetric. The drop rules (anchor finality + accepted-order
+        // nullifier conflicts) are exactly those of the transition itself, so
+        // feeding `compute` the surviving set leaves its outcome unchanged.
+        if !ctx.shielded_txs.is_empty() {
+            let selected_parent = ctx.selected_parent();
+            let block_blue_score = ctx.ghostdag_data.blue_score;
+            let keep = self.shielded_state_manager.partition_applied(&ctx.shielded_txs, |stx| {
+                self.is_shielded_anchor_final(&stx.anchor, selected_parent, block_blue_score)
+            });
+            let UtxoProcessingContext { shielded_txs, mergeset_rewards, .. } = ctx;
+            let mut idx = 0usize;
+            let mut dropped = 0usize;
+            shielded_txs.retain(|stx| {
+                let keep_it = keep[idx];
+                let source = shielded_tx_sources[idx];
+                idx += 1;
+                if !keep_it {
+                    // The fee was accumulated into this source block's `block_fee`
+                    // above from the same `value_balance`, so this cannot underflow.
+                    mergeset_rewards.get_mut(&source).expect("every collected shielded tx has a rewarded source block").total_fees -=
+                        stx.fee;
+                    dropped += 1;
+                }
+                keep_it
+            });
+            if dropped > 0 {
+                debug!("shielded: dropped {dropped} spend(s) (non-final anchor or nullifier conflict); their fees are not re-minted");
+            }
         }
     }
 
@@ -256,14 +303,12 @@ impl VirtualStateProcessor {
 
         let txs = self.block_transactions_store.get(header.hash).unwrap();
 
-        // Verify coinbase transaction
-        self.verify_coinbase_transaction(
-            &txs[0],
-            header.daa_score,
-            &ctx.ghostdag_data,
-            &ctx.mergeset_rewards,
-            &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
-        )?;
+        // Verify coinbase transaction. `ctx.mergeset_rewards` was already corrected
+        // in `calculate_utxo_state` to exclude the fees of dropped shielded spends,
+        // so this enforces that the coinbase re-mints only fees the shielded
+        // transition actually collects (PLAN §2.6).
+        let mergeset_non_daa = self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap();
+        self.verify_coinbase_transaction(&txs[0], header.daa_score, &ctx.ghostdag_data, &ctx.mergeset_rewards, &mergeset_non_daa)?;
 
         // Verify the header pruning point
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
@@ -337,25 +382,12 @@ impl VirtualStateProcessor {
             None
         };
 
-        // Anchor-finality (PLAN §2.5): a *spending* shielded bundle must prove against
-        // a matured, canonical anchor relative to this block (an anchor whose source
-        // block is not a selected-chain ancestor of the selected parent — e.g. from a
-        // >shielded_anchor_depth reorg — is not final, closing the shallow-anchor
-        // value-creation vector). Pure-output bundles (no nullifiers) are exempt.
-        //
-        // A spend that fails this is DROPPED (retained-out), not fatal: dropping is
-        // strictly safe (the spend is never applied, so no value is created and no
-        // double-spend is possible) and preserves liveness.
-        let block_blue_score = ctx.ghostdag_data.blue_score;
-        let selected_parent = ctx.selected_parent();
-        let before = ctx.shielded_txs.len();
-        ctx.shielded_txs
-            .retain(|stx| stx.nullifiers.is_empty() || self.is_shielded_anchor_final(&stx.anchor, selected_parent, block_blue_score));
-        let dropped = before - ctx.shielded_txs.len();
-        if dropped > 0 {
-            debug!("shielded: dropped {dropped} spend(s) against a non-final/abandoned anchor while merging into {}", header.hash);
-        }
-
+        // Anchor-finality (PLAN §2.5) and nullifier-conflict drops already happened
+        // in `calculate_utxo_state` (the partition step), BEFORE the coinbase was
+        // verified above — so `ctx.shielded_txs` holds exactly the txs the
+        // transition will apply and the coinbase re-mints exactly their fees.
+        // `compute`'s own conflict resolution re-runs on this set as defense in
+        // depth (it is a no-op for a correctly partitioned set).
         match self.shielded_state_manager.compute(ctx.selected_parent(), coinbase_mint.as_ref(), &ctx.shielded_txs) {
             Ok(computed) => ctx.shielded_computed = Some(computed),
             Err(crate::processes::shielded::ShieldedManagerError::State(e)) => {
@@ -368,6 +400,41 @@ impl VirtualStateProcessor {
             }
             Err(crate::processes::shielded::ShieldedManagerError::Store(e)) => {
                 panic!("shielded store read failed during verification: {e}");
+            }
+        }
+
+        // Positive anti-inflation invariant (PLAN §2.6), belt-and-suspenders: the
+        // shielded pool must grow by EXACTLY the subsidy of the rewarded mergeset
+        // blocks — every fee the coinbase re-mints must have been collected from an
+        // applied spend in this same transition. (A blue non-DAA block's fees are
+        // collected but never re-minted by Kaspa's coinbase rules, hence the
+        // subtraction — combinatorically near-impossible, but exact.) On this
+        // network no transparent value exists, so any other delta means unbacked
+        // supply was minted (or burned) and the block is invalid: halt-not-inflate.
+        if self.shielded_coinbase {
+            let computed = ctx.shielded_computed.as_ref().expect("set above");
+            let parent = self.shielded_state_manager.supply_totals_at(ctx.selected_parent()).unwrap();
+            let actual_delta = (computed.supply_totals.cumulative_coinbase - parent.cumulative_coinbase) as i128
+                - (computed.supply_totals.cumulative_fees - parent.cumulative_fees) as i128;
+            let mut expected_delta: i128 = 0;
+            for blue in ctx.ghostdag_data.mergeset_blues.iter() {
+                let reward = ctx.mergeset_rewards.get(blue).unwrap();
+                if mergeset_non_daa.contains(blue) {
+                    expected_delta -= reward.total_fees as i128;
+                } else {
+                    expected_delta += reward.subsidy as i128;
+                }
+            }
+            for red in ctx.ghostdag_data.mergeset_reds.iter() {
+                if !mergeset_non_daa.contains(red) {
+                    expected_delta += ctx.mergeset_rewards.get(red).unwrap().subsidy as i128;
+                }
+            }
+            if actual_delta != expected_delta {
+                return Err(InvalidShieldedState(
+                    header.hash,
+                    format!("shielded pool delta {actual_delta} != expected subsidy-only delta {expected_delta}"),
+                ));
             }
         }
 
