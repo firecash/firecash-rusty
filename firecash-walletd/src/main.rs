@@ -776,20 +776,17 @@ impl WalletEntry {
         // 170K-leaf history in one pass is an O(N*k) burst that pins a core and starves
         // the HTTP handler — the live "wallet won't connect" outage. Near the tip the
         // catch-up is small and, once done, stays incremental.
-        if self.caught_up {
-            if let Some(matured) = self.matured_leaves() {
-                // Advance witnesses by AT MOST one capped step per sync pass. Draining
-                // the whole catch-up here (the old `while` loop) let a single heavy
-                // wallet monopolize the shared sync loop for minutes — on a CPU-pinned
-                // runtime `yield_now` hands the core straight back, so the loop never
-                // returned and every *other* wallet's scan froze (the "stuck at N%"
-                // outage). One bounded step keeps sync_chunk short so the loop round-
-                // robins the fleet; the remaining witness work continues on later
-                // passes, and any note whose live witness isn't ready yet is rebuilt
-                // on demand at spend time (`witness_path_at`).
-                let _ = self.db.advance_witnesses_capped(matured, WITNESS_ADVANCE_CAP);
-            }
-        }
+        // NB: no eager witness pre-advancing here. It was the last heavy *synchronous*
+        // step in the sync path — one `advance_witnesses_capped` call hashes
+        // cap × (note count) Sinsemilla commitments with no await inside, which on a
+        // heavy wallet blocks the tokio worker for tens of seconds and stalls every
+        // HTTP request and every other wallet's scan (the "stuck at N%" outage). It was
+        // only ever a spend-latency optimization: a spend that needs a note's witness
+        // rebuilds it on demand from the persisted leaf stream (`witness_path_at`, which
+        // already falls back to a fresh rebuild when no live witness is held). Dropping
+        // the pre-advance keeps sync_chunk O(scan) and non-blocking; the one-time
+        // rebuild cost moves to spend time, where it's paid only for the notes a spend
+        // actually selects.
         self.error = None;
         self.updated_unix = now_unix();
     }
