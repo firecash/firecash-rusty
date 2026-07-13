@@ -44,6 +44,12 @@ const BPS: u64 = 1;
 const HALVING_INTERVAL_BLOCKS: u64 = 90 * 86_400 * BPS;
 /// How many recent blocks to keep in the live feed ring.
 const RECENT_CAP: usize = 200;
+/// How many transactions the id→location index retains. The live feed ring only
+/// covers RECENT_CAP blocks (~3 min at 1 BPS), which made EVERY transaction older
+/// than a few minutes report "not found" — the explorer had no tx index at all.
+/// This index is what makes a transaction permanently linkable (wallet history,
+/// shared links). ~1M entries ≈ tens of MB, and it is persisted so restarts keep it.
+const TX_INDEX_CAP: usize = 1_000_000;
 
 #[derive(Parser, Debug)]
 #[command(name = "firecash-api", about = "FireCash explorer backend (gRPC → REST)")]
@@ -54,6 +60,18 @@ struct Cli {
     /// Address to serve the HTTP API on.
     #[arg(short = 'l', long, default_value = "127.0.0.1:8500")]
     listen: String,
+    /// Append-only transaction index (txid → block). Persisted so a restart keeps
+    /// every transaction linkable instead of losing everything but the last ~3 min.
+    #[arg(long, default_value = "/root/firecash/txindex.tsv")]
+    tx_index: String,
+}
+
+/// Where a transaction lives, so it can be served long after it left the live ring.
+#[derive(Clone)]
+struct TxLoc {
+    block_hash: String,
+    blue_score: u64,
+    block_time: u64,
 }
 
 /// One block as the frontend's live feed expects it.
@@ -93,6 +111,78 @@ struct AppState {
     recent: RwLock<VecDeque<BlockSummary>>,
     shielded: RwLock<ShieldedAgg>,
     network_name: String,
+    /// txid → where it landed. Survives the live ring so a transaction stays
+    /// linkable forever (see TX_INDEX_CAP).
+    tx_index: RwLock<(std::collections::HashMap<String, TxLoc>, VecDeque<String>)>,
+    tx_index_path: String,
+}
+
+/// Read the persisted index back at startup: one `txid\tblock_hash\tblue\ttime` row
+/// per transaction. A malformed row is skipped rather than failing the boot.
+fn load_tx_index(path: &str) -> (std::collections::HashMap<String, TxLoc>, VecDeque<String>) {
+    let mut map = std::collections::HashMap::new();
+    let mut order = VecDeque::new();
+    let Ok(text) = std::fs::read_to_string(path) else { return (map, order) };
+    for line in text.lines() {
+        let mut f = line.split('\t');
+        let (Some(id), Some(bh), Some(bs), Some(bt)) = (f.next(), f.next(), f.next(), f.next()) else { continue };
+        let (Ok(blue_score), Ok(block_time)) = (bs.parse::<u64>(), bt.parse::<u64>()) else { continue };
+        if map
+            .insert(id.to_string(), TxLoc { block_hash: bh.to_string(), blue_score, block_time })
+            .is_none()
+        {
+            order.push_back(id.to_string());
+        }
+    }
+    while order.len() > TX_INDEX_CAP {
+        if let Some(old) = order.pop_front() {
+            map.remove(&old);
+        }
+    }
+    log::info!("tx index: loaded {} transactions from {path}", map.len());
+    (map, order)
+}
+
+/// Record every transaction in `block`, in memory and appended to the index file.
+async fn index_block(state: &AppState, block: &RpcBlock) {
+    use std::io::Write;
+    let block_hash = block.header.hash.to_string();
+    let blue_score = block.verbose_data.as_ref().map(|v| v.blue_score).unwrap_or(block.header.blue_score);
+    let block_time = block.header.timestamp;
+
+    let mut rows = String::new();
+    {
+        let mut guard = state.tx_index.write().await;
+        let (map, order) = &mut *guard;
+        for tx in &block.transactions {
+            let Some(id) = tx.verbose_data.as_ref().map(|v| v.transaction_id.to_string()) else { continue };
+            if map.contains_key(&id) {
+                continue;
+            }
+            rows.push_str(&format!("{id}\t{block_hash}\t{blue_score}\t{block_time}\n"));
+            map.insert(id.clone(), TxLoc { block_hash: block_hash.clone(), blue_score, block_time });
+            order.push_back(id);
+            if order.len() > TX_INDEX_CAP {
+                if let Some(old) = order.pop_front() {
+                    map.remove(&old);
+                }
+            }
+        }
+    }
+    if rows.is_empty() {
+        return;
+    }
+    // Append outside the lock; a failed write only costs us the index across a
+    // restart, never correctness of what we serve now.
+    let path = state.tx_index_path.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(rows.as_bytes()))
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+    {
+        log::warn!("tx index append failed: {e}");
+    }
 }
 
 fn now_secs() -> u64 {
@@ -256,6 +346,11 @@ async fn follow(state: Arc<AppState>) {
             }
         }
     }
+    // Index the seeded blocks too, so a just-restarted API can still serve the
+    // transactions that are on screen right now.
+    for b in &backfill {
+        index_block(&state, b).await;
+    }
     log::info!("seeded {} recent blocks; following tip...", backfill.len());
 
     // Poll forward from the last block we have. `get_blocks` pages over a DAG
@@ -291,11 +386,16 @@ async fn follow(state: Arc<AppState>) {
             let mut agg = state.shielded.write().await;
             let summary = ingest(block, &mut agg);
             drop(agg);
-            let mut recent = state.recent.write().await;
-            recent.push_front(summary);
-            if recent.len() > RECENT_CAP {
-                recent.pop_back();
+            {
+                let mut recent = state.recent.write().await;
+                recent.push_front(summary);
+                if recent.len() > RECENT_CAP {
+                    recent.pop_back();
+                }
             }
+            // Permanently index this block's transactions — this is what keeps a tx
+            // findable after it falls out of the live ring.
+            index_block(&state, block).await;
             advanced = true;
         }
         if let Some(last) = resp.block_hashes.last().copied() {
@@ -529,10 +629,16 @@ async fn transactions_search(State(s): State<Arc<AppState>>, Json(req): Json<TxS
 /// tx by scanning the recent-block ring for its id (the explorer only links txs it
 /// has just shown), then fetch that block from the node for the full transaction.
 async fn transaction_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
-    // Find which recent block carries this tx id.
+    // Find which block carries this tx: the live ring first (hot), then the
+    // persistent index (which is what lets a tx older than the ring still resolve —
+    // without it every tx older than ~3 min reported "not found").
     let block_hash = {
         let recent = s.recent.read().await;
         recent.iter().find(|b| b.txs.iter().any(|t| t.tx_id == id)).map(|b| b.block_hash.clone())
+    };
+    let block_hash = match block_hash {
+        Some(h) => Some(h),
+        None => s.tx_index.read().await.0.get(&id).map(|loc| loc.block_hash.clone()),
     };
     let Some(block_hash) = block_hash else {
         // Not in a mined block yet — surface it straight from the node mempool so a
@@ -556,6 +662,7 @@ async fn transaction_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String
                     "block_hash": Vec::<String>::new(),
                     "block_time": now_ms,
                     "is_accepted": false,
+                    "confirmations": 0u64,
                     "accepting_block_blue_score": 0u64,
                     "inputs": Value::Null,
                     "outputs": if outputs.is_empty() { Value::Null } else { json!(outputs) },
@@ -586,6 +693,15 @@ async fn transaction_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String
     let block_hash_s = block.header.hash.to_string();
     let block_time = block.header.timestamp;
     let blue_score = block.verbose_data.as_ref().map(|v| v.blue_score).unwrap_or(block.header.blue_score);
+    // Compute confirmations HERE, against the chain tip's blue score. Doing this in
+    // the frontend meant subtracting a blue score from virtualDaaScore — different
+    // counters (DAA counts red blocks), which reported a constant ~4.5k on every tx.
+    // One authoritative number, in the same units, removes that whole bug class.
+    let confirmations = {
+        let recent = s.recent.read().await;
+        let tip_blue = recent.iter().filter_map(|b| b.blue_score.parse::<u64>().ok()).max().unwrap_or(0);
+        tip_blue.saturating_sub(blue_score)
+    };
 
     // Transparent/shielded outputs → address rows. A 43-byte Orchard script is a
     // shielded note; render its firecash: address.
@@ -626,6 +742,7 @@ async fn transaction_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String
         "block_hash": [block_hash_s.clone()],
         "block_time": block_time,
         "is_accepted": true,
+        "confirmations": confirmations,
         "accepting_block_hash": block_hash_s,
         "accepting_block_blue_score": blue_score,
         "accepting_block_time": block_time,
@@ -760,6 +877,8 @@ async fn main() {
         recent: RwLock::new(VecDeque::with_capacity(RECENT_CAP)),
         shielded: RwLock::new(ShieldedAgg::default()),
         network_name,
+        tx_index: RwLock::new(load_tx_index(&cli.tx_index)),
+        tx_index_path: cli.tx_index.clone(),
     });
 
     tokio::spawn(follow(state.clone()));
