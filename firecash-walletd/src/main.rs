@@ -67,7 +67,10 @@ const DEFAULT_ANCHOR_DEPTH: u64 = 600;
 // (one page ≈ 200 blocks ≈ tens of ms). The status handler locks the same mutex; a large
 // chunk held the lock for seconds and hung status behind the sync loop. The loop drops
 // the lock and re-acquires per chunk, so status interleaves.
-const PAGES_PER_CHUNK: usize = 2;
+// 4 pages/chunk: the shared decode (see `DecodedPage`) makes per-wallet ingest
+// cheaper, so a wallet can absorb more blocks per pass — fewer passes to clear a
+// mass rescan — while the lock is still dropped between chunks for status calls.
+const PAGES_PER_CHUNK: usize = 4;
 /// Chain blocks requested per `GetShieldedBlocks` page.
 const SHIELDED_PAGE: u64 = 200;
 /// Blue-score margin the sync holds back from the sink before ingesting a chain
@@ -534,8 +537,52 @@ fn load_checkpoint(
 // same cursor returns more blocks as the chain grows).
 // ---------------------------------------------------------------------------
 
+/// One chain block, fetched once and **decoded once** for the whole wallet cohort.
+/// The two costs that are identical for every wallet — parsing each accepted
+/// bundle, and computing each coinbase note's Sinsemilla leaf commitment — are paid
+/// here, so a wallet's per-block work drops to the parts that actually depend on its
+/// key (a coinbase recipient byte-compare, and trial-decryption of the rare real
+/// payment bundles). `coinbase` holds only the notes that commit successfully, in
+/// coinbase order — exactly what `WalletDb::ingest_block_precomputed` expects.
+struct DecodedBlock {
+    hash: RpcHash,
+    blue_score: u64,
+    daa_score: u64,
+    coinbase: Vec<(kaspa_shielded_core::coinbase::CoinbaseNoteDesc, u64, kaspa_shielded_core::ExtractedNoteCommitment)>,
+    bundles: Vec<ShieldedBundle>,
+}
+
+/// A decoded `GetShieldedBlocks` page: the response envelope plus the per-block
+/// decode shared across wallets.
+struct DecodedPage {
+    reorged: bool,
+    sink_blue_score: u64,
+    blocks: Vec<DecodedBlock>,
+}
+
+fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
+    let mut coinbase = Vec::new();
+    for (i, out) in b.coinbase_outputs.iter().enumerate() {
+        if out.script_public_key.len() >= ORCHARD_SCRIPT_LEN {
+            let mut recipient = [0u8; ORCHARD_SCRIPT_LEN];
+            recipient.copy_from_slice(&out.script_public_key[..ORCHARD_SCRIPT_LEN]);
+            let mut note_seed = Vec::with_capacity(36);
+            note_seed.extend_from_slice(&b.coinbase_txid.as_bytes());
+            note_seed.extend_from_slice(&(i as u32).to_le_bytes());
+            let desc = derive_coinbase_note_desc(recipient, &note_seed);
+            // Only keep a note that commits — exactly `WalletDb::ingest_block`'s skip
+            // rule, so the shared leaf stream matches the recompute path leaf-for-leaf.
+            if let Ok(cmx) = kaspa_shielded_core::coinbase::coinbase_note_commitment(&desc, out.value) {
+                coinbase.push((desc, out.value, cmx));
+            }
+        }
+    }
+    let bundles: Vec<ShieldedBundle> = b.accepted_bundles.iter().filter_map(|p| ShieldedBundle::from_bytes(p).ok()).collect();
+    DecodedBlock { hash: b.hash, blue_score: b.blue_score, daa_score: b.daa_score, coinbase, bundles }
+}
+
 struct PageCache {
-    map: HashMap<RpcHash, (std::time::Instant, Arc<kaspa_rpc_core::GetShieldedBlocksResponse>)>,
+    map: HashMap<RpcHash, (std::time::Instant, Arc<DecodedPage>)>,
     order: VecDeque<RpcHash>,
 }
 
@@ -548,12 +595,14 @@ impl PageCache {
     }
 }
 
-/// Fetch one `GetShieldedBlocks` page through the shared cache.
+/// Fetch one `GetShieldedBlocks` page through the shared cache, decoding it once.
+/// During a mass rescan every active wallet walks the same stream, so the single
+/// fetch+decode here serves the whole cohort for `PAGE_CACHE_TTL`.
 async fn fetch_shielded_page(
     client: &GrpcClient,
     cache: &Mutex<PageCache>,
     low: RpcHash,
-) -> Result<Arc<kaspa_rpc_core::GetShieldedBlocksResponse>, kaspa_rpc_core::RpcError> {
+) -> Result<Arc<DecodedPage>, kaspa_rpc_core::RpcError> {
     {
         let c = cache.lock().await;
         if let Some((at, resp)) = c.map.get(&low) {
@@ -562,16 +611,21 @@ async fn fetch_shielded_page(
             }
         }
     }
-    let resp = Arc::new(client.get_shielded_blocks(low, SHIELDED_PAGE).await?);
+    let raw = client.get_shielded_blocks(low, SHIELDED_PAGE).await?;
+    let decoded = Arc::new(DecodedPage {
+        reorged: raw.reorged,
+        sink_blue_score: raw.sink_blue_score,
+        blocks: raw.blocks.iter().map(decode_block).collect(),
+    });
     let mut c = cache.lock().await;
-    c.map.insert(low, (std::time::Instant::now(), resp.clone()));
+    c.map.insert(low, (std::time::Instant::now(), decoded.clone()));
     c.order.push_back(low);
     if c.order.len() > PAGE_CACHE_CAP {
         if let Some(old) = c.order.pop_front() {
             c.map.remove(&old);
         }
     }
-    Ok(resp)
+    Ok(decoded)
 }
 
 // ---------------------------------------------------------------------------
@@ -693,7 +747,11 @@ impl WalletEntry {
                     at_margin = true;
                     break;
                 }
-                ingest_shielded_chain_block(&mut self.db, b);
+                // Ingest with the coinbase commitments the shared cache already
+                // computed for this block — the Sinsemilla work is not repeated per
+                // wallet.
+                let bundle_refs: Vec<&ShieldedBundle> = b.bundles.iter().collect();
+                self.db.ingest_block_precomputed(&b.coinbase, &bundle_refs);
                 self.low = b.hash;
                 self.scanned = b.daa_score as usize;
                 self.boundaries.push_back((b.blue_score, self.db.size()));

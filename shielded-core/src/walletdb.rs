@@ -298,10 +298,31 @@ impl WalletDb {
             let owned = self.recover_coinbase_note(desc, *value);
             self.append_leaf(cmx, owned);
         }
+        self.ingest_bundles(txs);
+    }
 
-        // Then every accepted transaction's actions, in order — applying the same
-        // drop rule as the consensus transition: a bundle whose nullifier was
-        // already spent in this stream appends nothing (see `spent_nullifiers`).
+    /// Like [`Self::ingest_block`], but the caller has **already computed** each
+    /// coinbase note's leaf commitment. A coinbase note's `cmx` is a pure function
+    /// of its public description and value ([`coinbase_note_commitment`]) — the same
+    /// for every wallet — so when many wallets ingest the same chain-block stream
+    /// (a public daemon under a mass rescan), computing that Sinsemilla commitment
+    /// once and sharing it removes the dominant per-wallet-per-block cost. The
+    /// caller must supply exactly the notes [`ingest_block`] would keep, in the same
+    /// order (skip a note whose `coinbase_note_commitment` errors), so the leaf
+    /// stream is byte-identical to the non-shared path.
+    pub fn ingest_block_precomputed(&mut self, coinbase: &[(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)], txs: &[&ShieldedBundle]) {
+        for (desc, value, cmx) in coinbase {
+            let owned = self.recover_coinbase_note(desc, *value);
+            self.append_leaf(*cmx, owned);
+        }
+        self.ingest_bundles(txs);
+    }
+
+    /// Ingest every accepted transaction's actions, in order — applying the same
+    /// drop rule as the consensus transition: a bundle whose nullifier was already
+    /// spent in this stream appends nothing (see `spent_nullifiers`). Shared by both
+    /// ingest paths above.
+    fn ingest_bundles(&mut self, txs: &[&ShieldedBundle]) {
         for bundle in txs {
             if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
                 continue;
@@ -682,6 +703,51 @@ mod tests {
         assert_eq!(db.notes().len(), 1, "only the wallet's own coinbase note is tracked");
         assert_eq!(db.balance(), 5_000);
         assert_eq!(db.notes()[0].position, 0, "our note is leaf 0 (first coinbase note)");
+    }
+
+    /// `ingest_block_precomputed` (the shared-cache path) must produce a wallet
+    /// state byte-identical to `ingest_block` (the recompute path): same owned
+    /// notes, positions, balance, and tip anchor. This is the correctness guarantee
+    /// that lets the daemon compute each block's coinbase commitments once and share
+    /// them across the whole wallet cohort.
+    #[test]
+    fn precomputed_ingest_matches_recompute() {
+        let mine = [7u8; 32];
+        let other = [8u8; 32];
+
+        // A stream of blocks, each with a couple of coinbase notes (some ours, some
+        // a stranger's), so the leaf order and ownership both get exercised.
+        let blocks: Vec<Vec<(CoinbaseNoteDesc, u64)>> = (0..25u32)
+            .map(|b| {
+                vec![
+                    coinbase_for(address_of(mine), format!("txid-{b}||0").as_bytes(), 1_000 + b as u64),
+                    coinbase_for(address_of(other), format!("txid-{b}||1").as_bytes(), 7_000),
+                ]
+            })
+            .collect();
+
+        let mut recompute = WalletDb::from_seed(mine).unwrap();
+        let mut shared = WalletDb::from_seed(mine).unwrap();
+        for block in &blocks {
+            recompute.ingest_block(block, &[]);
+            // The daemon-side precompute: derive each coinbase leaf commitment once,
+            // dropping any that would not commit (exactly ingest_block's skip rule).
+            let pre: Vec<(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)> = block
+                .iter()
+                .filter_map(|(d, v)| coinbase_note_commitment(d, *v).ok().map(|cmx| (d.clone(), *v, cmx)))
+                .collect();
+            shared.ingest_block_precomputed(&pre, &[]);
+        }
+
+        assert_eq!(recompute.balance(), shared.balance(), "balances match");
+        assert_eq!(recompute.notes().len(), shared.notes().len(), "same note count");
+        assert_eq!(
+            recompute.notes().iter().map(|n| n.position).collect::<Vec<_>>(),
+            shared.notes().iter().map(|n| n.position).collect::<Vec<_>>(),
+            "same leaf positions",
+        );
+        assert_eq!(recompute.size(), shared.size(), "same leaf count");
+        assert_eq!(recompute.anchor(), shared.anchor(), "identical tip anchor");
     }
 
     /// A **watch-only** wallet loaded from just the FVK discovers exactly the same
