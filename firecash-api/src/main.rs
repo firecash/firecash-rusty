@@ -535,6 +535,34 @@ async fn transaction_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String
         recent.iter().find(|b| b.txs.iter().any(|t| t.tx_id == id)).map(|b| b.block_hash.clone())
     };
     let Some(block_hash) = block_hash else {
+        // Not in a mined block yet — surface it straight from the node mempool so a
+        // just-broadcast tx appears immediately as pending (0-conf) rather than
+        // "not found". Confirmations stay 0 (accepting_block_blue_score = 0) until it
+        // is mined and enters the recent-block window on a later request.
+        if let Ok(txid) = id.parse::<RpcHash>() {
+            if let Ok(entry) = s.client.get_mempool_entry(txid, false, false).await {
+                let tx = &entry.transaction;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let outputs = detail_outputs(tx, &id, "");
+                return Json(json!({
+                    "subnetwork_id": tx.subnetwork_id.to_string(),
+                    "transaction_id": id,
+                    "hash": tx.verbose_data.as_ref().map(|v| v.hash.to_string()).unwrap_or_else(|| id.clone()),
+                    "mass": tx.verbose_data.as_ref().map(|v| v.compute_mass).unwrap_or(0).to_string(),
+                    "payload": hexs(&tx.payload),
+                    "block_hash": Vec::<String>::new(),
+                    "block_time": now_ms,
+                    "is_accepted": false,
+                    "accepting_block_blue_score": 0u64,
+                    "inputs": Value::Null,
+                    "outputs": if outputs.is_empty() { Value::Null } else { json!(outputs) },
+                }))
+                .into_response();
+            }
+        }
         return err(format!("transaction {id} not found in the recent window"));
     };
     let hash = match block_hash.parse::<RpcHash>() {
@@ -670,6 +698,38 @@ fn tx_json(tx: &kaspa_rpc_core::RpcTransaction) -> Value {
             "mass": tx.verbose_data.as_ref().map(|v| v.compute_mass).unwrap_or(0),
         },
     })
+}
+
+/// Render a tx's outputs in the transaction-detail shape the explorer's tx page
+/// consumes, resolving shielded (43-byte Orchard) scripts to their firecash:
+/// address. Shared by the mined-block and mempool paths.
+fn detail_outputs(tx: &kaspa_rpc_core::RpcTransaction, id: &str, accepting_block_hash: &str) -> Vec<Value> {
+    tx.outputs
+        .iter()
+        .enumerate()
+        .map(|(idx, o)| {
+            let script = o.script_public_key.script();
+            let shielded = script.len() == ORCHARD_SCRIPT_LEN;
+            let address = if shielded {
+                String::from(&kaspa_addresses::Address::new(
+                    kaspa_addresses::Prefix::Mainnet,
+                    kaspa_addresses::Version::ShieldedOrchard,
+                    script,
+                ))
+            } else {
+                String::new()
+            };
+            json!({
+                "transaction_id": id,
+                "index": idx,
+                "amount": o.value,
+                "script_public_key": hexs(script),
+                "script_public_key_address": address,
+                "script_public_key_type": if shielded { "shielded" } else { "pubkey" },
+                "accepting_block_hash": accepting_block_hash,
+            })
+        })
+        .collect()
 }
 
 /// Shielded chains expose no meaningful transparent address data; answer these so

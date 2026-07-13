@@ -1212,6 +1212,15 @@ struct StatusResp {
     chain_len: u64,
     balance_sompi: String,
     balance_fc: String,
+    /// Spendable-now balance: the subset of `balance_*` held in notes matured past
+    /// the shielded anchor depth (~10 min). A send can only draw on this; the rest
+    /// is `maturing_*`. Exposed so the wallet shows "spendable vs maturing" instead
+    /// of offering the full balance and then failing a send with "have 0".
+    spendable_sompi: String,
+    spendable_fc: String,
+    /// balance − spendable: value in notes too new to spend yet (still maturing).
+    maturing_sompi: String,
+    maturing_fc: String,
     note_count: usize,
     updated_unix: u64,
     error: Option<String>,
@@ -1244,6 +1253,10 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         chain_len: daa_score,
         balance_sompi: "0".into(),
         balance_fc: "0.00000000".into(),
+        spendable_sompi: "0".into(),
+        spendable_fc: "0.00000000".into(),
+        maturing_sompi: "0".into(),
+        maturing_fc: "0.00000000".into(),
         note_count: 0,
         updated_unix: 0,
         error: None,
@@ -1269,6 +1282,20 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
                 resp.chain_len = tip;
                 resp.balance_sompi = e.db.balance().to_string();
                 resp.balance_fc = fmt_fc(e.db.balance());
+                // Spendable-now = value in notes matured past the anchor depth — the
+                // exact set /prepare will draw on (same cutoff as the send path). The
+                // remainder is still maturing (~10 min after it arrived).
+                let total = e.db.balance();
+                let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
+                let spendable: u128 = match e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
+                    Some(matured) => e.db.notes().iter().filter(|n| n.position < matured).map(|n| n.value() as u128).sum(),
+                    None => 0,
+                };
+                let maturing = total.saturating_sub(spendable);
+                resp.spendable_sompi = spendable.to_string();
+                resp.spendable_fc = fmt_fc(spendable);
+                resp.maturing_sompi = maturing.to_string();
+                resp.maturing_fc = fmt_fc(maturing);
                 resp.note_count = e.db.notes().len();
                 resp.updated_unix = e.updated_unix;
                 resp.error = e.error.clone();
