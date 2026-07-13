@@ -37,10 +37,11 @@ const ORCHARD_SCRIPT_LEN: usize = 43;
 /// (after blue_score(8) + subsidy(8)); see consensus `processes/coinbase.rs`.
 const COMMITMENT_OFFSET: usize = 16;
 const SOMPI_PER_FC: u64 = 100_000_000;
-/// Terminal FireCash supply, whole FC (~5.15B).
-const MAX_SUPPLY_FC: u64 = 5_150_000_000;
-/// Blocks per halving ≈ 3 months at 10 BPS (90d · 86400s · 10).
-const HALVING_INTERVAL_BLOCKS: u64 = 77_760_000;
+/// Blocks per second. The chain relaunched at 1 BPS (v0.2.0); the halving and
+/// countdown math below is in blocks, so it must track this.
+const BPS: u64 = 1;
+/// Blocks per halving ≈ 3 months (90d · 86400s · BPS).
+const HALVING_INTERVAL_BLOCKS: u64 = 90 * 86_400 * BPS;
 /// How many recent blocks to keep in the live feed ring.
 const RECENT_CAP: usize = 200;
 
@@ -365,9 +366,14 @@ async fn info_coinsupply(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     // outputs); the real circulating supply is the value that has entered the
     // shielded pool via coinbase (the turnstile-in total).
     let circulating = { s.shielded.read().await.turnstile_in_sompi };
+    // FireCash emission has a PERPETUAL TAIL (the subsidy floors at 3 FC/s and never
+    // reaches zero — see the consensus `tail_subsidy`), so there is no terminal
+    // supply. Reporting a finite `maxSupply` here was simply false. `null` is the
+    // honest answer; consumers that need a cap have to model the tail themselves.
     Json(json!({
         "circulatingSupply": circulating.to_string(),
-        "maxSupply": (MAX_SUPPLY_FC as u128 * SOMPI_PER_FC as u128).to_string(),
+        "maxSupply": serde_json::Value::Null,
+        "emissionModel": "perpetual-tail",
     }))
     .into_response()
 }
@@ -384,7 +390,7 @@ async fn info_halving(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     };
     let next_h = ((blue_score / HALVING_INTERVAL_BLOCKS) + 1) * HALVING_INTERVAL_BLOCKS;
     let blocks_left = next_h.saturating_sub(blue_score);
-    let secs_left = blocks_left / 10; // 10 BPS
+    let secs_left = blocks_left / BPS;
     let ts = now_secs() + secs_left;
     let days = secs_left / 86400;
     Json(json!({

@@ -20,19 +20,24 @@ circuit = ["orchard/circuit", "orchard/multicore", "dep:nonempty"]
 [dependencies]
 # Orchard primitives (Halo 2 / Pasta). `circuit` (halo2_proofs) is enabled via
 # this crate's `circuit` feature, which the consensus verifier turns on.
-orchard = { version = "0.14", default-features = false, features = ["std"] }
+# EXACT-pinned, not semver-ranged: these crates carry the consensus's entire
+# anti-counterfeiting guarantee, and 0.14.0 is specifically the release that fixes
+# the June-2026 Orchard proof-forgery bug. A caret range would let `cargo update`
+# silently move us onto an unaudited (or regressed) release. Bump deliberately,
+# reading the changelog, never incidentally.
+orchard = { version = "=0.14.0", default-features = false, features = ["std"] }
 # Must match the incrementalmerkletree version Orchard links, so that
 # `MerkleHashOrchard: incrementalmerkletree::Hashable` is the same trait.
 # `legacy-api` provides CommitmentTree / IncrementalWitness, the wallet-side
 # witness tracking a real wallet needs (PLAN §2.9, `walletdb`).
-incrementalmerkletree = { version = "0.8.1", features = ["legacy-api"] }
+incrementalmerkletree = { version = "=0.8.2", features = ["legacy-api"] }
 # For the persisted frontier snapshot (FrontierState). incrementalmerkletree's
 # Frontier is not serde-serializable, so we persist a representation we control.
 serde = { workspace = true, features = ["derive"] }
 # Curve point handling for the encoding consensus rules (non-identity epk).
 # Versions are pinned to match what Orchard 0.14 links.
-group = "0.13"
-pasta_curves = "0.5"
+group = "=0.13.0"
+pasta_curves = "=0.5.1"
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
 # Bundle reconstruction (batch verification) — enabled by the `circuit` feature.

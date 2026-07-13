@@ -116,6 +116,16 @@ impl TryFrom<Versioned<protowire::BlockHeader>> for Header {
             Ok(header)
         } else {
             let aux: AuxPow = borsh::from_slice(&item.aux_pow).map_err(|e| ConversionError::AuxPowDecodeError(e.to_string()))?;
+            // Drop an over-long Merkle branch at the edge, before it can be stored or
+            // relayed: no honest parent block needs more than MAX_COINBASE_MERKLE_BRANCH
+            // levels, and the field is otherwise bounded only by the p2p message size.
+            if aux.coinbase_merkle_branch.len() > kaspa_consensus_core::auxpow::MAX_COINBASE_MERKLE_BRANCH {
+                return Err(ConversionError::AuxPowDecodeError(format!(
+                    "coinbase merkle branch too long: {} > {}",
+                    aux.coinbase_merkle_branch.len(),
+                    kaspa_consensus_core::auxpow::MAX_COINBASE_MERKLE_BRANCH
+                )));
+            }
             Ok(header.with_aux_pow(aux))
         }
     }

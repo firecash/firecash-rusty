@@ -46,6 +46,17 @@ use serde::{Deserialize, Serialize};
 /// coinbase payload. "FireCash Merged Mining".
 pub const MERGE_MINE_MAGIC: [u8; 4] = *b"FCMM";
 
+/// Hard cap on [`AuxPow::coinbase_merkle_branch`] length. The branch has one entry
+/// per level of the parent's transaction Merkle tree, so a parent with `n`
+/// transactions needs `ceil(log2(n))` entries: 64 admits a parent with 2^64
+/// transactions, i.e. every parent block that can physically exist.
+///
+/// Without a cap the branch is bounded only by the p2p message size, and each entry
+/// costs a hash in [`AuxPow::verify_coinbase_inclusion`] — an attacker could attach
+/// a multi-million-entry branch to a junk header and make every peer grind through
+/// it. Rejecting an over-long branch is free and cannot refuse an honest block.
+pub const MAX_COINBASE_MERKLE_BRANCH: usize = 64;
+
 /// The proof that a FireCash block was mined on top of a parent kHeavyHash block.
 ///
 /// Travels alongside the FireCash header (it is deliberately *not* part of the
@@ -111,6 +122,10 @@ impl AuxPow {
     /// folding the branch as a pure left-path (coinbase = leaf 0), reproducing
     /// Kaspa's tx Merkle tree ([`crate::merkle::calc_hash_merkle_root`]).
     pub fn verify_coinbase_inclusion(&self) -> bool {
+        // Refuse an absurd branch before doing any hashing (see MAX_COINBASE_MERKLE_BRANCH).
+        if self.coinbase_merkle_branch.len() > MAX_COINBASE_MERKLE_BRANCH {
+            return false;
+        }
         let mut acc = hashing::tx::hash(&self.parent_coinbase);
         for sibling in &self.coinbase_merkle_branch {
             acc = kaspa_merkle::merkle_hash(acc, *sibling);
@@ -256,6 +271,19 @@ mod tests {
         let bad = vec![Hash::from_bytes([0xFFu8; 32])];
         let aux = AuxPow { parent_header: header, parent_coinbase: cb, coinbase_merkle_branch: bad };
         assert!(!aux.verify_coinbase_inclusion(), "a wrong sibling must not reproduce the root");
+    }
+
+    /// An absurdly long Merkle branch is refused outright, before any hashing: the
+    /// field is otherwise bounded only by the p2p message size, so an attacker could
+    /// force every peer to fold millions of siblings for a junk header.
+    #[test]
+    fn over_long_branch_is_rejected_without_hashing() {
+        let cb = coinbase_committing(hfc());
+        let (header, _branch) = parent_with(cb.clone(), vec![other_tx(1)]);
+        let huge = vec![Hash::from_bytes([0x11u8; 32]); MAX_COINBASE_MERKLE_BRANCH + 1];
+        let aux = AuxPow { parent_header: header, parent_coinbase: cb, coinbase_merkle_branch: huge };
+        assert!(!aux.verify_coinbase_inclusion(), "a branch past the cap is rejected");
+        assert!(!aux.verify_binding(hfc()), "and so the binding fails");
     }
 
     #[test]
