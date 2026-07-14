@@ -48,7 +48,8 @@ use kaspa_shielded_core::orchard_recipient_bytes;
 use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::wallet::build::{PreparedPayment, build_wallet_payment, finalize_payment, prepare_payment, proving_key};
-use kaspa_shielded_core::walletdb::WalletDb;
+use kaspa_shielded_core::coinbase::CoinbaseNoteDesc;
+use kaspa_shielded_core::walletdb::{Preview, WalletDb};
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -86,6 +87,16 @@ const SYNC_TIP_MARGIN: u64 = 200;
 /// transiently near the tip; a single `reorged` response is usually stale within
 /// a pass or two, and a rescan costs the whole scan history.
 const REORG_STRIKES: u32 = 3;
+/// The node's error text for a hash it genuinely does not have
+/// (`ConsensusError::BlockNotFound` — "cannot find full block {hash}"). Discarding a
+/// wallet's checkpoint is destructive (it forces a full rescan from birthday), so it
+/// must be driven by *positive* evidence that the cursor is gone — never by the mere
+/// fact that an RPC returned `Err`. A timeout or an overloaded node also returns
+/// `Err`, and treating that as "cursor unknown" is what nuked eleven wallets in one
+/// 20ms burst on 2026-07-12 and a live user's wallet seconds after a send on
+/// 2026-07-13 (the send's Halo 2 proof is exactly the CPU spike that makes the probe
+/// RPC time out).
+const BLOCK_NOT_FOUND: &str = "cannot find full block";
 /// Extra blue-score slack under the consensus anchor-maturity depth when picking
 /// the anchor a spend roots at, so it stays matured while the tx awaits merging.
 const ANCHOR_SLACK: u64 = 30;
@@ -279,6 +290,16 @@ impl WalletKey {
         match self {
             WalletKey::Seed(s) => WalletDb::from_checkpoint(*s, bytes),
             WalletKey::Fvk(f) => WalletDb::from_checkpoint_fvk(f, bytes),
+        }
+    }
+
+    /// As [`Self::db_from_checkpoint`], but with the tip tree the node reported for the
+    /// checkpoint's own cursor block — so an old (v3) checkpoint restores without
+    /// replaying its leaf stream. Falls back to the replay if the frontier doesn't match.
+    fn db_from_checkpoint_with_tip(&self, bytes: &[u8], tip: &kaspa_shielded_core::tree::FrontierState) -> Option<WalletDb> {
+        match self {
+            WalletKey::Seed(s) => WalletDb::from_checkpoint_with_tip(*s, bytes, tip),
+            WalletKey::Fvk(f) => WalletDb::from_checkpoint_fvk_with_tip(f, bytes, tip),
         }
     }
 
@@ -480,6 +501,20 @@ fn save_checkpoint(
     std::fs::rename(&tmp, &path)
 }
 
+/// The cursor block a wallet's checkpoint resumes from, read from the header alone.
+/// Needed before the body is parsed, because the node must be asked for the tree state
+/// *at that block* so the restore can skip the leaf replay.
+fn checkpoint_cursor(dir: &str, token: &str, current_genesis: &RpcHash) -> Option<RpcHash> {
+    let buf = std::fs::read(scan_path(dir, token)).ok()?;
+    if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || buf[4] != SCAN_VERSION {
+        return None;
+    }
+    if RpcHash::from_bytes(buf[5..37].try_into().ok()?) != *current_genesis {
+        return None;
+    }
+    Some(RpcHash::from_bytes(buf[37..69].try_into().ok()?))
+}
+
 /// Load a wallet's scan checkpoint if present and still valid for
 /// `current_genesis` (the network genesis hash). Returns the reconstructed
 /// `(db, low_cursor, scanned, boundaries, sink_blue)`, or `None` on any absence /
@@ -491,6 +526,7 @@ fn load_checkpoint(
     token: &str,
     key: WalletKey,
     current_genesis: &RpcHash,
+    tip: Option<&kaspa_shielded_core::tree::FrontierState>,
 ) -> Option<(WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64)> {
     let buf = std::fs::read(scan_path(dir, token)).ok()?;
     if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || buf[4] != SCAN_VERSION {
@@ -510,7 +546,11 @@ fn load_checkpoint(
         Some(s)
     };
     let db_len = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?) as usize;
-    let db = key.db_from_checkpoint(take(&mut pos, db_len)?)?;
+    let blob = take(&mut pos, db_len)?;
+    let db = match tip {
+        Some(fs) => key.db_from_checkpoint_with_tip(blob, fs)?,
+        None => key.db_from_checkpoint(blob)?,
+    };
     let ring_len = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?) as usize;
     let mut boundaries = VecDeque::with_capacity(ring_len.min(MATURED_RING));
     for _ in 0..ring_len {
@@ -665,6 +705,11 @@ struct WalletEntry {
     /// retry; at [`REORG_STRIKES`] the sync loop discards the checkpoint and
     /// reloads this wallet from scratch (the append-only tree cannot roll back).
     reorged_strikes: u32,
+    /// Balance effect of the blocks between the settled cutoff and the tip — value
+    /// arriving and owned value being spent, seen by trial-decryption without touching
+    /// the append-only tree. This is what makes a payment visible ~1 second after it is
+    /// mined instead of ~3 minutes later when SYNC_TIP_MARGIN clears.
+    preview: Preview,
 }
 
 /// How many chain-block→leaf boundaries [`WalletEntry`] keeps. Anchor maturity is
@@ -706,6 +751,7 @@ impl WalletEntry {
             boundaries,
             sink_blue,
             reorged_strikes: 0,
+            preview: Preview::default(),
         }
     }
 
@@ -719,12 +765,22 @@ impl WalletEntry {
             let resp = match fetch_shielded_page(client, cache, self.low).await {
                 Ok(r) => r,
                 Err(e) => {
-                    // Distinguish "cursor no longer known" (pruned / relaunched —
-                    // needs a rescan) from a transient node failure.
-                    if client.get_block(self.low, false).await.is_err() && client.get_block_dag_info().await.is_ok() {
-                        self.reorged_strikes = REORG_STRIKES;
+                    // Distinguish "cursor no longer known" (pruned / relaunched — needs a
+                    // rescan) from a transient node failure. Only a definitive
+                    // `BlockNotFound` for our cursor counts: any other error (timeout,
+                    // transport, node busy) leaves the checkpoint alone, because it is not
+                    // evidence about the cursor at all. Even then, take a single strike and
+                    // require REORG_STRIKES *consecutive* passes to agree — a node that is
+                    // merely slow must never be able to delete a wallet's scan history.
+                    let gone = match client.get_block(self.low, false).await {
+                        Err(probe) => probe.to_string().contains(BLOCK_NOT_FOUND),
+                        Ok(_) => false,
+                    };
+                    if gone && client.get_block_dag_info().await.is_ok() {
+                        self.reorged_strikes += 1;
                         self.error = Some("wallet cursor no longer known to the node; rescanning".into());
                     } else {
+                        log::debug!("wallet sync page failed (transient, checkpoint kept): {e}");
                         self.error = Some(format!("get_shielded_blocks failed: {e}"));
                     }
                     return;
@@ -742,8 +798,21 @@ impl WalletEntry {
             let settled = resp.sink_blue_score.saturating_sub(SYNC_TIP_MARGIN);
             let mut advanced = false;
             let mut at_margin = false;
-            for b in &resp.blocks {
+            for (i, b) in resp.blocks.iter().enumerate() {
                 if b.blue_score > settled {
+                    // Everything from here to the tip is inside the reorg margin and must
+                    // not be appended to the tree. Preview it instead, so a payment shows
+                    // up as pending the moment it is mined rather than ~3 minutes later
+                    // when the margin clears. Recomputed from scratch each pass (not
+                    // accumulated), so it self-corrects if a block drops out.
+                    let mut preview = Preview::default();
+                    for u in &resp.blocks[i..] {
+                        let bundle_refs: Vec<&ShieldedBundle> = u.bundles.iter().collect();
+                        let cb: Vec<(CoinbaseNoteDesc, u64)> =
+                            u.coinbase.iter().map(|(d, v, _)| (d.clone(), *v)).collect();
+                        preview.add(self.db.preview_block(&cb, &bundle_refs));
+                    }
+                    self.preview = preview;
                     at_margin = true;
                     break;
                 }
@@ -759,6 +828,10 @@ impl WalletEntry {
                     self.boundaries.pop_front();
                 }
                 advanced = true;
+            }
+            if !at_margin {
+                // No unsettled blocks in this page — nothing is pending from the margin.
+                self.preview = Preview::default();
             }
             if !advanced || at_margin {
                 self.caught_up = true;
@@ -1058,7 +1131,25 @@ impl AppState {
         // Resume from a persisted checkpoint when one is present and version/genesis
         // valid; otherwise fast-sync (birthday-gated: a fast-synced wallet is blind
         // to notes older than its base) or the pruning-point full scan.
-        let entry = match load_checkpoint(&self.wallet_dir, token, key, &genesis) {
+        // Ask the node for the tree at this checkpoint's cursor. It is the same tree the
+        // wallet would rebuild from its own leaf stream, so having it turns a ~60s
+        // Sinsemilla replay into a frontier copy. Best-effort: if the node can't answer
+        // (pruned cursor, RPC hiccup), we simply restore the old way.
+        let tip = match checkpoint_cursor(&self.wallet_dir, token, &genesis) {
+            Some(cursor) => match self.client.get_shielded_tree_state(Some(cursor)).await {
+                Ok(ts) => Some(kaspa_shielded_core::tree::FrontierState {
+                    size: ts.size,
+                    leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+                    ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
+                }),
+                Err(e) => {
+                    log::debug!("no tree state for checkpoint cursor ({e}); restoring from the leaf stream");
+                    None
+                }
+            },
+            None => None,
+        };
+        let entry = match load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref()) {
             Some((db, low, scanned, boundaries, sink_blue)) => {
                 WalletEntry::from_parts(key, db, genesis, low, scanned, boundaries, sink_blue)
             }
@@ -1069,6 +1160,14 @@ impl AppState {
         };
         let w = Arc::new(Mutex::new(entry));
         self.wallets.lock().await.insert(token.to_string(), w.clone());
+        // NB: do NOT eagerly decode the leaf stream here. It is tempting — only a spend
+        // needs curve points, so "warm them in the background" sounds free. It is not:
+        // decoding is ~60s of curve arithmetic per wallet, and firing it for every wallet
+        // that loads (a restart touches all of them) buries every tokio worker on a
+        // 4-core box and starves the HTTP handler — the daemon stops answering entirely
+        // (observed live: a 331-deep accept backlog, every wallet reading "node offline").
+        // The decode stays lazy: it happens inside the spend path, which already runs on
+        // a blocking thread, and is paid once by the one wallet that actually spends.
         Some(w)
     }
 }
@@ -1114,11 +1213,20 @@ async fn sync_loop(state: Arc<AppState>) {
                 e.caught_up = false;
                 e.sync_chunk(&state.sync_client, &state.page_cache).await;
                 if e.reorged_strikes >= REORG_STRIKES {
-                    // The append-only tree cannot roll back a deep reorg: discard
-                    // the checkpoint and evict the wallet; the next request reloads
-                    // it cleanly (fast-sync or full scan).
-                    log::warn!("wallet '{token}': deep reorg below cursor — discarding checkpoint and rescanning");
-                    let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
+                    // The append-only tree cannot roll back a deep reorg: retire the
+                    // checkpoint and evict the wallet; the next request reloads it cleanly
+                    // (fast-sync or full scan). Move it aside rather than deleting it — a
+                    // rescan re-derives the same state from chain data, so the old blob is
+                    // only ever needed to *diagnose* a misfire, and having it is the
+                    // difference between explaining an incident and guessing at it.
+                    let scan = scan_path(&state.wallet_dir, &token);
+                    log::warn!(
+                        "wallet '{token}': cursor off the selected chain for {} consecutive passes ({}) \
+                         — retiring checkpoint to .bak and rescanning",
+                        e.reorged_strikes,
+                        e.error.as_deref().unwrap_or("no error recorded")
+                    );
+                    let _ = std::fs::rename(&scan, format!("{scan}.bak"));
                     reorged_tokens.push(token.clone());
                     continue;
                 }
@@ -1221,6 +1329,13 @@ struct StatusResp {
     /// balance − spendable: value in notes too new to spend yet (still maturing).
     maturing_sompi: String,
     maturing_fc: String,
+    /// 0-conf: value seen arriving/leaving in blocks too near the tip to ingest. Lets a
+    /// payment show up ~1s after it is mined instead of ~3min later. Older daemons omit
+    /// these; a missing value means "none pending".
+    pending_in_sompi: String,
+    pending_in_fc: String,
+    pending_out_sompi: String,
+    pending_out_fc: String,
     note_count: usize,
     updated_unix: u64,
     error: Option<String>,
@@ -1257,6 +1372,10 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         spendable_fc: "0.00000000".into(),
         maturing_sompi: "0".into(),
         maturing_fc: "0.00000000".into(),
+        pending_in_sompi: "0".into(),
+        pending_in_fc: "0.00000000".into(),
+        pending_out_sompi: "0".into(),
+        pending_out_fc: "0.00000000".into(),
         note_count: 0,
         updated_unix: 0,
         error: None,
@@ -1296,6 +1415,11 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
                 resp.spendable_fc = fmt_fc(spendable);
                 resp.maturing_sompi = maturing.to_string();
                 resp.maturing_fc = fmt_fc(maturing);
+                // 0-conf effects from the unsettled window (see WalletEntry::preview).
+                resp.pending_in_sompi = e.preview.incoming.to_string();
+                resp.pending_in_fc = fmt_fc(e.preview.incoming);
+                resp.pending_out_sompi = e.preview.outgoing.to_string();
+                resp.pending_out_fc = fmt_fc(e.preview.outgoing);
                 resp.note_count = e.db.notes().len();
                 resp.updated_unix = e.updated_unix;
                 resp.error = e.error.clone();

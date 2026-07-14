@@ -40,6 +40,7 @@ use orchard::{
     tree::{MerkleHashOrchard, MerklePath},
     value::NoteValue,
 };
+use std::cell::OnceCell;
 use std::collections::HashSet;
 
 use crate::bundle::ShieldedBundle;
@@ -68,6 +69,26 @@ impl OwnedNote {
     /// The note's value in the base unit.
     pub fn value(&self) -> u64 {
         self.note.value().inner()
+    }
+}
+
+/// The balance effect of blocks too close to the tip to be safely ingested — value
+/// arriving and owned value being spent. Reported as *pending* (0-conf); see
+/// [`WalletDb::preview_block`].
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Preview {
+    pub incoming: u128,
+    pub outgoing: u128,
+}
+
+impl Preview {
+    /// Fold another block's preview into this one.
+    pub fn add(&mut self, other: Preview) {
+        self.incoming += other.incoming;
+        self.outgoing += other.outgoing;
+    }
+    pub fn is_zero(&self) -> bool {
+        self.incoming == 0 && self.outgoing == 0
     }
 }
 
@@ -101,7 +122,18 @@ pub struct WalletDb {
     /// demand** (see [`Self::witness_path`]) instead of advancing a per-note witness
     /// on every append — the difference between an O(N) and an O(N²) scan. At 32
     /// bytes/leaf this is ~1 MB per million notes, cheap next to 625M hashes.
-    leaves: Vec<MerkleHashOrchard>,
+    leaves: Vec<[u8; 32]>,
+    /// The leaf stream decoded to curve points, built on first use.
+    ///
+    /// A `MerkleHashOrchard` is a Pallas point, so turning a stored leaf back into one
+    /// is a point *decompression* — ~0.68 ms each, ~136 s for a 200K-leaf chain. Doing
+    /// that eagerly on restore was over half of the multi-minute window in which a
+    /// restarted daemon showed every user an empty wallet. Nothing about a balance, a
+    /// note, or the tip anchor needs curve points; only rebuilding a spend witness
+    /// does. So the stream is *stored* as bytes (restoring it is a memcpy) and decoded
+    /// lazily, once, when a witness actually needs it — and `warm_leaves` lets the
+    /// daemon do that off the request path so a send never waits on it either.
+    decoded: OnceCell<Vec<MerkleHashOrchard>>,
     /// Owned, unspent notes (absolute position + note only; witnesses are built lazily).
     notes: Vec<OwnedNote>,
     /// Number of leaves ingested so far, absolute (`base_size + leaves.len()`) — the
@@ -151,6 +183,7 @@ impl WalletDb {
             base_frontier: Frontier::empty(),
             base_size: 0,
             leaves: Vec::new(),
+            decoded: OnceCell::new(),
             notes: Vec::new(),
             size: 0,
             witnesses: Vec::new(),
@@ -180,6 +213,7 @@ impl WalletDb {
             base_frontier: Frontier::empty(),
             base_size: 0,
             leaves: Vec::new(),
+            decoded: OnceCell::new(),
             notes: Vec::new(),
             size: 0,
             witnesses: Vec::new(),
@@ -344,6 +378,52 @@ impl WalletDb {
         }
     }
 
+    /// What an **unsettled** block would do to this wallet's balance, without touching
+    /// any state.
+    ///
+    /// The wallet cannot *ingest* a block within the reorg margin of the tip: its
+    /// commitment tree is append-only, so a leaf appended from a block that is later
+    /// reorged out could never be removed, and every later note's position would shift
+    /// off the consensus tree. That safety rule is why a payment took ~3 minutes to
+    /// appear even though the chain had confirmed it in one second.
+    ///
+    /// But "cannot append it" is not "cannot look at it". Trial-decrypting the block
+    /// tells us the value arriving and the owned notes being spent, with no leaf, no
+    /// position, and no tree mutation — so it is free of the reorg hazard entirely. The
+    /// caller reports this as *pending* (0-conf) and the number is superseded by the
+    /// real one when the block settles and is ingested for real. Worst case a reorg
+    /// drops it and the pending figure simply disappears — the same contract every
+    /// 0-conf balance in every chain has.
+    pub fn preview_block(&self, coinbase: &[(CoinbaseNoteDesc, u64)], txs: &[&ShieldedBundle]) -> Preview {
+        let mut p = Preview::default();
+        for (desc, value) in coinbase {
+            if self.recover_coinbase_note(desc, *value).is_some() {
+                p.incoming += *value as u128;
+            }
+        }
+        for bundle in txs {
+            // Same drop rule as ingest: a bundle re-spending an already-spent nullifier
+            // appends nothing, so it must not be previewed either.
+            if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+                continue;
+            }
+            // An action reveals the nullifier of the note it spends: if it is one of
+            // ours, that value is on its way out (this is what makes a *sender* see the
+            // spend immediately).
+            for action in &bundle.actions {
+                if let Some(n) = self.notes.iter().find(|n| n.nullifier == action.nullifier) {
+                    p.outgoing += n.value() as u128;
+                }
+            }
+            // ...and anything decryptable to our ivk is on its way in — a payment to us,
+            // or our own change coming back.
+            for r in scan_bundle(&self.ivk, bundle) {
+                p.incoming += r.note.value().inner() as u128;
+            }
+        }
+        p
+    }
+
     /// Drop a note the wallet has spent (by leaf position), so it is no longer
     /// offered for spending. The witness is discarded; the tree mirror is
     /// untouched (spent notes stay in the tree — only the nullifier marks them
@@ -397,7 +477,7 @@ impl WalletDb {
         self.witnesses.retain(|(pos, _)| live.contains(pos));
 
         for abs in start..target {
-            let Some(&leaf) = self.leaves.get((abs - self.base_size) as usize) else { break };
+            let Some(&leaf) = self.decoded_leaves().get((abs - self.base_size) as usize) else { break };
             // Every already-open witness must see every later leaf...
             for (_, w) in self.witnesses.iter_mut() {
                 let _ = w.append(leaf);
@@ -425,9 +505,36 @@ impl WalletDb {
         Some(MerklePath::from_parts(u64::from(path.position()) as u32, auth))
     }
 
+    /// The leaf stream as curve points, decoding it on first use (see `decoded`).
+    /// Returns an empty slice if any leaf fails to decode — impossible for bytes we
+    /// wrote ourselves, and failing closed makes a witness build return `None` (a clean
+    /// send error) rather than silently root to a wrong tree.
+    fn decoded_leaves(&self) -> &[MerkleHashOrchard] {
+        self.decoded.get_or_init(|| {
+            self.leaves
+                .iter()
+                .map(|b| Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(b)))
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default()
+        })
+    }
+
+    /// Decode the leaf stream now, so a later spend doesn't pay for it. The daemon calls
+    /// this on a blocking thread right after loading a wallet: the wallet is usable
+    /// (balance, notes, receive) the instant it restores, and the curve points are ready
+    /// by the time anyone spends.
+    pub fn warm_leaves(&self) {
+        let _ = self.decoded_leaves();
+    }
+
     fn append_leaf(&mut self, cmx: ExtractedNoteCommitment, owned: Option<Note>) {
         let leaf = MerkleHashOrchard::from_cmx(&cmx);
-        self.leaves.push(leaf);
+        self.leaves.push(leaf.to_bytes());
+        // Keep an already-materialised cache in step rather than invalidating it — a
+        // synced wallet appends a few leaves a second and must not re-decode the chain.
+        if let Some(d) = self.decoded.get_mut() {
+            d.push(leaf);
+        }
         // `append` only errors when the tree is full (2^32 leaves) — unreachable.
         let _ = self.tree.append(leaf);
         if let Some(note) = owned {
@@ -470,7 +577,8 @@ impl WalletDb {
         let rel = position.checked_sub(self.base_size)? as usize;
         let matured_rel = matured_leaves.checked_sub(self.base_size)? as usize;
         // The note must sit strictly inside the matured prefix, and we must hold it.
-        if rel >= matured_rel || matured_rel > self.leaves.len() {
+        let leaves = self.decoded_leaves();
+        if rel >= matured_rel || matured_rel > leaves.len() {
             return None;
         }
         // Rebuild the tree from the checkpoint frontier up to and including the target
@@ -479,11 +587,11 @@ impl WalletDb {
         // tip. For a full-scan wallet the base frontier is empty, so this reduces to
         // rebuilding from genesis.
         let mut tree = CommitmentTree::from_frontier(&self.base_frontier);
-        for leaf in &self.leaves[..=rel] {
+        for leaf in &leaves[..=rel] {
             tree.append(*leaf).ok()?;
         }
         let mut witness = IncrementalWitness::<MerkleHashOrchard, TREE_DEPTH>::from_tree(tree)?;
-        for leaf in &self.leaves[rel + 1..matured_rel] {
+        for leaf in &leaves[rel + 1..matured_rel] {
             witness.append(*leaf).ok()?;
         }
         let path = witness.path()?;
@@ -522,21 +630,11 @@ impl WalletDb {
         out.push(CHECKPOINT_VERSION);
         // Fast-sync base: absolute base size, then the base frontier (empty ⇒ tag 0).
         out.extend_from_slice(&self.base_size.to_le_bytes());
-        match self.base_frontier.value() {
-            None => out.push(0),
-            Some(nef) => {
-                out.push(1);
-                out.extend_from_slice(&nef.leaf().to_bytes());
-                out.extend_from_slice(&(nef.ommers().len() as u64).to_le_bytes());
-                for o in nef.ommers() {
-                    out.extend_from_slice(&o.to_bytes());
-                }
-            }
-        }
+        write_frontier(&mut out, &self.base_frontier);
         out.extend_from_slice(&self.size.to_le_bytes());
         out.extend_from_slice(&(self.leaves.len() as u64).to_le_bytes());
         for leaf in &self.leaves {
-            out.extend_from_slice(&leaf.to_bytes());
+            out.extend_from_slice(leaf);
         }
         out.extend_from_slice(&(self.notes.len() as u64).to_le_bytes());
         for n in &self.notes {
@@ -554,6 +652,12 @@ impl WalletDb {
         for nf in nfs {
             out.extend_from_slice(nf);
         }
+        // v4: the **tip** frontier — the mirror tree summarised in O(1). Without it a
+        // restore has to replay every leaf back through Sinsemilla to rebuild `tree`,
+        // which is minutes of CPU per wallet and is why a daemon restart showed every
+        // user `0 balance / 0 notes / syncing 0%` until their wallet finished reloading.
+        // Same encoding as the base frontier above.
+        write_frontier(&mut out, &self.tree.to_frontier());
         out
     }
 
@@ -564,7 +668,27 @@ impl WalletDb {
     /// mirror `tree` is reconstructed from the base frontier + `leaves` (O(N) hashing,
     /// no network and no trial-decryption — far cheaper than re-fetching the chain).
     pub fn from_checkpoint(seed: [u8; 32], bytes: &[u8]) -> Option<Self> {
-        Self::restore(Self::from_seed(seed)?, bytes)
+        Self::restore(Self::from_seed(seed)?, bytes, None)
+    }
+
+    /// [`Self::from_checkpoint`] with the tip tree supplied by the caller.
+    ///
+    /// A wallet's mirror tree at its cursor block *is* the consensus note-commitment
+    /// tree at that block — same leaves, same order. So a node can hand us that tree's
+    /// frontier directly (`GetShieldedTreeState` at the cursor) and the restore skips
+    /// the leaf replay entirely. This is what makes restoring an **old (v3)** checkpoint
+    /// O(1) as well, instead of ~60s of Sinsemilla per wallet — without which upgrading
+    /// the format would strand every existing wallet in a multi-hour reload.
+    ///
+    /// The frontier is accepted only if it describes exactly as many leaves as the
+    /// checkpoint claims; on any mismatch we fall back to rebuilding from the stream, so
+    /// a wrong or stale frontier can never silently install a wrong tree.
+    pub fn from_checkpoint_with_tip(seed: [u8; 32], bytes: &[u8], tip: &FrontierState) -> Option<Self> {
+        Self::restore(Self::from_seed(seed)?, bytes, Some(tip))
+    }
+
+    pub fn from_checkpoint_fvk_with_tip(fvk_bytes: &[u8; 96], bytes: &[u8], tip: &FrontierState) -> Option<Self> {
+        Self::restore(Self::from_fvk(fvk_bytes)?, bytes, Some(tip))
     }
 
     /// [`Self::from_checkpoint`] for a **watch-only** wallet: the checkpoint blob holds
@@ -572,30 +696,20 @@ impl WalletDb {
     /// viewing key. This is what lets a daemon resume syncing a non-custodial wallet
     /// across restarts without ever having seen the seed.
     pub fn from_checkpoint_fvk(fvk_bytes: &[u8; 96], bytes: &[u8]) -> Option<Self> {
-        Self::restore(Self::from_fvk(fvk_bytes)?, bytes)
+        Self::restore(Self::from_fvk(fvk_bytes)?, bytes, None)
     }
 
-    fn restore(mut db: Self, bytes: &[u8]) -> Option<Self> {
+    fn restore(mut db: Self, bytes: &[u8], tip: Option<&FrontierState>) -> Option<Self> {
         let mut r = Cursor { buf: bytes, pos: 0 };
-        if r.u8()? != CHECKPOINT_VERSION {
+        // v3 blobs are still accepted so that shipping v4 does not force every live
+        // wallet into a full rescan; they simply pay the old O(N) tree rebuild once and
+        // are rewritten as v4 by the next checkpoint.
+        let version = r.u8()?;
+        if version != CHECKPOINT_VERSION && version != CHECKPOINT_VERSION_V3 {
             return None;
         }
         let base_size = r.u64()?;
-        let base_frontier = match r.u8()? {
-            0 => Frontier::empty(),
-            1 => {
-                let leaf = r.arr::<32>()?;
-                let n_ommers = r.u64()? as usize;
-                let mut ommers = Vec::with_capacity(n_ommers);
-                for _ in 0..n_ommers {
-                    ommers.push(r.arr::<32>()?);
-                }
-                // Reuse the node-side frontier reconstruction (validates consistency).
-                let fs = FrontierState { size: base_size, leaf: Some(leaf), ommers };
-                GlobalTree::from_state(&fs).ok()?.frontier().clone()
-            }
-            _ => return None,
-        };
+        let base_frontier = read_frontier(&mut r, base_size)?;
         db.base_frontier = base_frontier;
         db.base_size = base_size;
         db.lag_tree = CommitmentTree::from_frontier(&db.base_frontier);
@@ -607,10 +721,9 @@ impl WalletDb {
         let n_leaves = r.u64()? as usize;
         db.leaves.reserve(n_leaves);
         for _ in 0..n_leaves {
-            let leaf = Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&r.arr()?))?;
-            // `append` only errors on a full (2^32-leaf) tree — unreachable here.
-            let _ = db.tree.append(leaf);
-            db.leaves.push(leaf);
+            // Stored verbatim — no point decompression here; that is what makes a restore
+            // a memcpy instead of minutes of curve arithmetic.
+            db.leaves.push(r.arr::<32>()?);
         }
         let n_notes = r.u64()? as usize;
         for _ in 0..n_notes {
@@ -628,6 +741,24 @@ impl WalletDb {
         for _ in 0..n_nfs {
             db.spent_nullifiers.insert(r.arr::<32>()?);
         }
+        // The tip mirror tree. v4 carries it as a frontier, so restoring it is O(1) —
+        // no hashing at all. A v3 blob has no such field, so fall back to replaying the
+        // leaf stream (O(N) Sinsemilla), which is what every restore used to cost.
+        db.tree = if version == CHECKPOINT_VERSION {
+            let tip = read_frontier(&mut r, size)?;
+            CommitmentTree::from_frontier(&tip)
+        } else if let Some(fs) = tip.filter(|fs| fs.size == size) {
+            // A v3 blob carries no tip frontier, but the caller got one from the node for
+            // exactly this cursor — same tree, so use it and skip the replay.
+            CommitmentTree::from_frontier(GlobalTree::from_state(fs).ok()?.frontier())
+        } else {
+            let mut tree = CommitmentTree::from_frontier(&db.base_frontier);
+            for leaf in db.decoded_leaves() {
+                // `append` only errors on a full (2^32-leaf) tree — unreachable here.
+                let _ = tree.append(*leaf);
+            }
+            tree
+        };
         if !r.done() {
             return None;
         }
@@ -636,11 +767,52 @@ impl WalletDb {
     }
 }
 
+/// Serialize a frontier: `0` for empty, else `1 ‖ leaf(32) ‖ n_ommers(u64) ‖ ommer(32)*`.
+fn write_frontier(out: &mut Vec<u8>, f: &Frontier<MerkleHashOrchard, TREE_DEPTH>) {
+    match f.value() {
+        None => out.push(0),
+        Some(nef) => {
+            out.push(1);
+            out.extend_from_slice(&nef.leaf().to_bytes());
+            out.extend_from_slice(&(nef.ommers().len() as u64).to_le_bytes());
+            for o in nef.ommers() {
+                out.extend_from_slice(&o.to_bytes());
+            }
+        }
+    }
+}
+
+/// Inverse of [`write_frontier`]. `size` is the absolute leaf count the frontier
+/// summarises; it pins the frontier's position, and reusing the node-side
+/// reconstruction ([`GlobalTree::from_state`]) revalidates that the ommers are
+/// consistent with it, so a corrupt blob fails cleanly rather than yielding a wrong tree.
+fn read_frontier(r: &mut Cursor<'_>, size: u64) -> Option<Frontier<MerkleHashOrchard, TREE_DEPTH>> {
+    match r.u8()? {
+        0 => Some(Frontier::empty()),
+        1 => {
+            let leaf = r.arr::<32>()?;
+            let n_ommers = r.u64()? as usize;
+            let mut ommers = Vec::with_capacity(n_ommers);
+            for _ in 0..n_ommers {
+                ommers.push(r.arr::<32>()?);
+            }
+            let fs = FrontierState { size, leaf: Some(leaf), ommers };
+            Some(GlobalTree::from_state(&fs).ok()?.frontier().clone())
+        }
+        _ => None,
+    }
+}
+
 /// Checkpoint format version. Bump on any layout change so an old blob is rejected
 /// (triggering a clean rescan) rather than silently misread. v2 added the fast-sync
 /// base frontier; v3 the spent-nullifier set (bundle drop rule) — v2 trees may have
-/// double-applied bundles, so they must rescan.
-const CHECKPOINT_VERSION: u8 = 3;
+/// double-applied bundles, so they must rescan. v4 appends the tip frontier, making a
+/// restore O(1) instead of an O(N) Sinsemilla replay.
+const CHECKPOINT_VERSION: u8 = 4;
+/// v4 is a pure suffix of v3, so v3 blobs still restore correctly (paying the old O(N)
+/// tree rebuild once). Reading them is what lets the v4 binary deploy without forcing
+/// every live wallet into a full rescan from birthday.
+const CHECKPOINT_VERSION_V3: u8 = 3;
 
 /// A minimal forward byte-reader for [`WalletDb::from_checkpoint`]: every read is
 /// bounds-checked and returns `None` past the end, so a truncated or corrupt blob
@@ -999,6 +1171,93 @@ mod tests {
         let mut bad = blob.clone();
         bad[0] = 0xFF;
         assert!(WalletDb::from_checkpoint(mine, &bad).is_none(), "wrong version rejected");
+    }
+
+    /// Measures what the v4 tip frontier actually buys, at live chain scale. Not run by
+    /// default (it builds a 200K-leaf tree): `cargo test -p kaspa-shielded-core --release
+    /// -- --ignored --nocapture restore_cost`.
+    #[test]
+    #[ignore]
+    fn restore_cost_v3_vs_v4() {
+        const LEAVES: usize = 200_000; // ~ the live chain's note-commitment count
+        let mine = [11u8; 32];
+        let addr = address_of(mine);
+        let theirs = address_of([12u8; 32]);
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        // Only a small fraction of the chain's notes are ours — the shape of a real
+        // wallet. (Owning *every* leaf would make the restore a measure of note
+        // reconstruction, not of the leaf stream, and flatter the result.)
+        for i in 0..LEAVES {
+            let to = if i % 1000 == 0 { addr } else { theirs };
+            db.ingest_block(&[coinbase_for(to, &i.to_le_bytes(), 1)], &[]);
+        }
+        assert_eq!(db.notes().len(), LEAVES / 1000);
+
+        let v4 = db.to_checkpoint();
+        let mut suffix = Vec::new();
+        write_frontier(&mut suffix, &db.tree.to_frontier());
+        let mut v3 = v4[..v4.len() - suffix.len()].to_vec();
+        v3[0] = CHECKPOINT_VERSION_V3;
+
+        let t = std::time::Instant::now();
+        let a = WalletDb::from_checkpoint(mine, &v3).unwrap();
+        let v3_ms = t.elapsed().as_millis();
+        let t = std::time::Instant::now();
+        let b = WalletDb::from_checkpoint(mine, &v4).unwrap();
+        let v4_ms = t.elapsed().as_millis();
+
+        assert_eq!(a.anchor(), b.anchor(), "both restores rebuild the same tree");
+        println!("restore of {LEAVES} leaves: v3 (leaf replay) {v3_ms} ms -> v4 (frontier) {v4_ms} ms");
+    }
+
+    /// **v3 checkpoints still restore.** v4 appends the tip frontier so a restore can
+    /// rebuild the mirror tree in O(1) instead of replaying every leaf through
+    /// Sinsemilla. That change may not orphan the checkpoints already on disk: if the
+    /// v4 binary rejected them, deploying it would force every live hosted wallet into
+    /// a full rescan from birthday — the exact multi-minute "0 balance / 0 notes"
+    /// blackout the change exists to prevent. A v3 blob is a v4 blob minus that
+    /// trailing frontier, and must reload to an identical wallet.
+    #[test]
+    fn v3_checkpoint_still_restores_and_matches_v4() {
+        let mine = [7u8; 32];
+        let addr = address_of(mine);
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        db.ingest_block(&[coinbase_for(address_of([2u8; 32]), b"b1||0", 500), coinbase_for(addr, b"b1||1", 1_500)], &[]);
+        db.ingest_block(&[coinbase_for(addr, b"b2||0", 2_500)], &[]);
+
+        let v4 = db.to_checkpoint();
+        assert_eq!(v4[0], CHECKPOINT_VERSION, "fresh checkpoints are written as v4");
+
+        // Reconstruct the v3 encoding: identical bytes, minus the trailing tip frontier.
+        let mut suffix = Vec::new();
+        write_frontier(&mut suffix, &db.tree.to_frontier());
+        let mut v3 = v4[..v4.len() - suffix.len()].to_vec();
+        v3[0] = CHECKPOINT_VERSION_V3;
+
+        let from_v3 = WalletDb::from_checkpoint(mine, &v3).expect("v3 checkpoint still reloads");
+        let from_v4 = WalletDb::from_checkpoint(mine, &v4).expect("v4 checkpoint reloads");
+
+        // The O(1) path and the O(N) replay must agree on every part of the tree state.
+        assert_eq!(from_v3.anchor(), db.anchor(), "v3 replay rebuilds the tip anchor");
+        assert_eq!(from_v4.anchor(), db.anchor(), "v4 frontier rebuilds the same tip anchor");
+        assert_eq!(from_v4.size, from_v3.size);
+        assert_eq!(from_v4.balance(), from_v3.balance());
+
+        // And a spend witness built from the O(1)-restored tree still roots correctly.
+        let n = from_v4.notes()[0].position;
+        let p4 = from_v4.witness_path(n).expect("witness from v4 restore");
+        let p3 = from_v3.witness_path(n).expect("witness from v3 restore");
+        let cmx = ExtractedNoteCommitment::from(from_v4.notes()[0].note.commitment());
+        assert_eq!(p4.root(cmx), p3.root(cmx), "identical spend witness either way");
+
+        // Appending after an O(1) restore must continue the same tree, not a fresh one.
+        let mut a = from_v4;
+        let mut b = from_v3;
+        let blk = [coinbase_for(addr, b"b3||0", 900)];
+        a.ingest_block(&blk, &[]);
+        b.ingest_block(&blk, &[]);
+        assert_eq!(a.anchor(), b.anchor(), "post-restore appends agree");
+        assert_eq!(a.anchor(), { db.ingest_block(&blk, &[]); db.anchor() }, "and match the never-restarted wallet");
     }
 
     /// **Protocol fast-sync equivalence.** A wallet that starts from a node-supplied
