@@ -996,6 +996,85 @@ struct AppState {
     /// signatures, and broadcasts. Held in memory only — a restart drops pending
     /// sessions (the device just re-prepares). The seed is never involved.
     prepared: Mutex<HashMap<String, PreparedSession>>,
+    /// Last-known-good status per loaded wallet, read by `status` when the wallet mutex
+    /// is momentarily held by the sync loop (see [`StatusSnap`]). Refreshed by the sync
+    /// loop each pass and by any `status` call that acquires the wallet lock.
+    snapshots: Mutex<HashMap<String, StatusSnap>>,
+}
+
+/// Build a status snapshot from a locked wallet entry. Shared by the sync loop and the
+/// `status` handler so the spendable/maturing split is computed identically to what
+/// `/prepare` will actually draw on (same anchor-depth cutoff).
+fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSnap {
+    let tip = e.chain_len.max(daa_score);
+    let total = e.db.balance();
+    let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
+    let spendable: u128 = match e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
+        Some(matured) => e.db.notes().iter().filter(|n| n.position < matured).map(|n| n.value() as u128).sum(),
+        None => 0,
+    };
+    StatusSnap {
+        address,
+        watch_only: e.key.is_watch_only(),
+        synced: e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip,
+        scanned: e.scanned,
+        chain_len: tip,
+        balance_sompi: total,
+        spendable_sompi: spendable,
+        maturing_sompi: total.saturating_sub(spendable),
+        pending_in: e.preview.incoming,
+        pending_out: e.preview.outgoing,
+        note_count: e.db.notes().len(),
+        updated_unix: e.updated_unix,
+        error: e.error.clone(),
+    }
+}
+
+/// Project a cached snapshot onto a `StatusResp` (the wire shape the SPA reads).
+fn fill_status_from_snap(resp: &mut StatusResp, s: &StatusSnap) {
+    resp.has_wallet = true;
+    resp.address = Some(s.address.clone());
+    resp.watch_only = s.watch_only;
+    resp.synced = s.synced;
+    resp.scanned_blocks = s.scanned;
+    resp.chain_len = s.chain_len;
+    resp.balance_sompi = s.balance_sompi.to_string();
+    resp.balance_fc = fmt_fc(s.balance_sompi);
+    resp.spendable_sompi = s.spendable_sompi.to_string();
+    resp.spendable_fc = fmt_fc(s.spendable_sompi);
+    resp.maturing_sompi = s.maturing_sompi.to_string();
+    resp.maturing_fc = fmt_fc(s.maturing_sompi);
+    resp.pending_in_sompi = s.pending_in.to_string();
+    resp.pending_in_fc = fmt_fc(s.pending_in);
+    resp.pending_out_sompi = s.pending_out.to_string();
+    resp.pending_out_fc = fmt_fc(s.pending_out);
+    resp.note_count = s.note_count;
+    resp.updated_unix = s.updated_unix;
+    resp.error = s.error.clone();
+}
+
+/// Last-known-good status for a loaded wallet, kept OUTSIDE the wallet mutex so the
+/// `status` handler can answer from it the moment the sync loop is holding the wallet
+/// lock (which, during a scan, is most of the time). Without this, a `try_lock` miss
+/// on the request path returned an all-zero default — balance and scan progress
+/// flickered to 0 on every poll that raced a scan pass, which read as "the wallet
+/// stopped updating". The sync loop refreshes this after each pass; `status` also
+/// refreshes it whenever it does get the lock.
+#[derive(Clone, Default)]
+struct StatusSnap {
+    address: String,
+    watch_only: bool,
+    synced: bool,
+    scanned: usize,
+    chain_len: u64,
+    balance_sompi: u128,
+    spendable_sompi: u128,
+    maturing_sompi: u128,
+    pending_in: u128,
+    pending_out: u128,
+    note_count: usize,
+    updated_unix: u64,
+    error: Option<String>,
 }
 
 /// A non-custodial payment proven and awaiting on-device spend-auth signatures.
@@ -1259,7 +1338,12 @@ async fn sync_loop(state: Arc<AppState>) {
                         e.saved_scanned = e.scanned;
                     }
                 }
+                // Refresh the out-of-band status snapshot while we still hold the lock,
+                // so a `status` call that races the NEXT scan pass answers with these
+                // real numbers instead of the zero default (the balance/progress flicker).
+                let snap = snap_from_entry(state.address_of(&e.db), &e, chain_len);
                 drop(e);
+                state.snapshots.lock().await.insert(token.clone(), snap);
                 // A real sleep (not just yield_now) between wallets. yield_now only hands
                 // off to another ready tokio task, which is useless when every core is
                 // already pinned by CPU-bound scan work — HTTP still can't get a cycle.
@@ -1271,8 +1355,10 @@ async fn sync_loop(state: Arc<AppState>) {
         }
         if !reorged_tokens.is_empty() {
             let mut map = state.wallets.lock().await;
+            let mut snaps = state.snapshots.lock().await;
             for t in reorged_tokens {
                 map.remove(&t);
+                snaps.remove(&t);
             }
         }
         // While catching up a big initial scan, loop back immediately (only a
@@ -1393,39 +1479,22 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         state.touch(&token).await;
         if let Some(w) = state.cached_wallet(&token).await {
             if let Ok(e) = w.try_lock() {
-                resp.has_wallet = true;
-                resp.address = Some(state.address_of(&e.db));
-                resp.watch_only = e.key.is_watch_only();
-                let tip = e.chain_len.max(daa_score);
-                resp.synced = e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip;
-                resp.scanned_blocks = e.scanned;
-                resp.chain_len = tip;
-                resp.balance_sompi = e.db.balance().to_string();
-                resp.balance_fc = fmt_fc(e.db.balance());
-                // Spendable-now = value in notes matured past the anchor depth — the
-                // exact set /prepare will draw on (same cutoff as the send path). The
-                // remainder is still maturing (~10 min after it arrived).
-                let total = e.db.balance();
-                let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
-                let spendable: u128 = match e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
-                    Some(matured) => e.db.notes().iter().filter(|n| n.position < matured).map(|n| n.value() as u128).sum(),
-                    None => 0,
-                };
-                let maturing = total.saturating_sub(spendable);
-                resp.spendable_sompi = spendable.to_string();
-                resp.spendable_fc = fmt_fc(spendable);
-                resp.maturing_sompi = maturing.to_string();
-                resp.maturing_fc = fmt_fc(maturing);
-                // 0-conf effects from the unsettled window (see WalletEntry::preview).
-                resp.pending_in_sompi = e.preview.incoming.to_string();
-                resp.pending_in_fc = fmt_fc(e.preview.incoming);
-                resp.pending_out_sompi = e.preview.outgoing.to_string();
-                resp.pending_out_fc = fmt_fc(e.preview.outgoing);
-                resp.note_count = e.db.notes().len();
-                resp.updated_unix = e.updated_unix;
-                resp.error = e.error.clone();
+                // Got the lock → compute a fresh snapshot, cache it out-of-band for the
+                // polls that will race the next scan pass, and answer from it.
+                let snap = snap_from_entry(state.address_of(&e.db), &e, daa_score);
+                drop(e);
+                state.snapshots.lock().await.insert(token.clone(), snap.clone());
+                fill_status_from_snap(&mut resp, &snap);
+            } else if let Some(snap) = state.snapshots.lock().await.get(&token).cloned() {
+                // Lock held by the sync loop this instant — answer from the last-known-good
+                // snapshot (real balance + progress) instead of a zero default. This is the
+                // fix for the balance/scan-progress flickering to 0 mid-scan.
+                fill_status_from_snap(&mut resp, &snap);
+                if resp.error.is_none() {
+                    resp.error = Some("updating…".into());
+                }
             } else {
-                // Being synced this instant; report last-known-good next poll.
+                // Loaded but not yet snapshotted (very first pass) — report presence only.
                 resp.has_wallet = true;
                 resp.error = Some("updating…".into());
             }
@@ -2398,6 +2467,7 @@ async fn main() {
         load_gate: tokio::sync::Semaphore::new(2),
         node_tip: Mutex::new((0, std::time::Instant::now())),
         prepared: Mutex::new(HashMap::new()),
+        snapshots: Mutex::new(HashMap::new()),
     });
 
     tokio::spawn(sync_loop(state.clone()));
