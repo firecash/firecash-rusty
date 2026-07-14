@@ -77,6 +77,13 @@ pub enum Prefix {
     Simnet,
     #[serde(rename = "firecashdev")]
     Devnet,
+    /// Upstream **Kaspa** mainnet. Not a FireCash network: it exists only so
+    /// merged mining can name the parent chain's coinbase recipient, since the
+    /// Kaspa block we mine on top of must pay a real `kaspa:` address. Never
+    /// returned by any FireCash network's `Params`, so it cannot be mistaken for
+    /// one of our own networks.
+    #[serde(rename = "kaspa")]
+    KaspaMainnet,
     #[cfg(test)]
     A,
     #[cfg(test)]
@@ -90,6 +97,7 @@ impl Prefix {
             Prefix::Testnet => "firecashtest",
             Prefix::Simnet => "firecashsim",
             Prefix::Devnet => "firecashdev",
+            Prefix::KaspaMainnet => "kaspa",
             #[cfg(test)]
             Prefix::A => "a",
             #[cfg(test)]
@@ -121,6 +129,7 @@ impl TryFrom<&str> for Prefix {
             "firecashtest" => Ok(Prefix::Testnet),
             "firecashsim" => Ok(Prefix::Simnet),
             "firecashdev" => Ok(Prefix::Devnet),
+            "kaspa" => Ok(Prefix::KaspaMainnet),
             #[cfg(test)]
             "a" => Ok(Prefix::A),
             #[cfg(test)]

@@ -81,6 +81,9 @@ impl TryFrom<Prefix> for NetworkType {
             Prefix::Testnet => Ok(NetworkType::Testnet),
             Prefix::Simnet => Ok(NetworkType::Simnet),
             Prefix::Devnet => Ok(NetworkType::Devnet),
+            // `kaspa` names the parent chain for merged mining, not a FireCash
+            // network, so it has no FireCash NetworkType.
+            Prefix::KaspaMainnet => Err(NetworkTypeError::InvalidNetworkType(prefix.to_string())),
             #[allow(unreachable_patterns)]
             #[cfg(test)]
             _ => Err(NetworkTypeError::InvalidNetworkType(prefix.to_string())),
