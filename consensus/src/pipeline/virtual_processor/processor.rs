@@ -195,7 +195,7 @@ pub struct VirtualStateProcessor {
     // commit hook is wired separately.
     pub(super) shielded_state_manager: crate::processes::shielded::ShieldedStateManager,
 
-    // firecash: when true, the coinbase reward enters the shielded pool as
+    // zkas: when true, the coinbase reward enters the shielded pool as
     // coinbase notes (no transparent outputs) — see `build_coinbase_mint`.
     pub(super) shielded_coinbase: bool,
 

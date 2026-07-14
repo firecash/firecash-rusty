@@ -1,17 +1,17 @@
-//! `firecash-walletd` — a shielded wallet daemon for the FireCash network.
+//! `ZKas-walletd` — a shielded wallet daemon for the ZKas network.
 //!
-//! It is the engine behind the FireCash web wallet. It drives the *same* shielded
+//! It is the engine behind the ZKas web wallet. It drives the *same* shielded
 //! primitives the CLI `shielded-pay` uses (`kaspa-shielded-core`): key generation,
 //! chain scan with the wallet's viewing key, real Orchard (Halo 2) shielded spends,
 //! and message sign/verify. Proofs are generated natively here (no in-browser Halo 2
-//! needed) and submitted to a FireCash node over gRPC.
+//! needed) and submitted to a ZKas node over gRPC.
 //!
 //! ## Two deployment modes
 //!
 //! - **Self-hosted (non-custodial):** the user runs this on their own machine; the
 //!   seed never leaves it. Point the web UI's daemon URL at `http://127.0.0.1:8501`.
 //! - **Hosted (convenience hot-wallet):** one instance serves many browsers behind a
-//!   reverse proxy, connected to a public FireCash node so users need no node of
+//!   reverse proxy, connected to a public ZKas node so users need no node of
 //!   their own. Each browser owns a random **wallet token** (an `X-Wallet-Token`
 //!   header); the daemon keeps one wallet per token. In this mode the seed is stored
 //!   server-side — weaker than keys-in-browser; the endgame is a client-side WASM
@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 /// 1 FC = 10^8 sompi.
-const SOMPI_PER_FC: u64 = 100_000_000;
+const SOMPI_PER_ZKAS: u64 = 100_000_000;
 /// Shielded output script length (raw Orchard address carried in a reward script).
 const ORCHARD_SCRIPT_LEN: usize = 43;
 /// Anchor maturity depth (blocks) — must match consensus `shielded_anchor_depth`
@@ -134,15 +134,15 @@ fn max_spends_per_tx() -> usize {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "firecash-walletd", about = "FireCash shielded wallet daemon (self-hosted or hosted)")]
+#[command(name = "zkas-walletd", about = "ZKas shielded wallet daemon (self-hosted or hosted)")]
 struct Cli {
-    /// FireCash node gRPC endpoint (host:port). In hosted mode, a public node.
+    /// ZKas node gRPC endpoint (host:port). In hosted mode, a public node.
     #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
     rpc_server: String,
     /// Address:port to serve the wallet REST API on. Loopback by default.
     #[arg(short = 'l', long, default_value = "127.0.0.1:8501")]
     listen: String,
-    /// Directory holding one wallet file per token. Default: ~/.firecash/wallets.
+    /// Directory holding one wallet file per token. Default: ~/.ZKas/wallets.
     #[arg(long)]
     wallet_dir: Option<String>,
     /// Network: mainnet | testnet | devnet | simnet.
@@ -152,7 +152,7 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     allow_remote: bool,
     /// Browser origin allowed to call the wallet API via CORS (repeatable, e.g.
-    /// `--allow-origin https://wallet.firecash.info`). With none given, cross-origin
+    /// `--allow-origin https://wallet.ZKas.info`). With none given, cross-origin
     /// browser requests are refused (same-origin only) — this closes the drive-by
     /// wallet-read/drain vector where any page a user visits could reach the daemon.
     #[arg(long = "allow-origin")]
@@ -163,8 +163,9 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     allow_default_token: bool,
     /// Secret used to encrypt wallet seed files at rest (XChaCha20-Poly1305, Argon2
-    /// key). May also be set via the `FIRECASH_WALLET_SECRET` env var. If unset, seeds
-    /// are stored in plaintext (0600 on unix) and a warning is logged at startup.
+    /// key). May also be set via the `ZKAS_WALLET_SECRET` env var (the legacy
+    /// `FIRECASH_WALLET_SECRET` is still honored). If unset, seeds are stored in
+    /// plaintext (0600 on unix) and a warning is logged at startup.
     #[arg(long)]
     wallet_secret: Option<String>,
 }
@@ -361,7 +362,7 @@ fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<(Wal
     let seed = if wf.encrypted {
         let blob = unhex(&wf.seed_hex)?;
         let secret = secret.or_else(|| {
-            log::error!("wallet '{token}' is encrypted but no --wallet-secret / FIRECASH_WALLET_SECRET is set");
+            log::error!("wallet '{token}' is encrypted but no --wallet-secret / ZKAS_WALLET_SECRET is set");
             None
         })?;
         decrypt_seed(&blob, secret).map_err(|e| log::error!("cannot decrypt wallet '{token}': {e}")).ok()?
@@ -1293,13 +1294,13 @@ fn err(code: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<serde_json
 }
 
 fn fmt_fc(sompi: u128) -> String {
-    let whole = sompi / SOMPI_PER_FC as u128;
-    let frac = sompi % SOMPI_PER_FC as u128;
+    let whole = sompi / SOMPI_PER_ZKAS as u128;
+    let frac = sompi % SOMPI_PER_ZKAS as u128;
     format!("{whole}.{frac:08}")
 }
 
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true, "service": "firecash-walletd" }))
+    Json(serde_json::json!({ "ok": true, "service": "zkas-walletd" }))
 }
 
 #[derive(Serialize)]
@@ -1709,7 +1710,7 @@ async fn wallet_send(
 
     let amount = match (req.amount_sompi, req.amount_fc) {
         (Some(s), _) => s,
-        (None, Some(fc)) => (fc * SOMPI_PER_FC as f64).round() as u64,
+        (None, Some(fc)) => (fc * SOMPI_PER_ZKAS as f64).round() as u64,
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "specify amount_sompi or amount_fc")),
     };
     let fee = req.fee.unwrap_or(3_000_000);
@@ -1965,7 +1966,7 @@ async fn wallet_consolidate(
 // it: it posts only its 96-byte FULL VIEWING KEY to `/prepare`. The daemon scans
 // watch-only, builds the Halo 2 proof, signs the throwaway padding dummies, and
 // returns the payment sighash plus one spend randomizer (`alpha`) per real spend.
-// The device signs each with `ask.randomize(alpha)` (e.g. via firecash-signer) and
+// The device signs each with `ask.randomize(alpha)` (e.g. via ZKas-signer) and
 // posts the signatures to `/submit`, which applies them and broadcasts. A server
 // compromise can see balances but CANNOT move funds — it never holds spend authority.
 // The crypto split is proven in shielded-core (`non_custodial_payment_api_roundtrip`).
@@ -1975,7 +1976,7 @@ async fn wallet_consolidate(
 struct PrepareReq {
     /// 96-byte full viewing key (hex). Grants viewing capability, not spend.
     fvk_hex: String,
-    /// Recipient `firecash:` shielded address.
+    /// Recipient `zkas:` shielded address.
     to: String,
     amount_sompi: Option<u64>,
     amount_fc: Option<f64>,
@@ -2036,7 +2037,7 @@ async fn wallet_prepare(
 
     let amount = match (req.amount_sompi, req.amount_fc) {
         (Some(s), _) => s,
-        (None, Some(fc)) => (fc * SOMPI_PER_FC as f64).round() as u64,
+        (None, Some(fc)) => (fc * SOMPI_PER_ZKAS as f64).round() as u64,
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "specify amount_sompi or amount_fc")),
     };
     let fee = req.fee.unwrap_or(3_000_000);
@@ -2357,10 +2358,14 @@ async fn main() {
     let sync_client = connect_node(&cli.rpc_server, "sync").await;
     log::info!("connected to node at {} (2 connections: request + sync)", cli.rpc_server);
 
-    // Seed-file encryption secret: CLI flag or FIRECASH_WALLET_SECRET env.
-    let wallet_secret = cli.wallet_secret.or_else(|| std::env::var("FIRECASH_WALLET_SECRET").ok());
+    // Seed-file encryption secret: CLI flag, ZKAS_WALLET_SECRET, or the legacy
+    // FIRECASH_WALLET_SECRET env (still honored so pre-rebrand service files work).
+    let wallet_secret = cli
+        .wallet_secret
+        .or_else(|| std::env::var("ZKAS_WALLET_SECRET").ok())
+        .or_else(|| std::env::var("FIRECASH_WALLET_SECRET").ok());
     if wallet_secret.is_none() {
-        log::warn!("no --wallet-secret / FIRECASH_WALLET_SECRET set: seed files are stored in PLAINTEXT (0600 on unix)");
+        log::warn!("no --wallet-secret / ZKAS_WALLET_SECRET set: seed files are stored in PLAINTEXT (0600 on unix)");
     }
     if cli.allow_default_token {
         log::warn!(
@@ -2459,7 +2464,7 @@ async fn main() {
         .layer(cors)
         .with_state(state);
 
-    log::info!("firecash-walletd listening on http://{listen}");
+    log::info!("zkas-walletd listening on http://{listen}");
     let listener = tokio::net::TcpListener::bind(listen).await.unwrap_or_else(|e| {
         log::error!("failed to bind {listen}: {e}");
         std::process::exit(1);

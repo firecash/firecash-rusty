@@ -1,6 +1,6 @@
-# FireCash — Live Operations Runbook
+# ZKas — Live Operations Runbook
 
-How the live FireCash network is deployed, how to keep it up, and how to relaunch
+How the live ZKas network is deployed, how to keep it up, and how to relaunch
 it. Read this before touching the running node/miner/pool. Every incident in here
 has already happened at least once — the point of this file is that it never
 happens again.
@@ -12,15 +12,15 @@ Two servers, each running its own full `kaspad` (own datadir), peered over P2P.
 | | VPS1 `185.147.157.125` | VPS2 `160.187.211.153` |
 |---|---|---|
 | Role | node + miner + mining pool + nginx | node + walletd + explorer API |
-| Process mgr | **systemd** | `setsid nohup` (from `/root/firecash/`) |
-| Node datadir | `/root/work/fc-mainnet` | `/root/firecash/fc-node` |
-| Binaries | `/root/work/kaspad-run`, `firecash-miner-run`; pool `firecash-pool/bin/stratum-bridge` | `/root/firecash/bin/{kaspad,firecash-walletd,firecash-api}` |
+| Process mgr | **systemd** | `setsid nohup` (from `/root/zkas/` → symlink to /root/firecash) |
+| Node datadir | `/root/work/fc-mainnet` | `/root/zkas/fc-node` |
+| Binaries | `/root/work/kaspad-run`, `zkas-miner-run`; pool `zkas-pool/bin/stratum-bridge` | `/root/zkas/bin/{kaspad,zkas-walletd,zkas-api}` |
 | Ports | node gRPC 16110, P2P 16111, pool stratum (see bridge yaml) | node gRPC 16110, walletd 8501, api 8500 |
 
 VPS1 nginx reaches VPS2's walletd/api over an `autossh -L 8500 -L 8501 root@VPS2`
-tunnel. wallet.firecash.info → walletd (8501); explorer → api (8500).
+tunnel. wallet.zkas.info → walletd (8501); explorer → api (8500).
 
-Chain facts: kHeavyHash PoW (byte-identical to Kaspa), 10 BPS, 44 $firecash/block,
+Chain facts: kHeavyHash PoW (byte-identical to Kaspa), 10 BPS, 44 ZKAS/block,
 addresses `firecash:...`, network id `firecash-mainnet`. AuxPoW merged-mining
 activation lives in `params.rs` (`merged_mining_activation`).
 
@@ -68,14 +68,14 @@ activation lives in `params.rs` (`merged_mining_activation`).
 ## Normal operation (VPS1)
 
 ```
-systemctl status  firecash-node firecash-miner firecash-pool
-systemctl restart firecash-node          # node
-systemctl restart firecash-miner         # solo/native miner (threads set in unit)
-systemctl restart firecash-pool          # stratum bridge (release binary)
-journalctl -u firecash-node -f           # follow logs
+systemctl status  zkas-node zkas-miner zkas-pool
+systemctl restart zkas-node              # node
+systemctl restart zkas-miner         # solo/native miner (threads set in unit)
+systemctl restart zkas-pool              # stratum bridge
+journalctl -u zkas-node -f               # follow logs
 ```
 
-Unit files: `/etc/systemd/system/firecash-{node,miner}.service`; the pool uses a
+Unit files: `/etc/systemd/system/zkas-{node,miner,pool,kaspa-node,grpc-public,pool-redactor,tunnel}.service`; the pool uses a
 drop-in `/etc/systemd/system/firecash-pool.service.d/override.conf` pointing at
 the **release** `bin/stratum-bridge` (the debug build used ~3 GB RSS and caused
 OOMs; release is ~60 MB). `firecash-pool.service` env: `BRIDGE_ALLOW_UNSYNCED=1`
@@ -85,16 +85,16 @@ OOMs; release is ~60 MB). `firecash-pool.service` env: `BRIDGE_ALLOW_UNSYNCED=1`
 ## Recover "node is down"
 
 1. Check RAM/OOM: `free -h` (is swap on?), `dmesg | grep -i oom`.
-2. VPS1: `systemctl start firecash-node firecash-miner firecash-pool`.
+2. VPS1: `systemctl start firecash-node zkas-miner firecash-pool`.
 3. VPS2 (from `/root/firecash`):
    ```
-   setsid nohup bin/kaspad --appdir=/root/firecash/fc-node --utxoindex \
+   setsid nohup bin/kaspad --appdir=/root/zkas/fc-node --utxoindex \
      --rpclisten=127.0.0.1:16110 --addpeer=185.147.157.125:16111 \
      </dev/null >node.log 2>&1 &
-   setsid nohup bin/firecash-walletd --network mainnet --rpc-server 127.0.0.1:16110 \
+   setsid nohup bin/zkas-walletd --network mainnet --rpc-server 127.0.0.1:16110 \
      --listen 127.0.0.1:8501 --wallet-dir /root/firecash/wallets \
-     --allow-origin https://wallet.firecash.info </dev/null >walletd.log 2>&1 &
-   setsid nohup bin/firecash-api -s 127.0.0.1:16110 -l 127.0.0.1:8500 \
+     --allow-origin https://wallet.zkas.info </dev/null >walletd.log 2>&1 &
+   setsid nohup bin/zkas-api -s 127.0.0.1:16110 -l 127.0.0.1:8500 \
      </dev/null >api.log 2>&1 &
    ```
 4. Verify: `ss -tlnp | grep -E ':16110|:8500|:8501'`, tail the logs.
@@ -107,15 +107,15 @@ Order matters — both empty before either mines.
 # 0. Build + copy the new binary to run-paths on BOTH boxes first.
 
 # 1. VPS1: stop everything, wipe.
-systemctl stop firecash-miner firecash-node firecash-pool
+systemctl stop zkas-miner firecash-node firecash-pool
 rm -rf /root/work/fc-mainnet
 
 # 2. VPS2: stop everything (kill by PID), wipe.
 #    kill <kaspad_pid> <walletd_pid> <api_pid>   # NOT pkill -f (self-match!)
-rm -rf /root/firecash/fc-node
+rm -rf /root/zkas/fc-node
 
 # 3. VPS1 first (has the miner): start node, then miner, then pool.
-systemctl start firecash-node && sleep 15 && systemctl start firecash-miner firecash-pool
+systemctl start firecash-node && sleep 15 && systemctl start zkas-miner firecash-pool
 
 # 4. VPS2: start node (follows VPS1 via relay), then walletd + api (see Recover).
 
@@ -128,7 +128,7 @@ mkdir -p /root/firecash/wallets_scan_bak
 mv /root/firecash/wallets/*.scan /root/firecash/wallets_scan_bak/   # keep the .json seeds
 ```
 
-Verify the wallet after: `curl https://wallet.firecash.info/daemon/api/status` must
+Verify the wallet after: `curl https://wallet.zkas.info/daemon/api/status` must
 return JSON (not the SPA `<!doctype html>`). The SPA calls `origin + /daemon` — nginx
 `location /daemon/` proxies to walletd on `127.0.0.1:8501` via the autossh tunnel. A
 bare `/api/status` correctly returns the SPA (catch-all); always test under `/daemon`.
@@ -138,11 +138,11 @@ VPS2 log shows `Accepted block … via relay` (following, not IBD of an old chai
 
 ## Wallet daemon security (VPS2)
 
-`firecash-walletd` is hardened: CORS is locked to `--allow-origin`
+`zkas-walletd` is hardened: CORS is locked to `--allow-origin`
 (default same-origin only), `X-Wallet-Token` is required (`--allow-default-token`
 restores the old single-user fallback), and seeds encrypt at rest when
 `--wallet-secret` / `FIRECASH_WALLET_SECRET` is set. Always launch it with
-`--allow-origin https://wallet.firecash.info` so the web wallet keeps working.
+`--allow-origin https://wallet.zkas.info` so the web wallet keeps working.
 
 ## Repos
 

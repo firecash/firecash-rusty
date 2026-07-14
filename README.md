@@ -1,10 +1,10 @@
-# FireCash — `firecash-rusty`
+# ZKas — `firecash-rusty` (rebranded from ZKas 2026-07-14)
 
 > **⚠️ TESTNET — this is a live test network. Coins have no value, the chain may be
-> reset without notice, and consensus parameters can still change. Do not treat $firecash
+> reset without notice, and consensus parameters can still change. Do not treat ZKAS
 > as money.**
 
-**Private-by-default money at Kaspa speed.** FireCash is a fork of
+**Private-by-default money at Kaspa speed.** ZKas is a fork of
 [rusty-kaspa](https://github.com/kaspanet/rusty-kaspa) that makes every balance and
 transfer **shielded by default** (Zcash **Orchard** notes, Halo 2 proofs — no trusted
 setup), while keeping Kaspa's sub-second BlockDAG confirmation and **kHeavyHash**
@@ -15,33 +15,33 @@ the wallet daemon, and the explorer API.
 
 ## What's different from Kaspa
 
-| | FireCash | Kaspa |
+| | ZKas | Kaspa |
 |---|---|---|
 | Privacy | **Shielded by default** (Orchard) | Transparent |
 | Consensus | GHOSTDAG BlockDAG, 10 blocks/s | same |
 | PoW | **kHeavyHash** (byte-identical to Kaspa) | kHeavyHash |
 | Merged mining | **Yes** — AuxPoW dual-acceptance with Kaspa | — |
-| Emission | 6 $firecash start, 3-month halving, two-step perpetual tail | fixed cap |
+| Emission | 6 ZKAS start, 3-month halving, two-step perpetual tail | fixed cap |
 
 - **Shielded state:** coinbase rewards and transfers enter a mandatory Orchard pool;
   the only public quantity is the fee a spender exposes to the miner. A shielded
   state root (anchor + nullifier accumulator + turnstile) is committed in the coinbase.
 - **Merged mining (Option-2 dual acceptance):** a block is valid if **either** its
   native kHeavyHash clears the target **or** it carries an `AuxPoW` proof — a parent
-  kHeavyHash block (e.g. a Kaspa block) whose coinbase commits to the FireCash block
+  kHeavyHash block (e.g. a Kaspa block) whose coinbase commits to the ZKas block
   hash. Native mining stays the backbone; merged mining adds security at zero marginal
   cost to Kaspa miners. See `consensus/core/src/auxpow.rs` and `consensus/pow/src/auxpow.rs`.
-- **Tokenomics:** 6 $firecash initial reward, halving every 3 months, settling on a two-step
-  perpetual tail (0.6 $firecash/block → 0.3 $firecash/block at month 24). No fixed supply cap.
+- **Tokenomics:** 6 ZKAS initial reward, halving every 3 months, settling on a two-step
+  perpetual tail (0.6 ZKAS/block → 0.3 ZKAS/block at month 24). No fixed supply cap.
 
 ## Binaries in this repo
 
 | Crate | Binary | Role |
 |---|---|---|
 | `kaspad` | `kaspad` | the node (gRPC :16110, p2p :16111) |
-| `miner` | `firecash-miner` | standalone CPU miner (native + `--merged` AuxPoW) |
-| `firecash-walletd` | `firecash-walletd` | shielded wallet daemon (token-scoped, local) |
-| `firecash-api` | `firecash-api` | explorer REST backend (gRPC → REST) |
+| `miner` | `zkas-miner` | standalone CPU miner (native + `--merged` AuxPoW) |
+| `zkas-walletd` | `zkas-walletd` | shielded wallet daemon (token-scoped, local) |
+| `zkas-api` | `zkas-api` | explorer REST backend (gRPC → REST) |
 
 Companion repos: **firecash-pool** (stratum bridge — ASIC mining), **firecash-explorer**
 (SPA), **firecash-wallet** (web wallet SPA), **firecash-website**.
@@ -76,7 +76,7 @@ source "$HOME/.cargo/env"
 git clone https://github.com/firecash/firecash-rusty.git
 cd firecash-rusty
 # all node-side binaries at once:
-cargo build --release -p kaspad -p miner -p firecash-walletd -p firecash-api
+cargo build --release -p kaspad -p miner -p zkas-walletd -p zkas-api
 # or the whole workspace:
 cargo build --release
 ```
@@ -86,7 +86,7 @@ First build downloads and compiles all dependencies (RocksDB, Halo 2, etc.) and 
 ## Run a node & join the network
 
 Grab the binaries from the latest [Release](https://github.com/firecash/firecash-rusty/releases)
-(or build from source, below), then run a node that syncs from the FireCash seed nodes:
+(or build from source, below), then run a node that syncs from the ZKas seed nodes:
 
 ```bash
 ./kaspad --appdir=./fc-node --rpclisten=127.0.0.1:16110 --utxoindex \
@@ -98,18 +98,18 @@ needs outbound access to the seed nodes' **p2p port 16111**; its own RPC (16110)
 ## Mine
 
 - **Pool (recommended — works with ASICs):** point your miner or KS-series ASIC at the
-  FireCash stratum pool at **mining-pool.firecash.info**. No node required.
+  ZKas stratum pool at **mining-pool.zkas.info**. No node required.
 - **Solo:** with your synced node running, mine to your `firecash:` shielded address:
   ```bash
-  ./firecash-miner -s 127.0.0.1:16110 -a firecash:<your-address> -t 4
+  ./zkas-miner -s 127.0.0.1:16110 -a firecash:<your-address> -t 4
   ```
 
 ## Wallet
 
 Everything is on the **shielded (Orchard) pool** — balances and amounts are private.
-`1 $firecash = 100,000,000 sompi`. There are three ways to use a wallet:
+`1 ZKAS = 100,000,000 sompi`. There are three ways to use a wallet:
 
-- **Web & mobile wallet (easiest):** https://wallet.firecash.info — no install; also
+- **Web & mobile wallet (easiest):** https://wallet.zkas.info — no install; also
   packaged as a native iOS/Android app (Capacitor). See
   [firecash-wallet](https://github.com/firecash/firecash-wallet) / its `MOBILE.md`.
 
@@ -141,12 +141,12 @@ reference tool; use the daemon or web wallet for real random-seed wallets.)
 ./shielded-pay verify --address firecash:<addr> --message "gm" --signature <hex>
 ```
 
-### `firecash-walletd` — wallet daemon (REST, powers the web wallet)
+### `zkas-walletd` — wallet daemon (REST, powers the web wallet)
 
 Run it locally for a non-custodial wallet with a REST API on `:8501`:
 
 ```bash
-./firecash-walletd --network mainnet --rpc-server 127.0.0.1:16110 \
+./zkas-walletd --network mainnet --rpc-server 127.0.0.1:16110 \
   --wallet-dir ./fc-wallets --listen 127.0.0.1:8501 \
   --allow-origin http://localhost:5173   # your web-wallet origin (omit for same-origin)
 ```
@@ -177,7 +177,7 @@ rest; `--allow-default-token` permits tokenless requests for single-user localho
 
 ## Explorer
 
-https://explorer.firecash.info
+https://explorer.zkas.info
 
 ## Configuration
 

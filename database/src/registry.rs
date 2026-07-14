@@ -82,7 +82,7 @@ pub enum DatabaseStorePrefixes {
     SmtSyncFlag = 75,
     SmtSeqCommitMeta = 76,
 
-    // ---- Shielded pool (firecash) ----
+    // ---- Shielded pool (ZKas) ----
     /// Append-only set of spent nullifiers (PLAN §2.2).
     ShieldedNullifiers = 80,
     /// Persisted frontier of the global note-commitment tree (PLAN §2.9).

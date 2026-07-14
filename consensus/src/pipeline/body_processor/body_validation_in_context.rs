@@ -188,7 +188,7 @@ mod tests {
             let mut block = consensus.build_block_with_parents_and_transactions(7.into(), vec![6.into()], vec![]);
             block.transactions[0].payload[8..16].copy_from_slice(&(5_u64).to_le_bytes());
             block.header.hash_merkle_root = calc_hash_merkle_root(block.transactions.iter());
-            // firecash divides Kaspa's emission table by BPS (=10): the deflationary
+            // ZKas divides Kaspa's emission table by BPS (=10): the deflationary
             // initial subsidy is 44_000_000_000/10 = 4_400_000_000 per block (the value
             // observed live in the mainnet coinbase).
             assert_match!(consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 4400000000);

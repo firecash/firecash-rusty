@@ -2,7 +2,7 @@
 //! (blocker #4). It talks the standard `get_block_template` / `submit_block` RPC to
 //! a `kaspad` node, searches the nonce space with the shared kHeavyHash PoW
 //! ([`kaspa_pow::State`], the very code the node verifies with), and submits solved
-//! blocks. The mining reward is paid to a `firecash:` shielded address, so a
+//! blocks. The mining reward is paid to a `zkas:` shielded address, so a
 //! bootstrapped chain is private-by-default from its first mined block.
 //!
 //! This is intentionally a CPU miner: on a fresh, low-difficulty genesis chain a
@@ -25,13 +25,13 @@ use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode};
 
 /// CLI arguments.
 #[derive(Parser, Debug)]
-#[command(name = "firecash-miner", about = "Standalone CPU miner for the firecash network (kHeavyHash PoW)")]
+#[command(name = "zkas-miner", about = "Standalone CPU miner for the ZKas network (kHeavyHash PoW)")]
 struct Args {
     /// kaspad gRPC endpoint (host:port).
     #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
     rpc_server: String,
 
-    /// The `firecash:` shielded address the block reward is paid to.
+    /// The `zkas:` shielded address the block reward is paid to.
     #[arg(short = 'a', long)]
     mining_address: String,
 
@@ -52,9 +52,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_pow: bool,
 
-    /// Merged-mining (AuxPoW) mode: instead of grinding the FireCash header's own
+    /// Merged-mining (AuxPoW) mode: instead of grinding the ZKas header's own
     /// nonce, prove proof-of-work via a parent kHeavyHash block that commits to the
-    /// FireCash block hash (Option-2 dual acceptance). Only accepted once merged
+    /// ZKas block hash (Option-2 dual acceptance). Only accepted once merged
     /// mining has activated on the node (see `merged_mining_activation`). This is the
     /// engine the pool reuses to feed ASIC hashrate; here it self-mines a synthetic
     /// parent for testing.

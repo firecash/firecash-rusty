@@ -3,7 +3,7 @@
 //!
 //! This is what *produces* a shielded transaction: it derives keys, builds an
 //! Orchard bundle, creates the Halo 2 proof, and signs the binding + spend-auth
-//! signatures over the firecash sighash — emitting a [`ShieldedBundle`] in our
+//! signatures over the ZKas sighash — emitting a [`ShieldedBundle`] in our
 //! canonical wire format, ready to carry in a transaction payload and be
 //! accepted by the consensus verifier.
 //!

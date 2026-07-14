@@ -4,7 +4,7 @@
 //! the piece that needs the kHeavyHash [`State`]: does the parent header's PoW
 //! clear *our* target.
 //!
-//! A FireCash block is accepted if it satisfies **either** PoW path against its own
+//! A ZKas block is accepted if it satisfies **either** PoW path against its own
 //! target (`header.bits`):
 //! - **native** — `kHeavyHash(header)` clears the target (the mode a solo
 //!   `firecash-miner` produces); or
@@ -13,7 +13,7 @@
 //!
 //! Both are the *same* hash function against the *same* target, so their work adds
 //! directly — which is exactly why the chain runs kHeavyHash. Crucially, the aux
-//! target is FireCash's own (set by our DAA), **not** Kaspa's: a single Kaspa hash
+//! target is ZKas's own (set by our DAA), **not** Kaspa's: a single Kaspa hash
 //! that fails Kaspa's hard target routinely clears our easy one.
 
 use kaspa_consensus_core::{auxpow::AuxPow, header::Header};
@@ -29,7 +29,7 @@ fn parent_pow(aux: &AuxPow) -> Uint256 {
     State::new(&aux.parent_header).calculate_pow(aux.parent_header.nonce)
 }
 
-/// Full AuxPoW verification for a FireCash block with hash `expected` and target
+/// Full AuxPoW verification for a ZKas block with hash `expected` and target
 /// `target` (decoded from its `bits`):
 /// 1. the parent coinbase commits to `expected` exactly once and is Merkle-included
 ///    under the parent header ([`AuxPow::verify_binding`]); **and**
@@ -103,8 +103,8 @@ mod tests {
         Uint256::from_compact_target_bits(bits)
     }
 
-    /// A FireCash block header; its `.hash` is the commitment `H_fc`.
-    fn firecash_header(seed: u64, bits: u32) -> Header {
+    /// A ZKas block header; its `.hash` is the commitment `H_fc`.
+    fn zkas_header(seed: u64, bits: u32) -> Header {
         Header::new_finalized(
             1,
             vec![vec![Hash::from_u64_word(seed)]].try_into().unwrap(),
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn native_path_unchanged_by_dual_gate() {
         // With no aux proof, check_pow_dual is exactly the native check.
-        let mut h = firecash_header(1, EASY_BITS);
+        let mut h = zkas_header(1, EASY_BITS);
         let state = State::new(&h);
         let mut nonce = 0u64;
         while !state.check_pow(nonce).0 {
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn aux_pow_accepts_single_tx_parent() {
-        let fc = firecash_header(2, EASY_BITS);
+        let fc = zkas_header(2, EASY_BITS);
         let hfc = fc.hash;
         let cb = coinbase_committing(hfc);
         let (parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn aux_pow_accepts_multi_tx_parent() {
         // A deeper (5-tx) parent Merkle tree exercises the sparse-subtree branch.
-        let fc = firecash_header(3, EASY_BITS);
+        let fc = zkas_header(3, EASY_BITS);
         let hfc = fc.hash;
         let cb = coinbase_committing(hfc);
         let txs = vec![cb.clone(), tx(1), tx(2), tx(3), tx(4)];
@@ -228,19 +228,19 @@ mod tests {
 
     #[test]
     fn aux_pow_rejects_wrong_commitment() {
-        let fc = firecash_header(4, EASY_BITS);
+        let fc = zkas_header(4, EASY_BITS);
         let cb = coinbase_committing(fc.hash);
         let (parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
         let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: branch };
-        // A different FireCash block cannot claim this parent's work.
-        let other = firecash_header(999, EASY_BITS).hash;
+        // A different ZKas block cannot claim this parent's work.
+        let other = zkas_header(999, EASY_BITS).hash;
         assert!(!verify_aux_pow(&aux, other, target(EASY_BITS)), "parent commits to fc, not `other`");
     }
 
     #[test]
     fn aux_pow_rejects_insufficient_work() {
         // Mine only to the easy target, then demand an impossible one (bits=0 ⇒ target 0).
-        let fc = firecash_header(5, EASY_BITS);
+        let fc = zkas_header(5, EASY_BITS);
         let hfc = fc.hash;
         let cb = coinbase_committing(hfc);
         let (parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
@@ -253,7 +253,7 @@ mod tests {
         // If the parent's committed merkle root does not match the coinbase+branch,
         // inclusion fails deterministically — the coinbase (and thus H_fc) is no
         // longer proven to be under the PoW-bearing header.
-        let fc = firecash_header(6, EASY_BITS);
+        let fc = zkas_header(6, EASY_BITS);
         let hfc = fc.hash;
         let cb = coinbase_committing(hfc);
         let (mut parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn gate_ignores_aux_until_active() {
         // A valid aux block: correct commitment + mined parent.
-        let fc = firecash_header(42, EASY_BITS);
+        let fc = zkas_header(42, EASY_BITS);
         let cb = coinbase_committing(fc.hash);
         let (parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
         let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: branch };
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn native_block_not_invalidated_by_bogus_aux() {
         // A validly native-mined header ...
-        let mut fc = firecash_header(77, EASY_BITS);
+        let mut fc = zkas_header(77, EASY_BITS);
         let state = State::new(&fc);
         let mut nonce = 0u64;
         while !state.check_pow(nonce).0 {
@@ -294,8 +294,8 @@ mod tests {
         fc.nonce = nonce;
         fc.finalize();
         // ... with a bogus aux attached (commits to a different block).
-        let cb = coinbase_committing(firecash_header(999, EASY_BITS).hash);
-        let bogus = AuxPow { parent_header: firecash_header(0, EASY_BITS), parent_coinbase: cb, coinbase_merkle_branch: vec![] };
+        let cb = coinbase_committing(zkas_header(999, EASY_BITS).hash);
+        let bogus = AuxPow { parent_header: zkas_header(0, EASY_BITS), parent_coinbase: cb, coinbase_merkle_branch: vec![] };
         // The native path is tried first, so the block is accepted despite the invalid
         // aux — an unhashed, tamperable witness must never invalidate a valid block.
         assert!(check_pow_gated(&fc, Some(&bogus), true).0, "valid native PoW is not invalidated by a bogus aux witness");
@@ -304,9 +304,9 @@ mod tests {
     #[test]
     fn aux_pow_rejects_stolen_pow_for_different_block() {
         // The canonical merged-mining attack: reuse one parent's PoW for a *second*
-        // FireCash block. The parent commits to fc_a's hash, so fc_b cannot claim it.
-        let fc_a = firecash_header(10, EASY_BITS);
-        let fc_b = firecash_header(11, EASY_BITS);
+        // ZKas block. The parent commits to fc_a's hash, so fc_b cannot claim it.
+        let fc_a = zkas_header(10, EASY_BITS);
+        let fc_b = zkas_header(11, EASY_BITS);
         let cb = coinbase_committing(fc_a.hash);
         let (parent, branch) = mine_parent(&[cb.clone()], EASY_BITS);
         let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: branch };

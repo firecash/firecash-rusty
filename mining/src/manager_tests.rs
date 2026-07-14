@@ -1634,6 +1634,62 @@ mod tests {
         );
     }
 
+    /// F-02 regression: a shielded tx whose note is spent by a *different*,
+    /// now-confirmed transaction must be evicted from the mempool the instant that
+    /// block is accepted — not left to relay and be re-templated until age-expiry.
+    /// This reproduces the cross-node case the admission-time nullifier check can't
+    /// cover: the winning side (`tx_a`) is never admitted to THIS mempool, so the
+    /// only place its conflict with the resident loser (`tx_b`) is caught is
+    /// block-acceptance reconciliation in `remove_double_spends`.
+    #[test]
+    fn test_confirmed_shielded_nullifier_evicts_conflicting_mempool_tx() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let mining_manager = default_mining_manager();
+
+        // The losing side is admitted locally (this node never saw the winner).
+        let tx_b = shielded_mutable_tx(&[shielded_nf(1)], 200_000);
+        let tx_b_id = tx_b.id();
+        let result = mining_manager.validate_and_insert_mutable_transaction(
+            consensus.as_ref(),
+            tx_b,
+            Priority::High,
+            Orphan::Forbidden,
+            RbfPolicy::Forbidden,
+        );
+        assert!(result.is_ok(), "the losing shielded tx should be admitted to the mempool but got {result:?}");
+        let (pool_txs, _) = mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly);
+        assert!(contained_by(tx_b_id, &pool_txs), "tx_b should be resident before the conflicting block arrives");
+
+        // A different tx spending the SAME note confirms on-chain. It was never in
+        // this mempool, so `build_block_transactions` puts it straight in a block.
+        let tx_a = shielded_mutable_tx(&[shielded_nf(1)], 300_000);
+        assert_ne!(tx_a.id(), tx_b_id, "the two conflicting spends are distinct transactions");
+        let block = build_block_transactions(std::iter::once(tx_a.tx.as_ref()));
+        let result = mining_manager.handle_new_block_transactions(consensus.as_ref(), 2, &block);
+        assert!(result.is_ok(), "handling the confirming block should succeed but got {result:?}");
+
+        // tx_b's note is now permanently spent on-chain — it must be gone.
+        assert!(
+            mining_manager.get_transaction(&tx_b_id, TransactionQuery::All).is_none(),
+            "the conflicting shielded tx {tx_b_id} must be evicted on block acceptance, not left until expiry"
+        );
+
+        // And a fresh spend of that same note is admissible again: the owner map
+        // no longer references the evicted loser (regression guard for a stale entry).
+        let tx_c = shielded_mutable_tx(&[shielded_nf(1)], 250_000);
+        let result = mining_manager.validate_and_insert_mutable_transaction(
+            consensus.as_ref(),
+            tx_c,
+            Priority::High,
+            Orphan::Forbidden,
+            RbfPolicy::Forbidden,
+        );
+        assert!(
+            result.is_ok(),
+            "after eviction the note's owner mapping must be cleared so a new spend is admissible, got {result:?}"
+        );
+    }
+
     #[allow(dead_code)]
     fn all_priority_orphan_combinations() -> impl Iterator<Item = (Priority, Orphan)> {
         [Priority::Low, Priority::High]

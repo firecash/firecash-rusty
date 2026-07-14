@@ -109,7 +109,12 @@ impl Address {
         .expect("All character are valid utf-8")
     }
 
-    pub(crate) fn decode_payload(prefix: Prefix, address: &str) -> Result<Self, AddressError> {
+    /// `hrp` is the prefix string as it literally appears in the encoded
+    /// address. The bech32 checksum is computed over that literal HRP, so a
+    /// legacy `firecash:` string (which maps to the same [`Prefix`] as
+    /// `zkas:`) verifies against its original checksum, not the canonical
+    /// spelling's.
+    pub(crate) fn decode_payload(prefix: Prefix, hrp: &str, address: &str) -> Result<Self, AddressError> {
         // From letters to bytes
         let mut err = Ok(());
         let address_u5 = address
@@ -129,7 +134,7 @@ impl Address {
         }
 
         let (payload_u5, checksum_u5) = address_u5.split_at(address.len() - 8);
-        let fivebit_prefix = prefix.as_str().as_bytes().iter().copied().map(|c| c & 0x1fu8);
+        let fivebit_prefix = hrp.as_bytes().iter().copied().map(|c| c & 0x1fu8);
 
         // Convert to number
         let checksum_ =

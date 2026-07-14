@@ -1,5 +1,5 @@
 [package]
-name = "firecash-api"
+name = "zkas-api"
 description = "FireCash explorer backend: translates the node's gRPC into the REST + shielded-pool API the FireCash explorer frontend consumes"
 version.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "firecash-api"
+name = "zkas-api"
 path = "src/main.rs"
 
 [lints]

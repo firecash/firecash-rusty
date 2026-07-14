@@ -81,8 +81,8 @@ impl TryFrom<Prefix> for NetworkType {
             Prefix::Testnet => Ok(NetworkType::Testnet),
             Prefix::Simnet => Ok(NetworkType::Simnet),
             Prefix::Devnet => Ok(NetworkType::Devnet),
-            // `kaspa` names the parent chain for merged mining, not a FireCash
-            // network, so it has no FireCash NetworkType.
+            // `kaspa` names the parent chain for merged mining, not a ZKas
+            // network, so it has no ZKas NetworkType.
             Prefix::KaspaMainnet => Err(NetworkTypeError::InvalidNetworkType(prefix.to_string())),
             #[allow(unreachable_patterns)]
             #[cfg(test)]
@@ -159,7 +159,7 @@ impl TryFrom<&NetworkTypeT> for Prefix {
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum NetworkIdError {
-    #[error("Invalid network name prefix: {0}. The expected prefix is 'firecash'.")]
+    #[error("Invalid network name prefix: {0}. The expected prefix is 'zkas' (or the legacy 'firecash').")]
     InvalidPrefix(String),
 
     #[error(transparent)]
@@ -265,13 +265,22 @@ impl NetworkId {
         NETWORK_IDS.iter().copied()
     }
 
-    /// Returns a textual description of the network prefixed with `firecash-`
+    /// Returns a textual description of the network prefixed with `firecash-`.
+    ///
+    /// ZKas rebrand note: this string is the network's *wire and disk*
+    /// identity, not a display name. It is compared byte-for-byte in the p2p
+    /// handshake (so released pre-rebrand binaries would refuse to peer with a
+    /// node emitting anything else) and names the datadir/logdir folder
+    /// (`<appdir>/firecash-mainnet/...`) of every existing node. It therefore
+    /// deliberately stays `firecash-` — like the `kaspa-*` crate names, it is
+    /// invisible infrastructure. `from_prefixed` accepts the `zkas-` spelling
+    /// as input.
     pub fn to_prefixed(&self) -> String {
         format!("firecash-{}", self)
     }
 
     pub fn from_prefixed(prefixed: &str) -> Result<Self, NetworkIdError> {
-        if let Some(stripped) = prefixed.strip_prefix("firecash-") {
+        if let Some(stripped) = prefixed.strip_prefix("firecash-").or_else(|| prefixed.strip_prefix("zkas-")) {
             Self::from_str(stripped)
         } else {
             Err(NetworkIdError::InvalidPrefix(prefixed.to_string()))

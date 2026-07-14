@@ -1,4 +1,4 @@
-//! firecash shielded pool core.
+//! ZKas shielded pool core.
 //!
 //! Wraps Zcash Orchard primitives (Halo 2, Pasta curves) to provide the
 //! consensus-side shielded state described in `PLAN.md`:
@@ -31,7 +31,7 @@ pub mod verify;
 pub mod wallet;
 pub mod walletdb;
 
-// The human-facing wallet facade (keys -> firecash: address -> scan -> pay).
+// The human-facing wallet facade (keys -> zkas: address -> scan -> pay).
 pub use account::{PaymentError, ShieldedAccount, orchard_recipient_bytes};
 
 // Re-export the Orchard primitives the consensus layer builds on, so there is a

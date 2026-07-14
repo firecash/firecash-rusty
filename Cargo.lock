@@ -2280,48 +2280,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "firecash-api"
-version = "2.0.1"
-dependencies = [
- "axum 0.7.9",
- "clap",
- "kaspa-addresses",
- "kaspa-consensus-core",
- "kaspa-core",
- "kaspa-grpc-client",
- "kaspa-rpc-core",
- "kaspa-shielded-core",
- "log",
- "serde",
- "serde_json",
- "tokio",
- "tower-http",
-]
-
-[[package]]
-name = "firecash-walletd"
-version = "2.0.1"
-dependencies = [
- "argon2",
- "axum 0.7.9",
- "chacha20poly1305",
- "clap",
- "kaspa-addresses",
- "kaspa-consensus-core",
- "kaspa-core",
- "kaspa-grpc-client",
- "kaspa-rpc-core",
- "kaspa-shielded-core",
- "kaspa-shielded-wallet",
- "log",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "tokio",
- "tower-http",
-]
-
-[[package]]
 name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9811,6 +9769,48 @@ dependencies = [
  "memuse",
  "subtle",
  "zcash_spec",
+]
+
+[[package]]
+name = "zkas-api"
+version = "2.0.1"
+dependencies = [
+ "axum 0.7.9",
+ "clap",
+ "kaspa-addresses",
+ "kaspa-consensus-core",
+ "kaspa-core",
+ "kaspa-grpc-client",
+ "kaspa-rpc-core",
+ "kaspa-shielded-core",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+]
+
+[[package]]
+name = "zkas-walletd"
+version = "2.0.1"
+dependencies = [
+ "argon2",
+ "axum 0.7.9",
+ "chacha20poly1305",
+ "clap",
+ "kaspa-addresses",
+ "kaspa-consensus-core",
+ "kaspa-core",
+ "kaspa-grpc-client",
+ "kaspa-rpc-core",
+ "kaspa-shielded-core",
+ "kaspa-shielded-wallet",
+ "log",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
 ]
 
 [[package]]

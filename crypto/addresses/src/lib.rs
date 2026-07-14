@@ -69,18 +69,18 @@ pub enum AddressError {
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Hash, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[borsh(use_discriminant = true)]
 pub enum Prefix {
-    #[serde(rename = "firecash")]
+    #[serde(rename = "zkas", alias = "firecash")]
     Mainnet,
-    #[serde(rename = "firecashtest")]
+    #[serde(rename = "zkastest", alias = "firecashtest")]
     Testnet,
-    #[serde(rename = "firecashsim")]
+    #[serde(rename = "zkassim", alias = "firecashsim")]
     Simnet,
-    #[serde(rename = "firecashdev")]
+    #[serde(rename = "zkasdev", alias = "firecashdev")]
     Devnet,
-    /// Upstream **Kaspa** mainnet. Not a FireCash network: it exists only so
+    /// Upstream **Kaspa** mainnet. Not a ZKas network: it exists only so
     /// merged mining can name the parent chain's coinbase recipient, since the
     /// Kaspa block we mine on top of must pay a real `kaspa:` address. Never
-    /// returned by any FireCash network's `Params`, so it cannot be mistaken for
+    /// returned by any ZKas network's `Params`, so it cannot be mistaken for
     /// one of our own networks.
     #[serde(rename = "kaspa")]
     KaspaMainnet,
@@ -93,10 +93,10 @@ pub enum Prefix {
 impl Prefix {
     fn as_str(&self) -> &'static str {
         match self {
-            Prefix::Mainnet => "firecash",
-            Prefix::Testnet => "firecashtest",
-            Prefix::Simnet => "firecashsim",
-            Prefix::Devnet => "firecashdev",
+            Prefix::Mainnet => "zkas",
+            Prefix::Testnet => "zkastest",
+            Prefix::Simnet => "zkassim",
+            Prefix::Devnet => "zkasdev",
             Prefix::KaspaMainnet => "kaspa",
             #[cfg(test)]
             Prefix::A => "a",
@@ -125,10 +125,16 @@ impl TryFrom<&str> for Prefix {
 
     fn try_from(prefix: &str) -> Result<Self, Self::Error> {
         match prefix {
-            "firecash" => Ok(Prefix::Mainnet),
-            "firecashtest" => Ok(Prefix::Testnet),
-            "firecashsim" => Ok(Prefix::Simnet),
-            "firecashdev" => Ok(Prefix::Devnet),
+            // ZKas is the canonical HRP; the pre-rebrand "firecash" HRPs remain
+            // accepted forever so every address string issued before the rename
+            // (miner payout configs, saved addresses) keeps parsing. Bech32
+            // checksums are computed over the HRP actually present in the
+            // string, so both spellings of the same key are valid, distinct
+            // encodings of the same address.
+            "zkas" | "firecash" => Ok(Prefix::Mainnet),
+            "zkastest" | "firecashtest" => Ok(Prefix::Testnet),
+            "zkassim" | "firecashsim" => Ok(Prefix::Simnet),
+            "zkasdev" | "firecashdev" => Ok(Prefix::Devnet),
             "kaspa" => Ok(Prefix::KaspaMainnet),
             #[cfg(test)]
             "a" => Ok(Prefix::A),
@@ -154,7 +160,7 @@ pub enum Version {
     PubKeyECDSA = 1,
     /// ScriptHash addresses always have the version byte set to 8
     ScriptHash = 8,
-    /// firecash shielded (Orchard) addresses have the version byte set to 9.
+    /// ZKas shielded (Orchard) addresses have the version byte set to 9.
     /// The payload is the 43-byte raw Orchard address (diversifier ‖ pk_d). Such
     /// an address is never spent through a transparent script — it is the
     /// recipient of a shielded (Orchard) output — so it maps to no standard
@@ -186,7 +192,7 @@ impl Version {
         }
     }
 
-    /// Whether this is a firecash shielded (Orchard) address, which is paid via
+    /// Whether this is a ZKas shielded (Orchard) address, which is paid via
     /// a shielded output rather than a transparent script.
     pub fn is_shielded(&self) -> bool {
         matches!(self, Version::ShieldedOrchard)
@@ -321,7 +327,7 @@ impl TryFrom<&str> for Address {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value.split_once(':') {
-            Some((prefix, payload)) => Self::decode_payload(prefix.try_into()?, payload),
+            Some((prefix, payload)) => Self::decode_payload(prefix.try_into()?, prefix, payload),
             None => Err(AddressError::MissingPrefix),
         }
     }
@@ -480,7 +486,7 @@ impl<'de> Deserialize<'de> for Address {
                     (None, _) => return Err(serde::de::Error::missing_field("prefix")),
                     (_, None) => return Err(serde::de::Error::missing_field("payload")),
                 };
-                Address::decode_payload(prefix.as_str().try_into().map_err(serde::de::Error::custom)?, &payload)
+                Address::decode_payload(prefix.as_str().try_into().map_err(serde::de::Error::custom)?, prefix.as_str(), &payload)
                     .map_err(serde::de::Error::custom)
             }
         }
@@ -511,13 +517,39 @@ mod tests {
             (Address::new(Prefix::B, Version::ScriptHash, b"1234598760"), "b:pqcnyve5x5unsdekxqeusxeyu2"),
             (Address::new(Prefix::B, Version::ScriptHash, b"abcdefghijklmnopqrstuvwxyz"), "b:ppskycmyv4nxw6rfdf4kcmtwdac8zunnw36hvamc09aqtpppz8lk"),
             (Address::new(Prefix::B, Version::ScriptHash, b"000000000000000000000000000000000000000000"), "b:pqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrq7ag684l3"),
+            (Address::new(Prefix::Testnet, Version::PubKey, &[0u8; 32]),      "zkastest:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq45699ch8"),
+            (Address::new(Prefix::Testnet, Version::PubKeyECDSA, &[0u8; 33]), "zkastest:qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqz98werzk"),
+            (Address::new(Prefix::Testnet, Version::PubKeyECDSA, b"\xba\x01\xfc\x5f\x4e\x9d\x98\x79\x59\x9c\x69\xa3\xda\xfd\xb8\x35\xa7\x25\x5e\x5f\x2e\x93\x4e\x93\x22\xec\xd3\xaf\x19\x0a\xb0\xf6\x0e"), "zkastest:qxaqrlzlf6wes72en3568khahq66wf27tuhfxn5nytkd8tcep2c0vrsvxgjus7t"),
+            (Address::new(Prefix::Mainnet, Version::PubKey, &[0u8; 32]),      "zkas:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq7fwd2pgv"),
+            (Address::new(Prefix::Mainnet, Version::PubKey, b"\x5f\xff\x3c\x4d\xa1\x8f\x45\xad\xcd\xd4\x99\xe4\x46\x11\xe9\xff\xf1\x48\xba\x69\xdb\x3c\x4e\xa2\xdd\xd9\x55\xfc\x46\xa5\x95\x22"), "zkas:qp0l70zd5x85ttwd6jv7g3s3a8llzj96d8dncn4zmhv4tlzx5k2jygc4lzm58"),
+        ]
+        // cspell:enable
+    }
+
+    /// Pre-rebrand `zkas:` strings (with checksums computed over the old
+    /// HRP) must keep decoding to the same addresses forever — miner payout
+    /// configs and saved addresses in the wild use them.
+    fn legacy_decode_cases() -> Vec<(Address, &'static str)> {
+        // cspell:disable
+        vec![
             (Address::new(Prefix::Testnet, Version::PubKey, &[0u8; 32]),      "firecashtest:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp3032w74"),
             (Address::new(Prefix::Testnet, Version::PubKeyECDSA, &[0u8; 33]), "firecashtest:qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq5gf74dqw"),
             (Address::new(Prefix::Testnet, Version::PubKeyECDSA, b"\xba\x01\xfc\x5f\x4e\x9d\x98\x79\x59\x9c\x69\xa3\xda\xfd\xb8\x35\xa7\x25\x5e\x5f\x2e\x93\x4e\x93\x22\xec\xd3\xaf\x19\x0a\xb0\xf6\x0e"), "firecashtest:qxaqrlzlf6wes72en3568khahq66wf27tuhfxn5nytkd8tcep2c0vrs6txzs7un"),
-            (Address::new(Prefix::Mainnet, Version::PubKey, &[0u8; 32]),      "firecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqquzn95rkl"),
-            (Address::new(Prefix::Mainnet, Version::PubKey, b"\x5f\xff\x3c\x4d\xa1\x8f\x45\xad\xcd\xd4\x99\xe4\x46\x11\xe9\xff\xf1\x48\xba\x69\xdb\x3c\x4e\xa2\xdd\xd9\x55\xfc\x46\xa5\x95\x22"), "firecash:qp0l70zd5x85ttwd6jv7g3s3a8llzj96d8dncn4zmhv4tlzx5k2jy2nghue25"),
+            (Address::new(Prefix::Mainnet, Version::PubKey, &[0u8; 32]),      "zkas:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqquzn95rkl"),
+            (Address::new(Prefix::Mainnet, Version::PubKey, b"\x5f\xff\x3c\x4d\xa1\x8f\x45\xad\xcd\xd4\x99\xe4\x46\x11\xe9\xff\xf1\x48\xba\x69\xdb\x3c\x4e\xa2\xdd\xd9\x55\xfc\x46\xa5\x95\x22"), "zkas:qp0l70zd5x85ttwd6jv7g3s3a8llzj96d8dncn4zmhv4tlzx5k2jy2nghue25"),
         ]
         // cspell:enable
+    }
+
+    #[test]
+    fn check_legacy_firecash_hrp_still_decodes() {
+        for (expected_address, address_str) in legacy_decode_cases() {
+            let address: Address = address_str.to_string().try_into().expect("legacy zkas: address must decode");
+            assert_eq!(address, expected_address);
+            // Re-encoding emits the canonical zkas HRP, not the legacy one.
+            let reencoded: String = address.into();
+            assert!(reencoded.starts_with("zkas"), "re-encode must use the zkas HRP: {reencoded}");
+        }
     }
 
     #[test]
@@ -537,7 +569,7 @@ mod tests {
     }
 
     /// A shielded (Orchard) address carries a 43-byte payload and round-trips
-    /// through the string form under the firecash HRP, decoding back to the
+    /// through the string form under the zkas HRP, decoding back to the
     /// same version and payload.
     #[test]
     fn shielded_orchard_address_roundtrip() {
@@ -550,7 +582,7 @@ mod tests {
 
         // Encodes under the mainnet HRP and decodes back identically.
         let s: String = (&address).into();
-        assert!(s.starts_with("firecash:"), "shielded address uses the firecash HRP: {s}");
+        assert!(s.starts_with("zkas:"), "shielded address uses the zkas HRP: {s}");
         let decoded: Address = s.clone().try_into().expect("shielded address must decode");
         assert_eq!(decoded, address);
         assert_eq!(decoded.payload.as_slice(), &raw[..]);
@@ -565,17 +597,17 @@ mod tests {
     #[test]
     fn test_errors() {
         // cspell:disable
-        let address_str: String = "firecash:qqqqqqqqqqqqq1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e".to_string();
+        let address_str: String = "zkas:qqqqqqqqqqqqq1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e".to_string();
         let address: Result<Address, AddressError> = address_str.try_into();
         assert_eq!(Err(AddressError::DecodingError('1')), address);
 
         let invalid_char = 124u8 as char;
-        let address_str: String = format!("firecash:qqqqqqqqqqqqq{invalid_char}qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e");
+        let address_str: String = format!("zkas:qqqqqqqqqqqqq{invalid_char}qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e");
         let address: Result<Address, AddressError> = address_str.try_into();
         assert_eq!(Err(AddressError::DecodingError(invalid_char)), address);
 
         let invalid_char = 129u8 as char;
-        let address_str: String = format!("firecash:qqqqqqqqqqqqq{invalid_char}qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e");
+        let address_str: String = format!("zkas:qqqqqqqqqqqqq{invalid_char}qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e");
         let address: Result<Address, AddressError> = address_str.try_into();
         assert!(matches!(address, Err(AddressError::DecodingError(_))));
 
@@ -587,11 +619,11 @@ mod tests {
         let address: Result<Address, AddressError> = address_str.try_into();
         assert_eq!(Err(AddressError::MissingPrefix), address);
 
-        let address_str: String = "firecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4l".to_string();
+        let address_str: String = "zkas:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4l".to_string();
         let address: Result<Address, AddressError> = address_str.try_into();
         assert_eq!(Err(AddressError::BadChecksum), address);
 
-        let address_str: String = "firecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e".to_string();
+        let address_str: String = "zkas:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e".to_string();
         let address: Result<Address, AddressError> = address_str.try_into();
         assert_eq!(Err(AddressError::BadChecksum), address);
         // cspell:enable

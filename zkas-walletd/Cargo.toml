@@ -1,5 +1,5 @@
 [package]
-name = "firecash-walletd"
+name = "zkas-walletd"
 description = "FireCash local wallet daemon: a non-custodial, localhost-only REST wallet over the shielded (Orchard) pool. Wraps kaspa-shielded-core (keygen, note-scan, real Halo 2 shielded spend, message sign/verify) and drives a kaspad (FireCash) node over gRPC. Keys never leave the machine."
 version.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "firecash-walletd"
+name = "zkas-walletd"
 path = "src/main.rs"
 
 [lints]

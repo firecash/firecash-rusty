@@ -4,6 +4,7 @@ use crate::mempool::{
     model::{
         pool::Pool,
         tx::{MempoolTransaction, TxRemovalReason},
+        utxo_set::shielded_nullifiers,
     },
 };
 use kaspa_consensus_core::{
@@ -70,6 +71,19 @@ impl Mempool {
         let mut transactions_to_remove = HashSet::new();
         for input in transaction.inputs.iter() {
             if let Some(redeemer_id) = self.transaction_pool.get_outpoint_owner_id(&input.previous_outpoint) {
+                transactions_to_remove.insert(*redeemer_id);
+            }
+        }
+        // Shielded spends declare their conflict via Orchard nullifiers, not
+        // transparent outpoints, so the loop above is a no-op for them. Reconcile
+        // the newly-confirmed transaction's nullifiers against the mempool the same
+        // way: any resident tx spending a now-confirmed note is a permanent double
+        // spend (its nullifier is finalized on-chain) and must be evicted, not left
+        // to be relayed and picked into templates until age-expiry. A node that
+        // never locally admitted the winning side never ran the admission-time
+        // `check_nullifier_double_spends`, so this is the only place the loser is caught.
+        for nullifier in shielded_nullifiers(transaction) {
+            if let Some(redeemer_id) = self.transaction_pool.get_nullifier_owner_id(&nullifier) {
                 transactions_to_remove.insert(*redeemer_id);
             }
         }

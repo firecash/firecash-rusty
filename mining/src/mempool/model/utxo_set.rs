@@ -117,6 +117,15 @@ impl MempoolUtxoSet {
         self.outpoint_owner_id.get(outpoint)
     }
 
+    /// The nullifier-keyed analogue of [`Self::get_outpoint_owner_id`]: the
+    /// resident mempool transaction (if any) that spends the note identified by
+    /// `nullifier`. Used to evict a losing shielded double-spend when the winning
+    /// side confirms on-chain via a block this node never admitted locally (so the
+    /// admission-time `check_nullifier_double_spends` never saw the conflict).
+    pub(crate) fn get_nullifier_owner_id(&self, nullifier: &[u8; 32]) -> Option<&TransactionId> {
+        self.nullifier_owner_id.get(nullifier)
+    }
+
     /// Make sure no other transaction in the mempool is already spending an output which one of this transaction inputs spends
     pub(crate) fn check_double_spends(&self, transaction: &MutableTransaction) -> RuleResult<()> {
         match self.get_first_double_spend(transaction) {
@@ -247,6 +256,31 @@ mod tests {
         set.remove_transaction(&tx_a, &TransactionIdSet::default());
         assert_eq!(set.nullifier_owner_count(), 0);
         assert!(set.check_nullifier_double_spends(&tx_b).is_ok());
+    }
+
+    /// The nullifier-keyed owner lookup that powers on-chain double-spend
+    /// reconciliation (F-02): a resident shielded tx is discoverable by any of its
+    /// nullifiers, and the mapping is dropped once the tx leaves the pool.
+    #[test]
+    fn nullifier_owner_lookup_tracks_residency() {
+        let mut set = MempoolUtxoSet::new();
+        let tx_a = shielded_tx(&[nf(1), nf(2)]);
+
+        // Nothing owns a note before the tx is admitted.
+        assert_eq!(set.get_nullifier_owner_id(&nf(1)), None);
+
+        set.add_transaction(&tx_a);
+        // Every one of the tx's notes resolves back to it.
+        assert_eq!(set.get_nullifier_owner_id(&nf(1)), Some(&tx_a.id()));
+        assert_eq!(set.get_nullifier_owner_id(&nf(2)), Some(&tx_a.id()));
+        // A note the tx never spent has no owner.
+        assert_eq!(set.get_nullifier_owner_id(&nf(9)), None);
+
+        // After eviction the owner map no longer references the tx (regression
+        // guard: a stale entry would let a permanently-spent note keep an owner).
+        set.remove_transaction(&tx_a, &TransactionIdSet::default());
+        assert_eq!(set.get_nullifier_owner_id(&nf(1)), None);
+        assert_eq!(set.get_nullifier_owner_id(&nf(2)), None);
     }
 
     /// A transparent transaction has no nullifiers, so it never trips the shielded

@@ -1,13 +1,13 @@
-//! `firecash-api` — the FireCash explorer backend.
+//! `firecash-api` — the ZKas explorer backend.
 //!
-//! Translates a running FireCash node's gRPC interface into the small REST +
+//! Translates a running ZKas node's gRPC interface into the small REST +
 //! shielded-pool API the explorer frontend (a fork of kaspa-explorer-ng) consumes,
 //! and follows the chain tip to maintain a live "recent blocks" feed and a running
 //! shielded-pool aggregate (notes minted, nullifiers spent, value shielded).
 //!
 //! It intentionally does NOT stand up the full kaspa-rest-server + Postgres stack:
 //! on a shielded-by-default chain most transparent address/UTXO data is empty, so
-//! the meaningful surface is blocks/DAG/coinbase plus the FireCash-specific
+//! the meaningful surface is blocks/DAG/coinbase plus the ZKas-specific
 //! `/info/shielded` endpoint — all servable straight from the node.
 
 use axum::{
@@ -36,7 +36,7 @@ const ORCHARD_SCRIPT_LEN: usize = 43;
 /// Coinbase-payload offset where the 32-byte shielded state-root commitment sits
 /// (after blue_score(8) + subsidy(8)); see consensus `processes/coinbase.rs`.
 const COMMITMENT_OFFSET: usize = 16;
-const SOMPI_PER_FC: u64 = 100_000_000;
+const SOMPI_PER_ZKAS: u64 = 100_000_000;
 /// Blocks per second. The chain relaunched at 1 BPS (v0.2.0); the halving and
 /// countdown math below is in blocks, so it must track this.
 const BPS: u64 = 1;
@@ -52,9 +52,9 @@ const RECENT_CAP: usize = 200;
 const TX_INDEX_CAP: usize = 1_000_000;
 
 #[derive(Parser, Debug)]
-#[command(name = "firecash-api", about = "FireCash explorer backend (gRPC → REST)")]
+#[command(name = "zkas-api", about = "ZKas explorer backend (gRPC → REST)")]
 struct Cli {
-    /// kaspad (FireCash) gRPC endpoint.
+    /// kaspad (ZKas) gRPC endpoint.
     #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
     rpc_server: String,
     /// Address to serve the HTTP API on.
@@ -268,7 +268,7 @@ fn ingest(block: &RpcBlock, agg: &mut ShieldedAgg) -> BlockSummary {
     }
 
     if let Some(sub) = coinbase_subsidy_sompi(block) {
-        agg.emission_per_block_fc = sub as f64 / SOMPI_PER_FC as f64;
+        agg.emission_per_block_fc = sub as f64 / SOMPI_PER_ZKAS as f64;
     }
     if let Some(root) = coinbase_state_root(block) {
         agg.state_root = root;
@@ -325,7 +325,7 @@ async fn follow(state: Arc<AppState>) {
         let mut agg = state.shielded.write().await;
         if let Some(sink_block) = backfill.last() {
             if let Some(sub) = coinbase_subsidy_sompi(sink_block) {
-                agg.emission_per_block_fc = sub as f64 / SOMPI_PER_FC as f64;
+                agg.emission_per_block_fc = sub as f64 / SOMPI_PER_ZKAS as f64;
                 if let Ok(dag) = state.client.get_block_dag_info().await {
                     agg.blue_score = dag.virtual_daa_score;
                     agg.note_count = dag.virtual_daa_score;
@@ -466,7 +466,7 @@ async fn info_coinsupply(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     // outputs); the real circulating supply is the value that has entered the
     // shielded pool via coinbase (the turnstile-in total).
     let circulating = { s.shielded.read().await.turnstile_in_sompi };
-    // FireCash emission has a PERPETUAL TAIL (the subsidy floors at 3 FC/s and never
+    // ZKas emission has a PERPETUAL TAIL (the subsidy floors at 3 FC/s and never
     // reaches zero — see the consensus `tail_subsidy`), so there is no terminal
     // supply. Reporting a finite `maxSupply` here was simply false. `null` is the
     // honest answer; consumers that need a cap have to model the tail themselves.
@@ -516,7 +516,7 @@ async fn info_shielded(State(s): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn info_feeestimate() -> impl IntoResponse {
-    // FireCash shielded txs carry a flat public fee; expose a nominal estimate.
+    // ZKas shielded txs carry a flat public fee; expose a nominal estimate.
     Json(json!({
         "priorityBucket": { "feerate": 1.0, "estimateSeconds": 1.0 },
         "normalBuckets": [{ "feerate": 1.0, "estimateSeconds": 1.0 }],
@@ -704,7 +704,7 @@ async fn transaction_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String
     };
 
     // Transparent/shielded outputs → address rows. A 43-byte Orchard script is a
-    // shielded note; render its firecash: address.
+    // shielded note; render its zkas: address.
     let outputs: Vec<Value> = tx
         .outputs
         .iter()
@@ -757,7 +757,7 @@ async fn transaction_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String
 /// Emit a transaction in the Kaspa-node JSON shape the explorer's block-details page
 /// consumes (`verboseData.transactionId`, `inputs[].previousOutpoint`, and
 /// `outputs[].verboseData.scriptPublicKeyAddress`). Shielded (43-byte) output scripts
-/// render their firecash: address.
+/// render their zkas: address.
 fn tx_json(tx: &kaspa_rpc_core::RpcTransaction) -> Value {
     let outputs = tx
         .outputs
@@ -818,7 +818,7 @@ fn tx_json(tx: &kaspa_rpc_core::RpcTransaction) -> Value {
 }
 
 /// Render a tx's outputs in the transaction-detail shape the explorer's tx page
-/// consumes, resolving shielded (43-byte Orchard) scripts to their firecash:
+/// consumes, resolving shielded (43-byte Orchard) scripts to their zkas:
 /// address. Shared by the mined-block and mempool paths.
 fn detail_outputs(tx: &kaspa_rpc_core::RpcTransaction, id: &str, accepting_block_hash: &str) -> Vec<Value> {
     tx.outputs
@@ -870,7 +870,7 @@ async fn main() {
     let client = connect(&cli.rpc_server).await;
     let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
     let network_name = dag.network.to_string();
-    log::info!("connected to FireCash node on {} (network {network_name})", cli.rpc_server);
+    log::info!("connected to ZKas node on {} (network {network_name})", cli.rpc_server);
 
     let state = Arc::new(AppState {
         client,
@@ -912,6 +912,6 @@ async fn main() {
 
     let listener =
         tokio::net::TcpListener::bind(&cli.listen).await.unwrap_or_else(|e| fatal(format!("failed to bind {}: {e}", cli.listen)));
-    log::info!("FireCash explorer API listening on http://{}", cli.listen);
+    log::info!("ZKas explorer API listening on http://{}", cli.listen);
     axum::serve(listener, app).await.unwrap_or_else(|e| fatal(format!("server error: {e}")));
 }

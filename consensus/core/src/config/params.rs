@@ -356,7 +356,7 @@ pub struct Params {
     pub coinbase_payload_script_public_key_max_len: u8,
     pub max_coinbase_payload_len: usize,
 
-    /// firecash: when true, the coinbase creates **no transparent outputs**; the
+    /// zkas: when true, the coinbase creates **no transparent outputs**; the
     /// block reward (subsidy + fees per rewarded block) enters the mandatory
     /// shielded pool as coinbase notes, minted in the virtual processor (PLAN
     /// §2.7). The miner's shielded (Orchard) address is carried in the reward's
@@ -404,13 +404,13 @@ pub struct Params {
     /// AuxPoW proof whose parent kHeavyHash clears our target (Option-2 dual acceptance).
     pub merged_mining_activation: ForkActivation,
 
-    /// firecash launch difficulty schedule — number of blocks (blue-score units) at the
+    /// ZKas launch difficulty schedule — number of blocks (blue-score units) at the
     /// start of the chain during which difficulty is **pinned** to the genesis target
     /// (super-easy) so the chain can be bootstrap-mined on CPU. `0` (together with
     /// `difficulty_ramp_blocks == 0`) disables the schedule.
     pub low_difficulty_start_blocks: u64,
 
-    /// firecash launch difficulty schedule — number of blocks (blue-score units) after the
+    /// ZKas launch difficulty schedule — number of blocks (blue-score units) after the
     /// low-difficulty start window over which the difficulty *ceiling* tightens geometrically from the
     /// genesis target toward real difficulty. After this ramp the ceiling is lifted and the
     /// pure DAA governs, so post-launch blocks are **not** easily mined. `0` disables the
@@ -727,9 +727,9 @@ impl From<NetworkId> for Params {
 }
 
 pub const MAINNET_PARAMS: Params = Params {
-    // firecash is a distinct network with its own genesis; it MUST NOT advertise or
+    // ZKas is a distinct network with its own genesis; it MUST NOT advertise or
     // dial Kaspa's DNS seeders (doing so would waste connections on genesis-mismatch
-    // rejects and leak our nodes into Kaspa's peer graph). Until firecash seeders are
+    // rejects and leak our nodes into Kaspa's peer graph). Until ZKas seeders are
     // deployed (task #28), mainnet bootstraps via explicit --connect/--addpeer.
     dns_seeders: &[],
     net: NetworkId::new(NetworkType::Mainnet),
@@ -742,7 +742,7 @@ pub const MAINNET_PARAMS: Params = Params {
     min_difficulty_window_size: MIN_DIFFICULTY_WINDOW_SIZE,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
-    // firecash is private-by-default: the mainnet coinbase creates no transparent
+    // ZKas is private-by-default: the mainnet coinbase creates no transparent
     // outputs — the reward enters the mandatory shielded pool as coinbase notes (PLAN §2.7).
     // The miner's Orchard address is carried in the reward's 43-byte script_public_key.
     shielded_coinbase: true,
@@ -766,7 +766,7 @@ pub const MAINNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
 
-    // firecash is a fresh 1-BPS-from-genesis chain (no 1→10 Crescendo history),
+    // ZKas is a fresh 1-BPS-from-genesis chain (no 1→10 Crescendo history),
     // so emission uses the 1-BPS schedule from block 0. `deflationary_phase_daa_score
     // = 0` means the smooth halving decay (3-month half-life, see coinbase.rs) applies
     // immediately — no flat pre-deflationary plateau — matching the published emission
@@ -796,7 +796,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // REVERT to 12_096_000 = day 14 for a real launch.
     merged_mining_activation: ForkActivation::always(),
 
-    // firecash launch difficulty schedule (blue-score units, 1 BPS — block counts scaled ÷10 vs
+    // ZKas launch difficulty schedule (blue-score units, 1 BPS — block counts scaled ÷10 vs
     // the prior 10-BPS values so the wall-clock windows are unchanged):
     //  - first 5_000 blocks (~1.4 h): difficulty pinned to the (super-easy) genesis target → CPU-mineable low-difficulty start.
     //  - next 20_000 blocks: the difficulty *ceiling* tightens geometrically toward real difficulty;
@@ -938,7 +938,7 @@ pub const DEVNET_PARAMS: Params = Params {
     min_difficulty_window_size: MIN_DIFFICULTY_WINDOW_SIZE,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
-    // firecash devnet is private-by-default like mainnet: the coinbase mints its
+    // ZKas devnet is private-by-default like mainnet: the coinbase mints its
     // reward into the shielded pool, so there is a note to spend privately. A live
     // shielded payment over RPC (blocker #2) is provable here because the note
     // matures after `shielded_anchor_depth` (~10 min), not the full finality window.

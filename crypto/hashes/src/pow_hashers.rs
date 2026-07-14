@@ -65,7 +65,7 @@ impl KHeavyHash {
 // ===========================================================================
 // FishHashPlus (KarlsenHashV2) — a memory-hard, ASIC-resistant, Ethash-derived
 // proof-of-work. Ported from rusty-karlsen (which itself derives from the
-// Iron Fish `fish-hash-plus` reference). firecash uses this instead of
+// Iron Fish `fish-hash-plus` reference). ZKas uses this instead of
 // kHeavyHash so mining is GPU-centric. The "Plus" variant is the XOR-folded
 // `mix_group` index derivation in the kernel (fully ASIC-resistant hardening).
 //

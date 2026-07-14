@@ -298,14 +298,14 @@ async fn template_mining_sanity_test() {
 /// and the block would not be UTXO-valid). No transparent coinbase value is created.
 #[tokio::test]
 async fn shielded_coinbase_mints_into_the_pool_live() {
-    // firecash main params with the shielded coinbase turned on.
+    // ZKas main params with the shielded coinbase turned on.
     let mut params = MAINNET_PARAMS.clone();
     params.shielded_coinbase = true;
     let config = ConfigBuilder::new(params).skip_proof_of_work().build();
 
     let mut ctx = TestContext::new(TestConsensus::new(&config));
     // The miner is paid in the shielded pool: its reward "script_public_key" is a
-    // real 43-byte Orchard address (what a firecash miner reports).
+    // real 43-byte Orchard address (what a ZKas miner reports).
     let recipient = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("valid orchard address");
     ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)), vec![]);
 

@@ -70,7 +70,7 @@ impl From<(&Header, &'static [u8])> for GenesisBlock {
 
 /// The genesis block of the block-DAG which serves as the public transaction ledger for the main network.
 ///
-/// firecash cuts a **fresh** mainnet genesis (unlike Kaspa's checkpoint-style genesis at
+/// ZKas cuts a **fresh** mainnet genesis (unlike Kaspa's checkpoint-style genesis at
 /// daa_score 1312860): daa_score 0, an empty UTXO commitment, and an easy initial difficulty
 /// (`bits`) which the launch difficulty schedule pins to during the low-difficulty start
 /// (see `SampledDifficultyManager`). This makes the chain mineable from block 1 on CPU.
@@ -85,7 +85,7 @@ pub const GENESIS: GenesisBlock = GenesisBlock {
         0x16, 0xb7, 0x06, 0x2d, 0x23, 0x40, 0xd5, 0x81, 0xf6, 0x0e, 0x4e,
     ]),
     utxo_commitment: EMPTY_MUHASH,
-    // 2026-07-01 00:00:00 UTC — firecash mainnet launch anchor.
+    // 2026-07-01 00:00:00 UTC — ZKas mainnet launch anchor.
     timestamp: 1782864000000,
     // Easy initial difficulty for the CPU low-difficulty start (same as testnet).
     bits: 0x1e7fffff,

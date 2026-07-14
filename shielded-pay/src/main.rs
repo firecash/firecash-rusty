@@ -1,4 +1,4 @@
-//! `shielded-pay` — a live shielded-payment client for the firecash network
+//! `shielded-pay` — a live shielded-payment client for the ZKas network
 //! (PLAN §2.10, blocker #2). It closes the last gap between the shielded wallet
 //! primitives and a running node: it reconstructs a mined coinbase note, builds a
 //! **real** Orchard spend of it (Halo 2 proof + spend-auth signature) paying a
@@ -54,7 +54,7 @@ const ORCHARD_SCRIPT_LEN: usize = 43;
 const DEFAULT_ANCHOR_DEPTH: u64 = 6000;
 
 #[derive(Parser, Debug)]
-#[command(name = "shielded-pay", about = "Build and submit a real shielded payment over RPC (firecash)")]
+#[command(name = "shielded-pay", about = "Build and submit a real shielded payment over RPC (ZKas)")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -212,7 +212,8 @@ fn prefix_from(network: &str) -> Prefix {
 /// two must be given.
 ///
 /// `--seed-byte` spans only 256 seeds — anyone can enumerate all of them and sweep
-/// the wallet — so it is refused unless `FIRECASH_TEST_SEED=1` is set in the
+/// the wallet — so it is refused unless `ZKAS_TEST_SEED=1` (or the legacy
+/// `FIRECASH_TEST_SEED=1`) is set in the
 /// environment. That gate covers every subcommand at once, including the ones that
 /// take an RPC endpoint rather than a network name, so a throwaway test key can
 /// never be used against real funds by accident.
@@ -221,11 +222,11 @@ fn resolve_seed(seed_hex: Option<String>, seed_byte: Option<u8>) -> [u8; 32] {
         (Some(_), Some(_)) => fatal("give either --seed-hex or --seed-byte, not both".into()),
         (None, None) => fatal("a seed is required: pass --seed-hex <64 hex chars> (or --seed-byte <0-255> for a test wallet)".into()),
         (None, Some(b)) => {
-            if std::env::var("FIRECASH_TEST_SEED").as_deref() != Ok("1") {
+            if std::env::var("ZKAS_TEST_SEED").as_deref() != Ok("1") && std::env::var("FIRECASH_TEST_SEED").as_deref() != Ok("1") {
                 fatal(
                     "--seed-byte derives the seed [byte; 32]: only 256 wallets exist, all trivially sweepable. \
                      Use --seed-hex <64 hex chars> for any wallet holding value. \
-                     To use it anyway on a throwaway test wallet, set FIRECASH_TEST_SEED=1."
+                     To use it anyway on a throwaway test wallet, set ZKAS_TEST_SEED=1."
                         .into(),
                 );
             }
@@ -531,7 +532,7 @@ async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64,
         let have: u64 = candidates.iter().map(|n| n.value()).sum();
         if have >= need {
             fatal(format!(
-                "amount needs more than {max_spends} input notes (standard tx size cap): max sendable in one tx is {} — send in chunks (or consolidate via firecash-walletd /api/wallet/consolidate)",
+                "amount needs more than {max_spends} input notes (standard tx size cap): max sendable in one tx is {} — send in chunks (or consolidate via zkas-walletd /api/wallet/consolidate)",
                 selected.saturating_sub(fee)
             ));
         }

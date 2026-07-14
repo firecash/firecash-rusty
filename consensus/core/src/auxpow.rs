@@ -1,4 +1,4 @@
-//! Merged-mining (AuxPoW) support — the data carried by a FireCash block that is
+//! Merged-mining (AuxPoW) support — the data carried by a ZKas block that is
 //! mined *on top of* a parent (Kaspa) kHeavyHash block instead of natively
 //! (PLAN: merged mining, "Option 2" dual-acceptance). This module owns the
 //! **structural** half of AuxPoW verification (commitment extraction + coinbase
@@ -8,7 +8,7 @@
 //!
 //! ## The binding chain
 //!
-//! A FireCash block is identified by its header hash `H_fc` (see
+//! A ZKas block is identified by its header hash `H_fc` (see
 //! [`crate::hashing::header::hash`]) — which does **not** cover any AuxPoW data, so
 //! it is a stable commitment. To prove that real kHeavyHash work was spent on this
 //! exact block, the miner:
@@ -42,8 +42,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::Hash;
 use serde::{Deserialize, Serialize};
 
-/// The 4-byte tag that marks the 32-byte FireCash block commitment inside a parent
-/// coinbase payload. "FireCash Merged Mining".
+/// The 4-byte tag that marks the 32-byte ZKas block commitment inside a parent
+/// coinbase payload. "ZKas Merged Mining".
 pub const MERGE_MINE_MAGIC: [u8; 4] = *b"FCMM";
 
 /// Hard cap on [`AuxPow::coinbase_merkle_branch`] length. The branch has one entry
@@ -57,9 +57,9 @@ pub const MERGE_MINE_MAGIC: [u8; 4] = *b"FCMM";
 /// it. Rejecting an over-long branch is free and cannot refuse an honest block.
 pub const MAX_COINBASE_MERKLE_BRANCH: usize = 64;
 
-/// The proof that a FireCash block was mined on top of a parent kHeavyHash block.
+/// The proof that a ZKas block was mined on top of a parent kHeavyHash block.
 ///
-/// Travels alongside the FireCash header (it is deliberately *not* part of the
+/// Travels alongside the ZKas header (it is deliberately *not* part of the
 /// header hash `H_fc`, so the commitment stays stable). Derives borsh only, to
 /// match [`Transaction`] and be storable / wire-serializable.
 // `Header` implements neither `PartialEq` nor `Eq`, so `AuxPow` cannot derive them.
@@ -84,9 +84,15 @@ pub struct AuxPow {
 }
 
 impl AuxPow {
-    /// Extract the single 32-byte commitment tagged by [`MERGE_MINE_MAGIC`] in the
-    /// parent coinbase payload. Returns `None` unless the magic occurs **exactly
-    /// once** and is followed by a full 32 bytes.
+    /// Extract the single commitment tagged by [`MERGE_MINE_MAGIC`] in the parent
+    /// coinbase payload. Returns `None` unless the magic occurs **exactly once** and is
+    /// followed by a full [`COMMITMENT_HEX_LEN`] lowercase-hex encoding of the 32-byte
+    /// hash.
+    ///
+    /// The commitment is hex (ASCII), not raw bytes, because it travels through Kaspa's
+    /// `getBlockTemplate` `extraData` field — a protobuf **string** that must be valid
+    /// UTF-8. Real 32-byte block hashes are almost never valid UTF-8, so raw bytes
+    /// cannot be carried there; the 64-char hex encoding always can.
     pub fn committed_hash(&self) -> Option<Hash> {
         let payload = self.parent_coinbase.payload.as_slice();
         let mut found: Option<Hash> = None;
@@ -101,13 +107,14 @@ impl AuxPow {
                     return None;
                 }
                 let start = i + MERGE_MINE_MAGIC.len();
-                let end = start + 32;
+                let end = start + COMMITMENT_HEX_LEN;
                 if end > payload.len() {
                     // Magic present but truncated commitment ⇒ malformed ⇒ reject.
                     return None;
                 }
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(&payload[start..end]);
+                // Magic present but the following bytes aren't valid hex ⇒ malformed ⇒
+                // reject (errs safe: never turns an invalid block valid).
+                let bytes = decode_hex32(&payload[start..end])?;
                 found = Some(Hash::from_bytes(bytes));
                 // Continue scanning to ensure the magic is unique.
                 i = start; // skip past the magic; overlap-free is fine for uniqueness
@@ -143,14 +150,50 @@ impl AuxPow {
     }
 
     /// Build the coinbase payload bytes a miner should use: `prefix || MAGIC ||
-    /// H_fc || suffix`. Helper for miners/tests; consensus never calls this.
+    /// hex(H_fc) || suffix`. The commitment is lowercase-hex (ASCII) so it survives
+    /// Kaspa's `getBlockTemplate` `extraData` (a protobuf UTF-8 string). Helper for
+    /// miners/tests; consensus never calls this.
     pub fn embed_commitment(prefix: &[u8], commitment: Hash, suffix: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(prefix.len() + MERGE_MINE_MAGIC.len() + 32 + suffix.len());
+        let hex = encode_hex32(&commitment.as_bytes());
+        let mut out = Vec::with_capacity(prefix.len() + MERGE_MINE_MAGIC.len() + hex.len() + suffix.len());
         out.extend_from_slice(prefix);
         out.extend_from_slice(&MERGE_MINE_MAGIC);
-        out.extend_from_slice(&commitment.as_bytes());
+        out.extend_from_slice(&hex);
         out.extend_from_slice(suffix);
         out
+    }
+}
+
+/// The commitment is carried as 64 lowercase-hex ASCII chars (32-byte hash), so it is
+/// valid UTF-8 for Kaspa's `getBlockTemplate` `extraData` string field.
+pub const COMMITMENT_HEX_LEN: usize = 64;
+
+fn encode_hex32(bytes: &[u8; 32]) -> [u8; COMMITMENT_HEX_LEN] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; COMMITMENT_HEX_LEN];
+    for (i, &b) in bytes.iter().enumerate() {
+        out[2 * i] = HEX[(b >> 4) as usize];
+        out[2 * i + 1] = HEX[(b & 0x0f) as usize];
+    }
+    out
+}
+
+fn decode_hex32(s: &[u8]) -> Option<[u8; 32]> {
+    if s.len() != COMMITMENT_HEX_LEN {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (o, pair) in out.iter_mut().zip(s.chunks_exact(2)) {
+        *o = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(out)
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None, // uppercase / non-hex rejected: embed_commitment always writes lowercase
     }
 }
 
@@ -217,12 +260,9 @@ mod tests {
 
     #[test]
     fn two_magics_is_ambiguous_and_rejected() {
-        // prefix contains a MAGIC too → two occurrences → None.
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&MERGE_MINE_MAGIC);
-        payload.extend_from_slice(&[0u8; 32]);
-        payload.extend_from_slice(&MERGE_MINE_MAGIC);
-        payload.extend_from_slice(&hfc().as_bytes());
+        // Two well-formed MAGIC || hex(commitment) occurrences → ambiguous → None.
+        let mut payload = AuxPow::embed_commitment(&[], Hash::from_bytes([0u8; 32]), &[]);
+        payload.extend_from_slice(&AuxPow::embed_commitment(&[], hfc(), &[]));
         let cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, payload);
         let aux = AuxPow {
             parent_header: Header::from_precomputed_hash(Default::default(), vec![]),
@@ -236,7 +276,7 @@ mod tests {
     fn truncated_commitment_rejected() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&MERGE_MINE_MAGIC);
-        payload.extend_from_slice(&[0u8; 10]); // fewer than 32 bytes follow
+        payload.extend_from_slice(&[b'0'; 10]); // fewer than 64 hex chars follow
         let cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, payload);
         let aux = AuxPow {
             parent_header: Header::from_precomputed_hash(Default::default(), vec![]),
@@ -319,6 +359,6 @@ mod tests {
         let cb = coinbase_committing(hfc());
         let (header, branch) = parent_with(cb.clone(), vec![]);
         let aux = AuxPow { parent_header: header, parent_coinbase: cb, coinbase_merkle_branch: branch };
-        assert!(!aux.verify_binding(Hash::from_bytes([0x11u8; 32])), "commitment must equal the FireCash block hash");
+        assert!(!aux.verify_binding(Hash::from_bytes([0x11u8; 32])), "commitment must equal the ZKas block hash");
     }
 }

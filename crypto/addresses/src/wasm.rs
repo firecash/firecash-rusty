@@ -67,9 +67,10 @@ impl TryCastFromJs for Address {
             if let Some(string) = value.as_ref().as_string() {
                 Address::try_from(string.trim())
             } else if let Some(object) = js_sys::Object::try_from(value.as_ref()) {
-                let prefix: Prefix = object.get_string("prefix")?.as_str().try_into()?;
+                let prefix_str = object.get_string("prefix")?;
+                let prefix: Prefix = prefix_str.as_str().try_into()?;
                 let payload = object.get_string("payload")?;
-                Address::decode_payload(prefix, &payload)
+                Address::decode_payload(prefix, prefix_str.as_str(), &payload)
             } else {
                 Err(AddressError::InvalidAddress)
             }

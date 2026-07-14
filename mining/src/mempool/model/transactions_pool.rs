@@ -299,6 +299,13 @@ impl TransactionsPool {
         self.utxo_set.get_outpoint_owner_id(outpoint)
     }
 
+    /// The resident mempool transaction (if any) spending the shielded note
+    /// identified by `nullifier` — the nullifier-keyed analogue of
+    /// [`Self::get_outpoint_owner_id`].
+    pub(crate) fn get_nullifier_owner_id(&self, nullifier: &[u8; 32]) -> Option<&TransactionId> {
+        self.utxo_set.get_nullifier_owner_id(nullifier)
+    }
+
     /// Make sure no other transaction in the mempool is already spending an output which one of this transaction inputs spends
     pub(crate) fn check_double_spends(&self, transaction: &MutableTransaction) -> RuleResult<()> {
         self.utxo_set.check_double_spends(transaction)

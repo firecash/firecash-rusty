@@ -26,8 +26,8 @@ const MIN_PAYLOAD_LENGTH: usize = LENGTH_OF_BLUE_SCORE
 // SECONDS_PER_MONTH = 30.4375 * 24 * 60 * 60
 const SECONDS_PER_MONTH: u64 = 2629800;
 
-// firecash monetary policy: the block subsidy follows the shape of Kaspa's `SUBSIDY_BY_MONTH_TABLE`
-// but with two firecash-specific transforms:
+// ZKas monetary policy: the block subsidy follows the shape of Kaspa's `SUBSIDY_BY_MONTH_TABLE`
+// but with two ZKas-specific transforms:
 //   1. It halves every 3 months instead of every 12. Kaspa's table encodes a smooth decay with
 //      `LEGACY_MONTHS_PER_HALVING` (=12) monthly steps per halving; we traverse it
 //      `LEGACY_MONTHS_PER_HALVING / SUBSIDY_HALVING_INTERVAL_MONTHS` = 4× faster so a full halving
@@ -44,20 +44,20 @@ const SUBSIDY_HALVING_INTERVAL_MONTHS: u64 = 3;
 // The number of monthly table steps that constitute one halving in Kaspa's original table.
 const LEGACY_MONTHS_PER_HALVING: u64 = 12;
 
-// firecash reward scale (see monetary-policy note above): each Kaspa table value is multiplied by
+// ZKas reward scale (see monetary-policy note above): each Kaspa table value is multiplied by
 // REWARD_SCALE_NUM/REWARD_SCALE_DEN before the BPS division. 3/22 sets the initial 10-BPS subsidy to
 // 6 FC/block (44 FC × 3/22).
 const REWARD_SCALE_NUM: u64 = 3;
 const REWARD_SCALE_DEN: u64 = 22;
 
-// Convert a raw Kaspa 1-BPS monthly-table value into the firecash per-block subsidy for `bps`:
+// Convert a raw Kaspa 1-BPS monthly-table value into the ZKas per-block subsidy for `bps`:
 // apply the reward scale, then divide by BPS. u128 intermediate avoids overflow.
 #[inline]
 fn scaled_subsidy(table_value: u64, bps: u64) -> u64 {
     ((table_value.div_ceil(bps) as u128) * REWARD_SCALE_NUM as u128 / REWARD_SCALE_DEN as u128) as u64
 }
 
-// Two-step perpetual tail emission (firecash): once the deflationary curve decays below the tail
+// Two-step perpetual tail emission (ZKas): once the deflationary curve decays below the tail
 // floor, every rewarded block keeps paying a fixed tail subsidy forever, funding long-term miner
 // security after the main emission curve is effectively exhausted. The tail steps down once.
 //
@@ -126,7 +126,7 @@ impl CoinbaseManager {
     ) -> Self {
         // Precomputed subsidy by month table for the actual block per second rate.
         // Values are rounded up per BPS (keeping the same number of rewarding months as the original
-        // 1 BPS table) and then scaled by the firecash reward scale (see `scaled_subsidy`).
+        // 1 BPS table) and then scaled by the ZKas reward scale (see `scaled_subsidy`).
         let subsidy_by_month_table_before: SubsidyByMonthTable =
             core::array::from_fn(|i| scaled_subsidy(SUBSIDY_BY_MONTH_TABLE[i], bps_history.before()));
         let subsidy_by_month_table_after: SubsidyByMonthTable =
@@ -361,7 +361,7 @@ impl CoinbaseManager {
             / (SECONDS_PER_MONTH as u128 * SUBSIDY_HALVING_INTERVAL_MONTHS as u128)) as u64;
         assert!(table_index <= usize::MAX as u64);
         let table_index: usize = table_index as usize;
-        // 1-BPS curve value with the firecash reward scale applied (no tail floor; used for tests).
+        // 1-BPS curve value with the ZKas reward scale applied (no tail floor; used for tests).
         let table_value = if table_index >= SUBSIDY_BY_MONTH_TABLE.len() {
             *SUBSIDY_BY_MONTH_TABLE.last().unwrap()
         } else {
@@ -415,7 +415,7 @@ mod tests {
         let pre_deflationary_rewards = legacy_cbm.pre_deflationary_phase_base_subsidy * legacy_cbm.deflationary_phase_daa_score;
         let total_rewards: u64 = pre_deflationary_rewards + SUBSIDY_BY_MONTH_TABLE.iter().map(|x| x * SECONDS_PER_MONTH).sum::<u64>();
         let testnet_11_bps = SIMNET_PARAMS.bps();
-        // Reference per-block reward for each month = firecash-scaled, BPS-rounded table value.
+        // Reference per-block reward for each month = ZKas-scaled, BPS-rounded table value.
         let total_high_bps_rewards_rounded_up: u64 = pre_deflationary_rewards
             + SUBSIDY_BY_MONTH_TABLE
                 .iter()
@@ -541,7 +541,7 @@ mod tests {
         const PRE_DEFLATIONARY_PHASE_BASE_SUBSIDY: u64 = 50000000000;
         const DEFLATIONARY_PHASE_INITIAL_SUBSIDY: u64 = 44000000000;
         const SECONDS_PER_MONTH: u64 = 2629800;
-        // firecash halves every 3 months (see SUBSIDY_HALVING_INTERVAL_MONTHS).
+        // ZKas halves every 3 months (see SUBSIDY_HALVING_INTERVAL_MONTHS).
         const SECONDS_PER_HALVING: u64 = SECONDS_PER_MONTH * 3;
 
         for network_id in NetworkId::iter() {
@@ -554,7 +554,7 @@ mod tests {
             let bps = params.bps_history().before();
 
             let pre_deflationary_phase_base_subsidy = PRE_DEFLATIONARY_PHASE_BASE_SUBSIDY / bps;
-            // Initial deflationary subsidy carries the firecash reward scale (see `scaled_subsidy`).
+            // Initial deflationary subsidy carries the ZKas reward scale (see `scaled_subsidy`).
             let deflationary_phase_initial_subsidy = scaled_subsidy(DEFLATIONARY_PHASE_INITIAL_SUBSIDY, bps);
             let blocks_per_halving = SECONDS_PER_HALVING * bps;
 
