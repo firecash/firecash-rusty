@@ -1129,15 +1129,78 @@ impl AppState {
             log::info!("wallet birthday {birthday} precedes fast-sync checkpoint (daa {}); full scan required", cp.daa_score);
             return None;
         }
+        // Default start = the finality checkpoint. But when the wallet's birthday is
+        // meaningfully later than the checkpoint, don't replay the whole finality window
+        // (tens of thousands of blocks of sequential Sinsemilla tree-building — the "super
+        // slow even though I set a birthday" report). The node retains a per-block tree
+        // frontier for every selected-chain block, so walk the chain to the birthday block
+        // (metadata only, no tree work) and start the tree from *that* block's frontier.
+        // Sound because a birthday asserts the wallet holds no notes before it. Any failure
+        // (RPC hiccup, tip reached early) falls back to the checkpoint start.
+        let (start_hash, start_daa, start_size, start_leaf, start_ommers) =
+            match self.birthday_start(cp.block_hash, birthday).await {
+                Some(s) => s,
+                None => (cp.block_hash, cp.daa_score, cp.size, cp.leaf, cp.ommers),
+            };
+        if start_daa > cp.daa_score {
+            log::info!("fast-sync from birthday block daa {start_daa} (checkpoint daa {}) — skipped {} blocks of replay", cp.daa_score, start_daa - cp.daa_score);
+        }
         let fs = FrontierState {
-            size: cp.size,
-            leaf: (cp.size > 0).then(|| cp.leaf.as_bytes()),
-            ommers: cp.ommers.iter().map(|h| h.as_bytes()).collect(),
+            size: start_size,
+            leaf: (start_size > 0).then(|| start_leaf.as_bytes()),
+            ommers: start_ommers.iter().map(|h| h.as_bytes()).collect(),
         };
         let db = key.db_from_frontier(&fs)?;
-        // low = the checkpoint chain block; sync resumes strictly after it.
+        // low = the start chain block; sync resumes strictly after it.
         // Progress is proxied by its DAA score so status reads "near tip".
-        Some(WalletEntry::from_parts(key, db, guard, cp.block_hash, cp.daa_score as usize, VecDeque::new(), 0))
+        Some(WalletEntry::from_parts(key, db, guard, start_hash, start_daa as usize, VecDeque::new(), 0))
+    }
+
+    /// Walk the selected chain forward from the finality checkpoint `from` until the
+    /// first block whose DAA score reaches `birthday`, and return that block's retained
+    /// shielded tree frontier `(hash, daa, size, leaf, ommers)`. Metadata-only: it reads
+    /// only each block's hash + daa from `GetShieldedBlocks` (no tree work), so skipping
+    /// a large finality window is cheap. Returns `None` on any RPC error, a reorg during
+    /// the walk, or if the tip is reached before `birthday` — the caller then starts from
+    /// the checkpoint as before.
+    async fn birthday_start(&self, from: RpcHash, birthday: u64) -> Option<(RpcHash, u64, u64, RpcHash, Vec<RpcHash>)> {
+        const WALK_PAGE: u64 = 2000; // RPC MAX_LIMIT — few round-trips across the window
+        let mut cursor = from;
+        // The last selected-chain block seen with daa < birthday. The tree starts from
+        // ITS frontier so that scanning resumes at (and trial-decrypts) the birthday block
+        // itself — a note received *in* the birthday block must not be skipped.
+        let mut base_below: Option<RpcHash> = None;
+        // Bound the walk (a 2000-block page × this cap covers many millions of blocks).
+        for _ in 0..4000 {
+            let page = self.client.get_shielded_blocks(cursor, WALK_PAGE).await.ok()?;
+            if page.reorged {
+                return None;
+            }
+            let Some(last) = page.blocks.last() else { return None };
+            if last.daa_score >= birthday {
+                // Birthday reached within this page. Advance `base_below` to the last block
+                // still strictly below it, then start the tree from that block's frontier.
+                for b in &page.blocks {
+                    if b.daa_score >= birthday {
+                        break;
+                    }
+                    base_below = Some(b.hash);
+                }
+                // No block below birthday anywhere (birthday <= first block past the
+                // checkpoint) → nothing to skip; let the caller start from the checkpoint.
+                let base = base_below?;
+                let ts = self.client.get_shielded_tree_state(Some(base)).await.ok()?;
+                return Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers));
+            }
+            base_below = Some(last.hash);
+            cursor = last.hash;
+            // Short page → reached the tip before birthday; nothing gained over the
+            // checkpoint start, so let the caller fall back.
+            if (page.blocks.len() as u64) < WALK_PAGE {
+                return None;
+            }
+        }
+        None
     }
 
     /// Full-history wallet entry: the tree is anchored at the **pruning-point
