@@ -407,18 +407,27 @@ impl WalletDb {
             if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
                 continue;
             }
-            // An action reveals the nullifier of the note it spends: if it is one of
-            // ours, that value is on its way out (this is what makes a *sender* see the
-            // spend immediately).
-            for action in &bundle.actions {
-                if let Some(n) = self.notes.iter().find(|n| n.nullifier == action.nullifier) {
-                    p.outgoing += n.value() as u128;
-                }
-            }
-            // ...and anything decryptable to our ivk is on its way in — a payment to us,
-            // or our own change coming back.
-            for r in scan_bundle(&self.ivk, bundle) {
-                p.incoming += r.note.value().inner() as u128;
+            // What this bundle takes from us: an action reveals the nullifier of the note it
+            // spends, so a nullifier we recognise is one of our notes leaving.
+            let spent: u128 = bundle
+                .actions
+                .iter()
+                .filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier))
+                .map(|n| n.value() as u128)
+                .sum();
+            // What this bundle gives us: anything decryptable to our ivk.
+            let received: u128 = scan_bundle(&self.ivk, bundle).iter().map(|r| r.note.value().inner() as u128).sum();
+
+            if spent > 0 {
+                // OUR OWN spend. The received part is our CHANGE coming back, not an
+                // incoming payment — reporting it as `incoming` made the *sender's* wallet
+                // announce "+4 ZKAS incoming" for their own change while also showing the
+                // whole 5-ZKAS note as sent, so the displayed balance swung 5 -> 4 -> 5.
+                // Only the net outflow (amount + fee) is real movement.
+                p.outgoing += spent.saturating_sub(received);
+            } else {
+                // Nothing of ours was spent, so this is money genuinely arriving.
+                p.incoming += received;
             }
         }
         p
