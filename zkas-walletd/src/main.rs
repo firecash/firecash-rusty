@@ -456,6 +456,18 @@ const ACTIVE_SYNC_WINDOW: std::time::Duration = std::time::Duration::from_secs(9
 
 /// Real sleep between wallets in the sync loop, to guarantee CPU headroom for the HTTP
 /// handlers even while scans run. Caps sync throughput; keeps the daemon responsive.
+/// Hard ceiling on any single node RPC made from the shared sync loop. The loop drives
+/// every wallet sequentially, so an un-timed-out await there is a whole-daemon stall, not
+/// a one-wallet stall (see `sync_chunk`). Generous enough that a merely busy node is never
+/// mistaken for a dead one.
+const SYNC_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often the sync loop re-checks the chain + mempool once every active wallet is
+/// caught up. This is the floor on how fast an incoming payment can appear, so it is a
+/// UX number, not a throughput one.
+const IDLE_SYNC_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often the dedicated mempool loop looks for unmined payments. This is the floor on
+/// "the receiver's screen changed" — keep it fast; the work behind it is trivial.
+const MEMPOOL_POLL: std::time::Duration = std::time::Duration::from_millis(700);
 const SYNC_WALLET_THROTTLE_MS: u64 = 150;
 /// Sleep after each ingested page inside a wallet's chunk, same reason (a single page
 /// is ~200 blocks of pure-CPU trial decryption with no natural await).
@@ -711,6 +723,17 @@ struct WalletEntry {
     /// the append-only tree. This is what makes a payment visible ~1 second after it is
     /// mined instead of ~3 minutes later when SYNC_TIP_MARGIN clears.
     preview: Preview,
+    /// Balance effect of shielded txs sitting in the node's **mempool** — not mined yet,
+    /// not in any block. Trial-decrypting these is what makes an incoming payment visible
+    /// within a second of being broadcast instead of only after it is mined AND the sync
+    /// loop next runs. Costs nothing on-chain: it never touches the tree, and if the tx is
+    /// dropped the figure simply disappears (the same contract as any 0-conf balance).
+    mempool: Preview,
+    /// Nullifiers of the bundles already counted in `preview` (the unsettled blocks).
+    /// A tx that has just been mined can still linger in the mempool for a moment, and
+    /// counting it from both places would briefly double the pending amount — so mempool
+    /// bundles whose nullifiers appear here are skipped.
+    unsettled_nulls: HashSet<kaspa_shielded_core::nullifier::NullifierBytes>,
 }
 
 /// How many chain-block→leaf boundaries [`WalletEntry`] keeps. Anchor maturity is
@@ -753,7 +776,22 @@ impl WalletEntry {
             sink_blue,
             reorged_strikes: 0,
             preview: Preview::default(),
+            mempool: Preview::default(),
+            unsettled_nulls: HashSet::new(),
         }
+    }
+
+    /// Trial-decrypt the shielded bundles currently in the node's mempool and record what
+    /// they would do to this wallet. Purely a display figure: no tree mutation, no leaf,
+    /// no position — so it carries none of the reorg hazard that keeps `sync_chunk` from
+    /// ingesting unsettled blocks. This is what makes an incoming payment appear about a
+    /// second after the sender hits Confirm, rather than only after it has been mined.
+    fn scan_mempool(&mut self, bundles: &[ShieldedBundle]) {
+        // Skip anything already counted from the unsettled blocks: a just-mined tx can
+        // still linger in the mempool, and counting it twice would double the pending sum.
+        let fresh: Vec<&ShieldedBundle> =
+            bundles.iter().filter(|b| !b.actions.iter().any(|a| self.unsettled_nulls.contains(&a.nullifier))).collect();
+        self.mempool = if fresh.is_empty() { Preview::default() } else { self.db.preview_block(&[], &fresh) };
     }
 
     /// Advance this wallet by up to `PAGES_PER_CHUNK` pages of new **chain**
@@ -763,9 +801,23 @@ impl WalletEntry {
     /// append-only tree must not ingest anything a routine reorg could replace).
     async fn sync_chunk(&mut self, client: &GrpcClient, cache: &Mutex<PageCache>) {
         for _ in 0..PAGES_PER_CHUNK {
-            let resp = match fetch_shielded_page(client, cache, self.low).await {
-                Ok(r) => r,
-                Err(e) => {
+            // HARD TIMEOUT. There is ONE sync loop for every wallet, and it advances them
+            // sequentially — so an await here that never returns does not stall one wallet,
+            // it stalls ALL of them, forever. That was a live outage: a hung page fetch
+            // froze the loop, so no wallet's cursor advanced, `sink_blue` went stale, the
+            // maturity cutoff never moved, and every wallet's whole balance showed as
+            // "maturing" and unspendable — indistinguishable from a broken wallet, and only
+            // a daemon restart cleared it. A timed-out page is treated exactly like any
+            // other transient node failure: keep the checkpoint, record it, move on.
+            let fetched = tokio::time::timeout(SYNC_RPC_TIMEOUT, fetch_shielded_page(client, cache, self.low)).await;
+            let resp = match fetched {
+                Ok(Ok(r)) => r,
+                Err(_elapsed) => {
+                    log::warn!("wallet sync page timed out after {SYNC_RPC_TIMEOUT:?} (checkpoint kept); will retry next pass");
+                    self.error = Some("node is slow to answer; retrying".into());
+                    return;
+                }
+                Ok(Err(e)) => {
                     // Distinguish "cursor no longer known" (pruned / relaunched — needs a
                     // rescan) from a transient node failure. Only a definitive
                     // `BlockNotFound` for our cursor counts: any other error (timeout,
@@ -773,11 +825,16 @@ impl WalletEntry {
                     // evidence about the cursor at all. Even then, take a single strike and
                     // require REORG_STRIKES *consecutive* passes to agree — a node that is
                     // merely slow must never be able to delete a wallet's scan history.
-                    let gone = match client.get_block(self.low, false).await {
-                        Err(probe) => probe.to_string().contains(BLOCK_NOT_FOUND),
-                        Ok(_) => false,
+                    // Both probes are timed out too — they run on the same shared loop, so a
+                    // hang here would freeze every wallet just as surely as the fetch above.
+                    let gone = match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block(self.low, false)).await {
+                        Ok(Err(probe)) => probe.to_string().contains(BLOCK_NOT_FOUND),
+                        Ok(Ok(_)) => false,
+                        Err(_) => false, // timed out: says nothing about the cursor
                     };
-                    if gone && client.get_block_dag_info().await.is_ok() {
+                    let node_alive =
+                        matches!(tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block_dag_info()).await, Ok(Ok(_)));
+                    if gone && node_alive {
                         self.reorged_strikes += 1;
                         self.error = Some("wallet cursor no longer known to the node; rescanning".into());
                     } else {
@@ -807,13 +864,22 @@ impl WalletEntry {
                     // when the margin clears. Recomputed from scratch each pass (not
                     // accumulated), so it self-corrects if a block drops out.
                     let mut preview = Preview::default();
+                    let mut nulls = HashSet::new();
                     for u in &resp.blocks[i..] {
                         let bundle_refs: Vec<&ShieldedBundle> = u.bundles.iter().collect();
                         let cb: Vec<(CoinbaseNoteDesc, u64)> =
                             u.coinbase.iter().map(|(d, v, _)| (d.clone(), *v)).collect();
                         preview.add(self.db.preview_block(&cb, &bundle_refs));
+                        // Remember what these blocks spend, so the same tx still sitting in
+                        // the mempool is not counted a second time (see `mempool`).
+                        for b in &bundle_refs {
+                            for a in &b.actions {
+                                nulls.insert(a.nullifier);
+                            }
+                        }
                     }
                     self.preview = preview;
+                    self.unsettled_nulls = nulls;
                     at_margin = true;
                     break;
                 }
@@ -833,6 +899,7 @@ impl WalletEntry {
             if !at_margin {
                 // No unsettled blocks in this page — nothing is pending from the margin.
                 self.preview = Preview::default();
+                self.unsettled_nulls.clear();
             }
             if !advanced || at_margin {
                 self.caught_up = true;
@@ -1009,10 +1076,29 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
     let tip = e.chain_len.max(daa_score);
     let total = e.db.balance();
     let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
-    let spendable: u128 = match e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
+    let matured_leaves = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc);
+    let spendable: u128 = match matured_leaves {
         Some(matured) => e.db.notes().iter().filter(|n| n.position < matured).map(|n| n.value() as u128).sum(),
         None => 0,
     };
+    // "I have a balance but cannot spend any of it" is the single worst state this
+    // wallet can be in, and from the outside it is indistinguishable from a hang.
+    // When it happens, say exactly why: the anchor cutoff, whether the boundary ring
+    // even reaches back that far, and where the notes sit relative to it.
+    // NB: debug, not info — `snap_from_entry` runs on every status call AND every mempool
+    // tick (sub-second, per wallet), so an info! here floods the log. Turn it on with
+    // RUST_LOG=zkas_walletd=debug when actually investigating a stuck balance.
+    if total > 0 && spendable == 0 {
+        log::debug!(
+            "spendable=0 with balance {total}: sink_blue={} cutoff_blue={cutoff_blue} boundaries={} (oldest_blue={:?} newest_blue={:?}) matured_leaves={:?} note_positions={:?}",
+            e.sink_blue,
+            e.boundaries.len(),
+            e.boundaries.front().map(|b| b.0),
+            e.boundaries.back().map(|b| b.0),
+            matured_leaves,
+            e.db.notes().iter().map(|n| n.position).collect::<Vec<_>>(),
+        );
+    }
     StatusSnap {
         address,
         watch_only: e.key.is_watch_only(),
@@ -1022,8 +1108,11 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
         balance_sompi: total,
         spendable_sompi: spendable,
         maturing_sompi: total.saturating_sub(spendable),
-        pending_in: e.preview.incoming,
-        pending_out: e.preview.outgoing,
+        // 0-conf = what the unsettled blocks do + what the mempool would do once mined.
+        // The two are de-duplicated by nullifier in `scan_mempool`, so a tx crossing from
+        // mempool into a block is counted exactly once throughout.
+        pending_in: e.preview.incoming + e.mempool.incoming,
+        pending_out: e.preview.outgoing + e.mempool.outgoing,
         note_count: e.db.notes().len(),
         updated_unix: e.updated_unix,
         error: e.error.clone(),
@@ -1194,10 +1283,16 @@ impl AppState {
             }
             base_below = Some(last.hash);
             cursor = last.hash;
-            // Short page → reached the tip before birthday; nothing gained over the
-            // checkpoint start, so let the caller fall back.
+            // Short page → we walked all the way to the tip without reaching the birthday,
+            // which is exactly what a wallet born *now* looks like (its birthday is the
+            // current tip). Start it at the tip: it cannot hold a note older than itself.
+            // Falling back to the checkpoint here was a bug with a very visible symptom —
+            // a freshly created wallet opened at "syncing 87%" and ground through ~44K
+            // blocks of history it could not possibly appear in.
             if (page.blocks.len() as u64) < WALK_PAGE {
-                return None;
+                let base = base_below?;
+                let ts = self.client.get_shielded_tree_state(Some(base)).await.ok()?;
+                return Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers));
             }
         }
         None
@@ -1301,6 +1396,19 @@ impl AppState {
                 None => self.full_scan_entry(key, genesis).await?,
             },
         };
+        // Decode the leaf stream to curve points NOW, on a blocking thread, while we still
+        // own the entry exclusively. `warm_leaves` was written for exactly this and then
+        // never called, so the cost landed on the first *spend* instead — a big chunk of the
+        // ~29s a send took. Doing it here costs the user nothing: the wallet is already
+        // usable (balance, notes, receive) and this finishes long before anyone hits Send.
+        let entry = tokio::task::spawn_blocking(move || {
+            let t = std::time::Instant::now();
+            entry.db.warm_leaves();
+            log::info!("wallet leaf-stream decoded in {:.1?} (kept off the spend path)", t.elapsed());
+            entry
+        })
+        .await
+        .ok()?;
         let w = Arc::new(Mutex::new(entry));
         self.wallets.lock().await.insert(token.to_string(), w.clone());
         // NB: do NOT eagerly decode the leaf stream here. It is tempting — only a spend
@@ -1318,6 +1426,67 @@ impl AppState {
 // ---------------------------------------------------------------------------
 // Background sync: advance every loaded wallet a bounded chunk each pass.
 // ---------------------------------------------------------------------------
+
+/// Watch the node's **mempool** and tell every active wallet what is heading its way,
+/// *before* any of it is mined. This is the whole "instant payment" path.
+///
+/// It is deliberately its OWN loop, not a step inside `sync_loop`. The sync loop walks
+/// wallets one at a time and does real block work (page fetches, tree ingest, a throttle
+/// between each), so a wallet's turn can come many seconds after the pass began — putting
+/// the mempool check in there made an incoming payment take ~28s to show for no reason
+/// other than queueing. Here the only per-wallet cost is trial decryption of a handful of
+/// mempool bundles: microseconds, no RPC, no tree. So a payment appears within about a
+/// second of the sender hitting Confirm, no matter how many wallets are mid-scan.
+async fn mempool_loop(state: Arc<AppState>) {
+    let mut last_seen = 0usize;
+    loop {
+        let active: HashSet<String> = {
+            let now = std::time::Instant::now();
+            state
+                .last_touch
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, t)| now.duration_since(**t) < ACTIVE_SYNC_WINDOW)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        if !active.is_empty() {
+            // One decode of the mempool, shared by every wallet.
+            let bundles: Vec<ShieldedBundle> =
+                match tokio::time::timeout(SYNC_RPC_TIMEOUT, state.client.get_mempool_entries(false, false)).await {
+                    Ok(Ok(entries)) => entries
+                        .iter()
+                        .filter(|e| e.transaction.version == TX_VERSION_SHIELDED)
+                        .filter_map(|e| ShieldedBundle::from_bytes(&e.transaction.payload).ok())
+                        .collect(),
+                    _ => Vec::new(), // node hiccup: no preview this tick, never a stall
+                };
+            // Log only on change — this loop runs sub-second. Without this line there is no
+            // way to tell "the mempool preview is working and the tx simply isn't there yet"
+            // apart from "the mempool preview is silently broken", which is exactly the hole
+            // that let an incoming payment take minutes to show.
+            if bundles.len() != last_seen {
+                log::info!("mempool: {} shielded bundle(s) pending", bundles.len());
+                last_seen = bundles.len();
+            }
+            let wallets: Vec<(String, Wallet)> = {
+                state.wallets.lock().await.iter().filter(|(k, _)| active.contains(*k)).map(|(k, v)| (k.clone(), v.clone())).collect()
+            };
+            for (token, w) in wallets {
+                // try_lock, never lock: if the sync loop is mid-chunk on this wallet, skip it
+                // and catch it next tick. Blocking here would re-couple us to the very queue
+                // this loop exists to escape.
+                let Ok(mut e) = w.try_lock() else { continue };
+                e.scan_mempool(&bundles);
+                let snap = snap_from_entry(state.address_of(&e.db), &e, e.chain_len);
+                drop(e);
+                state.snapshots.lock().await.insert(token, snap);
+            }
+        }
+        tokio::time::sleep(MEMPOOL_POLL).await;
+    }
+}
 
 async fn sync_loop(state: Arc<AppState>) {
     loop {
@@ -1340,7 +1509,12 @@ async fn sync_loop(state: Arc<AppState>) {
                 .collect()
         };
         if !wallets.is_empty() {
-            let chain_len = state.sync_client.get_block_dag_info().await.map(|d| d.virtual_daa_score).unwrap_or(0);
+            // Timed out for the same reason as the page fetch: this runs once per pass on
+            // the shared loop, so a hang here freezes every wallet.
+            let chain_len = match tokio::time::timeout(SYNC_RPC_TIMEOUT, state.sync_client.get_block_dag_info()).await {
+                Ok(Ok(d)) => d.virtual_daa_score,
+                _ => 0,
+            };
             if chain_len > 0 {
                 *state.node_tip.lock().await = (chain_len, std::time::Instant::now());
             }
@@ -1355,6 +1529,29 @@ async fn sync_loop(state: Arc<AppState>) {
                 let was_caught_up = e.caught_up;
                 e.caught_up = false;
                 e.sync_chunk(&state.sync_client, &state.page_cache).await;
+                // Keep spend witnesses close to the matured frontier, a BOUNDED step per
+                // pass. Without this the entire catch-up was paid at spend time, inside the
+                // user's send — the dominant part of a ~29s "Confirm & send". Doing it
+                // eagerly and *unbounded* is what caused a past outage (one call hashing
+                // cap × notes Sinsemilla commitments pinned a worker and starved HTTP), so
+                // it is capped here and the loop simply comes back next pass for the rest.
+                if e.caught_up && e.error.is_none() {
+                    if let Some(matured) = e.matured_leaves() {
+                        let t = std::time::Instant::now();
+                        // Deliberately does NOT set `any_behind`. Doing so put the loop into
+                        // its 10ms fast path, which then ran witness catch-up back-to-back
+                        // with no idle — one worker pinned at 100%, HTTP starved, 138
+                        // connections piled up and the daemon stopped answering. That is the
+                        // very outage the original code removed eager witness advancing to
+                        // avoid. One bounded step per idle pass (~1s) is plenty: it stays
+                        // ahead of a 1 BPS chain and costs nothing when already caught up.
+                        let _more = e.db.advance_witnesses_capped(matured, WITNESS_ADVANCE_CAP);
+                        let took = t.elapsed();
+                        if took > std::time::Duration::from_secs(1) {
+                            log::debug!("witness advance step took {took:.1?} (capped at {WITNESS_ADVANCE_CAP} leaves)");
+                        }
+                    }
+                }
                 if e.reorged_strikes >= REORG_STRIKES {
                     // The append-only tree cannot roll back a deep reorg: retire the
                     // checkpoint and evict the wallet; the next request reloads it cleanly
@@ -1429,7 +1626,12 @@ async fn sync_loop(state: Arc<AppState>) {
         if any_behind {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         } else {
-            tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+            // A caught-up wallet used to idle here for 12 SECONDS, which is most of the
+            // delay before a payment appears: the tx is mined in ~1s, but nothing looks at
+            // it until this sleep ends. It is a cheap pass when nothing has changed (one
+            // dag-info call, one mempool call, a short page), so poll at ~1s instead —
+            // payments are supposed to feel instant.
+            tokio::time::sleep(IDLE_SYNC_POLL).await;
         }
     }
 }
@@ -2197,7 +2399,9 @@ async fn wallet_prepare(
         if let Some(w) = state.get_wallet(&token).await {
             let mut e = w.lock().await;
             if e.db.fvk().to_bytes() == fvk_bytes {
+                let t_w = std::time::Instant::now();
                 e.advance_spend_witnesses();
+                log::info!("prepare: witness advance took {:.1?}", t_w.elapsed());
                 let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
                     let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
@@ -2207,9 +2411,11 @@ async fn wallet_prepare(
                         if selected >= need || inputs.len() == max_per_tx {
                             break;
                         }
+                        let t_p = std::time::Instant::now();
                         let path =
                             e.db.witness_path_at(n.position, matured)
                                 .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                        log::info!("prepare: witness_path_at(note@{}) took {:.1?}", n.position, t_p.elapsed());
                         inputs.push((n.note.clone(), path));
                         selected += n.value();
                     }
@@ -2264,10 +2470,12 @@ async fn wallet_prepare(
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?
         .fvk()
         .clone();
+    let t_proof = std::time::Instant::now();
     let payment = tokio::task::spawn_blocking(move || prepare_payment(&fvk, inputs, recipient, amount, fee, &net, &ctx))
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to prepare payment: {e:?}")))?;
+    log::info!("prepare: Halo2 proof took {:.1?}", t_proof.elapsed());
 
     let spend_auth: Vec<SpendAuthReq> =
         payment.spend_auth_requests.iter().map(|(i, alpha)| SpendAuthReq { index: *i, alpha: hex(alpha) }).collect();
@@ -2534,6 +2742,9 @@ async fn main() {
     });
 
     tokio::spawn(sync_loop(state.clone()));
+    // Unmined payments — the instant-payment path. Separate from sync_loop on purpose
+    // (see mempool_loop): it must never queue behind block scanning.
+    tokio::spawn(mempool_loop(state.clone()));
 
     // Keep the cached node tip fresh independently of loaded wallets, so `status` can
     // report node connectivity + chain height without ever calling the node on the

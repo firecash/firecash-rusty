@@ -562,12 +562,28 @@ impl VirtualStateProcessor {
         let Some(source) = self.shielded_state_manager.anchor_source_block(anchor).unwrap() else {
             return false; // not a real tree root of any block
         };
-        // Canonical: the source block is on this block's selected chain.
-        if source != selected_parent && !self.reachability_service.is_chain_ancestor_of(source, selected_parent) {
+        // A source block below the pruning point has had its ghostdag/reachability data
+        // pruned. Reading its blue score with `.unwrap()` here panicked the virtual
+        // processor the instant pruning first advanced past a live anchor's source — and
+        // since every virtual-chain update re-runs this check, the panic recurred every
+        // pass and FROZE THE WHOLE CHAIN (observed: node stuck ~17h, node panicking every
+        // ~30s at this line). A pruned source is finalized selected-chain history: the
+        // global shielded tree only ever advances on accepted chain blocks, and the pruning
+        // depth is far greater than `shielded_anchor_depth`, so such a source is by
+        // construction both canonical and matured. Treat "blue score unavailable" as
+        // pruned ⟹ final, before touching reachability (also pruned for such a block).
+        let Ok(source_blue_score) = self.ghostdag_store.get_blue_score(source) else {
+            return true;
+        };
+        // Canonical: the source block is on this block's selected chain. Use the
+        // pruning-aware `try_is_chain_ancestor_of` (not the panicking `is_chain_ancestor_of`)
+        // so a source whose reachability data has been pruned since the blue-score read can
+        // never crash the virtual processor here either. `Err` == reachability pruned ==
+        // the source is finalized selected-chain history == canonical.
+        if source != selected_parent && !matches!(self.reachability_service.try_is_chain_ancestor_of(source, selected_parent), Ok(true) | Err(_)) {
             return false;
         }
         // Matured: at least `shielded_anchor_depth` deep relative to this block.
-        let source_blue_score = self.ghostdag_store.get_blue_score(source).unwrap();
         block_blue_score.saturating_sub(source_blue_score) >= self.shielded_anchor_depth
     }
 
