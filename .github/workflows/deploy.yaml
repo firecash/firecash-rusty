@@ -73,6 +73,36 @@ jobs:
           zip -r "${archive}" ./bin/*
           echo "archive=${archive}" >> $GITHUB_ENV
 
+      # ---------------------------------------------------------------------
+      # FALLBACK (proven 2026-07-16, shipped as v0.3.0): if this CI job can't
+      # run, cross-compile from Linux with MinGW. This exact recipe produced
+      # 6/6 clean exes (full details: docs/BUILDING-WINDOWS.md):
+      #
+      #   apt install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+      #   rustup target add x86_64-pc-windows-gnu
+      #   mkdir -p /root/work/winlibs
+      #   cp /usr/lib/gcc/x86_64-w64-mingw32/13-posix/libstdc++.a /root/work/winlibs/
+      #   # linker + rustflags come from the committed .cargo/config.toml:
+      #   #   [target.x86_64-pc-windows-gnu]
+      #   #   linker = "x86_64-w64-mingw32-g++-posix"
+      #   #   rustflags = ["-Clink-arg=-static", "-Clink-arg=-static-libstdc++",
+      #   #                "-Clink-arg=-static-libgcc", "-L", "/root/work/winlibs"]
+      #   # (winlibs holds ONLY libstdc++.a so librocksdb-sys's -lstdc++ cannot
+      #   #  resolve to the libstdc++-6.dll import lib. Do NOT set the
+      #   #  CARGO_TARGET_..._RUSTFLAGS env var — it overrides this config.)
+      #   nice -n 19 cargo build -j 2 --release --target x86_64-pc-windows-gnu \
+      #     --bin kaspad --bin zkas-miner --bin zkas-walletd --bin zkas-api --bin shielded-pay --bin stratum-bridge
+      #
+      #   # MANDATORY gate before zipping — every exe must print CLEAN:
+      #   for f in target/x86_64-pc-windows-gnu/release/*.exe; do
+      #     x86_64-w64-mingw32-objdump -p "$f" | grep -i "DLL Name" \
+      #       | grep -qiE "libstdc|libgcc|winpthread" && echo "DIRTY: $f" || echo "CLEAN: $f"
+      #   done
+      #
+      #   # package: folder zkas-windows-x86_64-<tag>/ with the exes + RUN-WINDOWS.txt, then:
+      #   zip -r zkas-windows-x86_64-<tag>.zip zkas-windows-x86_64-<tag>
+      #   gh release upload <tag> zkas-windows-x86_64-<tag>.zip --clobber -R firecash/firecash-rusty
+      # ---------------------------------------------------------------------
       - name: Build on Windows
         if: runner.os == 'Windows'
         shell: bash
