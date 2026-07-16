@@ -13,3 +13,11 @@ rustflags = [
 # (similar to how we use musl on Linux for portable binaries)
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Windows cross-compile: g++-posix linker + static mingw runtimes.
+# /root/work/winlibs holds ONLY libstdc++.a, so librocksdb-sys's `-lstdc++`
+# cannot resolve to the DLL import lib (libstdc++-6.dll dependency).
+# Keep these flags HERE (not in env vars) so cargo fingerprints stay stable.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-g++-posix"
+rustflags = ["-Clink-arg=-static", "-Clink-arg=-static-libstdc++", "-Clink-arg=-static-libgcc", "-L", "/root/work/winlibs"]
