@@ -35,7 +35,7 @@ use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
 use incrementalmerkletree::witness::IncrementalWitness;
 use orchard::{
     Address,
-    keys::{FullViewingKey, IncomingViewingKey, Scope, SpendingKey},
+    keys::{FullViewingKey, IncomingViewingKey, PreparedIncomingViewingKey, Scope, SpendingKey},
     note::{ExtractedNoteCommitment, Note, RandomSeed, Rho},
     tree::{MerkleHashOrchard, MerklePath},
     value::NoteValue,
@@ -46,7 +46,7 @@ use std::collections::HashSet;
 use crate::bundle::ShieldedBundle;
 use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};
 use crate::tree::{FrontierState, GlobalTree, TREE_DEPTH};
-use crate::wallet::scan::scan_bundle;
+use crate::wallet::scan::scan_bundle_prepared;
 
 /// A note the wallet owns and can spend. The membership witness is **not** held
 /// live per note (that made scanning O(N²) — every leaf advanced every owned
@@ -98,6 +98,11 @@ impl Preview {
 pub struct WalletDb {
     /// Incoming viewing key — recovers shielded-tx outputs sent to this wallet.
     ivk: IncomingViewingKey,
+    /// The `ivk` precomputed for trial decryption, built once at construction and
+    /// reused for every bundle in every scan pass (see [`scan_bundle_prepared`]).
+    /// `IncomingViewingKey::prepare` is not free, so doing it per bundle — as the
+    /// old per-action path did — repeated the same setup on every scanned bundle.
+    prepared_ivk: PreparedIncomingViewingKey,
     /// Full viewing key — derives each owned note's nullifier for spent-detection.
     fvk: FullViewingKey,
     /// This wallet's raw external address — matches coinbase recipients.
@@ -174,9 +179,11 @@ impl WalletDb {
         let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
         let fvk = FullViewingKey::from(&sk);
         let ivk = fvk.to_ivk(Scope::External);
+        let prepared_ivk = ivk.prepare();
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
         Some(Self {
             ivk,
+            prepared_ivk,
             fvk,
             my_address,
             tree: CommitmentTree::empty(),
@@ -204,9 +211,11 @@ impl WalletDb {
     pub fn from_fvk(fvk_bytes: &[u8; 96]) -> Option<Self> {
         let fvk = FullViewingKey::from_bytes(fvk_bytes)?;
         let ivk = fvk.to_ivk(Scope::External);
+        let prepared_ivk = ivk.prepare();
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
         Some(Self {
             ivk,
+            prepared_ivk,
             fvk,
             my_address,
             tree: CommitmentTree::empty(),
@@ -361,7 +370,7 @@ impl WalletDb {
             if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
                 continue;
             }
-            let received = scan_bundle(&self.ivk, bundle);
+            let received = scan_bundle_prepared(&self.prepared_ivk, bundle);
             for (i, action) in bundle.actions.iter().enumerate() {
                 // Each action reveals the nullifier of the note it spends. If that is
                 // one of ours, the note is now spent — drop it from the unspent set so
@@ -416,7 +425,7 @@ impl WalletDb {
                 .map(|n| n.value() as u128)
                 .sum();
             // What this bundle gives us: anything decryptable to our ivk.
-            let received: u128 = scan_bundle(&self.ivk, bundle).iter().map(|r| r.note.value().inner() as u128).sum();
+            let received: u128 = scan_bundle_prepared(&self.prepared_ivk, bundle).iter().map(|r| r.note.value().inner() as u128).sum();
 
             if spent > 0 {
                 // OUR OWN spend. The received part is our CHANGE coming back, not an

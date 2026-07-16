@@ -42,16 +42,17 @@ use kaspa_consensus_core::tx::{TX_VERSION_SHIELDED, Transaction};
 use kaspa_grpc_client::GrpcClient;
 use kaspa_rpc_core::{RpcHash, RpcShieldedChainBlock, RpcTransaction, api::rpc::RpcApi, notify::mode::NotificationMode};
 use kaspa_shielded_core::bundle::{ShieldedBundle, expected_wire_len};
+use kaspa_shielded_core::coinbase::CoinbaseNoteDesc;
 use kaspa_shielded_core::coinbase::derive_coinbase_note_desc;
 use kaspa_shielded_core::message::{FVK_LEN, SIG_LEN, sign_message, verify_message};
 use kaspa_shielded_core::orchard_recipient_bytes;
 use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::wallet::build::{PreparedPayment, build_wallet_payment, finalize_payment, prepare_payment, proving_key};
-use kaspa_shielded_core::coinbase::CoinbaseNoteDesc;
 use kaspa_shielded_core::walletdb::{Preview, WalletDb};
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use tokio::sync::Mutex;
 
 /// 1 FC = 10^8 sompi.
@@ -71,9 +72,17 @@ const DEFAULT_ANCHOR_DEPTH: u64 = 600;
 // 4 pages/chunk: the shared decode (see `DecodedPage`) makes per-wallet ingest
 // cheaper, so a wallet can absorb more blocks per pass — fewer passes to clear a
 // mass rescan — while the lock is still dropped between chunks for status calls.
+// NB: kept small on purpose. Enlarging the page/chunk (tried 1000/2) lengthens the
+// synchronous decode burst under the wallet lock and starves the axum HTTP handlers
+// during a scan — it took wallet.zkas.info's /health/status to timeouts on 2026-07-15.
 const PAGES_PER_CHUNK: usize = 4;
-/// Chain blocks requested per `GetShieldedBlocks` page.
-const SHIELDED_PAGE: u64 = 200;
+/// Chain blocks requested per `GetShieldedBlocks` page (node max 2000). Raised
+/// 200→1000 for fewer round-trips and bigger ingest bursts between the node's
+/// pruning-lock stalls — safe now that (a) the RPC target is the local node
+/// (~ms/page), (b) the eager witness advance is gone from the sync path, and
+/// (c) status reads lock-free snapshots, so a longer burst under the wallet
+/// lock no longer blocks status calls.
+const SHIELDED_PAGE: u64 = 1000;
 /// Blue-score margin the sync holds back from the sink before ingesting a chain
 /// block. The wallet's tree is append-only (no rollback), so it must not ingest a
 /// block that a routine near-tip reorg could still replace. Blue score advances
@@ -87,16 +96,40 @@ const SYNC_TIP_MARGIN: u64 = 200;
 /// transiently near the tip; a single `reorged` response is usually stale within
 /// a pass or two, and a rescan costs the whole scan history.
 const REORG_STRIKES: u32 = 3;
-/// The node's error text for a hash it genuinely does not have
-/// (`ConsensusError::BlockNotFound` — "cannot find full block {hash}"). Discarding a
-/// wallet's checkpoint is destructive (it forces a full rescan from birthday), so it
-/// must be driven by *positive* evidence that the cursor is gone — never by the mere
-/// fact that an RPC returned `Err`. A timeout or an overloaded node also returns
-/// `Err`, and treating that as "cursor unknown" is what nuked eleven wallets in one
-/// 20ms burst on 2026-07-12 and a live user's wallet seconds after a send on
-/// 2026-07-13 (the send's Halo 2 proof is exactly the CPU spike that makes the probe
-/// RPC time out).
-const BLOCK_NOT_FOUND: &str = "cannot find full block";
+/// Node error substrings that are *positive* evidence the wallet's cursor block is
+/// no longer retrievable, so its checkpoint must be retired and the wallet rescanned
+/// from the current pruning-point frontier:
+/// - `cannot find full block` — the node never knew the hash (`ConsensusError::BlockNotFound`).
+/// - `cannot find header` — the block was **pruned away** (its header is gone;
+///   `ConsensusError::HeaderNotFound`). A wallet that falls behind the pruning point —
+///   e.g. the daemon was starved for a while and the chain pruned past its cursor —
+///   lands here. Before this it stalled **forever**, stuck at whatever % it froze at,
+///   because only the first string was matched.
+/// - `required chain data is missing` — pruned/corrupt chain store (`SyncManagerError`).
+///
+/// Discarding a checkpoint is destructive (forces a rescan), so it must be driven by
+/// one of these *positive* signals — never by the mere fact that an RPC returned `Err`.
+/// A timeout or an overloaded node also returns `Err`, and treating that as "cursor
+/// unknown" is what nuked eleven wallets in one 20ms burst on 2026-07-12 and a live
+/// user's wallet seconds after a send on 2026-07-13 (the send's Halo 2 proof is exactly
+/// the CPU spike that makes the probe RPC time out).
+const CURSOR_GONE_MARKERS: [&str; 4] = [
+    "cannot find full block",
+    "cannot find header",
+    "required chain data is missing",
+    // The node refuses to base a chain walk on this cursor: it is below the retention
+    // period root, or on a stale branch whose chain no longer reaches it. The block may
+    // still *exist* (a `get_block` probe succeeds!), but the walk can never proceed from
+    // it — deterministic, not transient. Observed live 2026-07-16: a wallet frozen at 74%
+    // for hours, its page fetch failing with this while `get_block` kept succeeding.
+    "does not have retention root",
+];
+
+/// True if a node error string is positive evidence the cursor block is gone (see
+/// [`CURSOR_GONE_MARKERS`]).
+fn cursor_gone(err: &str) -> bool {
+    CURSOR_GONE_MARKERS.iter().any(|m| err.contains(m))
+}
 /// Extra blue-score slack under the consensus anchor-maturity depth when picking
 /// the anchor a spend roots at, so it stays matured while the tx awaits merging.
 const ANCHOR_SLACK: u64 = 30;
@@ -447,12 +480,42 @@ const CHECKPOINT_EVERY: usize = 1000;
 
 /// Max leaves the background loop advances a wallet's spend-witnesses per step before
 /// yielding, so a large catch-up never runs as one core-pinning burst.
+#[allow(dead_code)]
 const WITNESS_ADVANCE_CAP: u64 = 4000;
+
+/// Total per-pass budget for eager witness catch-up, in (leaf × witness) hash units.
+/// `advance_witnesses_capped(cap)` costs `cap × (owned-note count)` Sinsemilla hashes —
+/// so a fixed leaf cap makes a many-note wallet's step blow up: a pool/miner wallet with
+/// thousands of notes was observed taking **7–15 s per step**, which pins the sync loop
+/// and freezes every other wallet's scan. Deriving the per-pass leaf cap as
+/// `BUDGET / note_count` (floored at [`WITNESS_MIN_STEP`]) bounds the step to roughly this
+/// many hashes regardless of wallet size, keeping the loop responsive. Witnesses that
+/// don't finish catching up here are rebuilt on demand at spend time anyway.
+#[allow(dead_code)]
+const WITNESS_ADVANCE_BUDGET: u64 = 400_000;
+/// Floor on the per-pass leaf cap, so even a huge wallet still makes some progress.
+#[allow(dead_code)]
+const WITNESS_MIN_STEP: u64 = 32;
 
 /// A wallet is synced by the background loop only while it has been touched by a
 /// request within this window; after that it is parked until the next request. Keeps a
 /// public daemon's CPU proportional to *active* wallets, not total tokens ever seen.
 const ACTIVE_SYNC_WINDOW: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How many active wallets the sync loop advances **concurrently**. The per-wallet
+/// scan is CPU-bound (Sinsemilla appends + trial decryption) with no await inside, so
+/// a single sequential loop pins exactly one core while the other cores sit idle — a
+/// wallet then advances at (one core's rate ÷ number of active wallets), which crawls
+/// once several wallets are active (observed: a wallet "stuck at 74%" on the live
+/// daemon while one tokio worker ran at 99% and the rest were idle). Running a bounded
+/// number in parallel uses the idle cores, multiplying throughput ~N×. Bounded (not
+/// unbounded) so it never consumes every core — HTTP handlers, the node, and the
+/// mempool loop must still get scheduled. Kept at cores-2 (min 2) to leave headroom.
+// Shielded scanning performs substantial synchronous curve work while holding a
+// wallet lock. More than one scan at a time can occupy every Tokio worker and make
+// /health and /api/status time out. Keep it serial until the CPU portion is moved
+// behind spawn_blocking; availability is more important than catch-up throughput.
+const SYNC_CONCURRENCY: usize = 3;
 
 /// Real sleep between wallets in the sync loop, to guarantee CPU headroom for the HTTP
 /// handlers even while scans run. Caps sync throughput; keeps the daemon responsive.
@@ -468,7 +531,9 @@ const IDLE_SYNC_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 /// How often the dedicated mempool loop looks for unmined payments. This is the floor on
 /// "the receiver's screen changed" — keep it fast; the work behind it is trivial.
 const MEMPOOL_POLL: std::time::Duration = std::time::Duration::from_millis(700);
-const SYNC_WALLET_THROTTLE_MS: u64 = 150;
+// 150→50 ms: with the bounded-parallel loop another scan task overlaps this sleep, so
+// its only job is guaranteeing the HTTP runtime a scheduling gap — 50 ms is plenty.
+const SYNC_WALLET_THROTTLE_MS: u64 = 50;
 /// Sleep after each ingested page inside a wallet's chunk, same reason (a single page
 /// is ~200 blocks of pure-CPU trial decryption with no natural await).
 const SYNC_PAGE_THROTTLE_MS: u64 = 5;
@@ -613,6 +678,16 @@ struct DecodedPage {
     blocks: Vec<DecodedBlock>,
 }
 
+/// Shared page decoding gets a bounded pool so it cannot consume every host core
+/// and starve HTTP or kaspad while several wallets ingest concurrently.
+static PAGE_DECODE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .thread_name(|i| format!("wallet-page-decode-{i}"))
+        .build()
+        .expect("build wallet page decode pool")
+});
+
 fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
     let mut coinbase = Vec::new();
     for (i, out) in b.coinbase_outputs.iter().enumerate() {
@@ -665,11 +740,18 @@ async fn fetch_shielded_page(
         }
     }
     let raw = client.get_shielded_blocks(low, SHIELDED_PAGE).await?;
-    let decoded = Arc::new(DecodedPage {
-        reorged: raw.reorged,
-        sink_blue_score: raw.sink_blue_score,
-        blocks: raw.blocks.iter().map(decode_block).collect(),
+    // Decode the page ACROSS CORES. The per-block coinbase Sinsemilla commitment is the
+    // dominant scan cost (~1 ms/block — it, not decryption, set the measured ~900 blk/s
+    // single-thread ceiling), and each block decodes independently. `block_in_place`
+    // moves this task off the async worker pool so the rayon fan-out doesn't stall other
+    // tokio tasks; the decode is done once here and shared by every wallet via the cache.
+    let blocks = tokio::task::block_in_place(|| {
+        PAGE_DECODE_POOL.install(|| {
+            use rayon::prelude::*;
+            raw.blocks.par_iter().map(decode_block).collect::<Vec<_>>()
+        })
     });
+    let decoded = Arc::new(DecodedPage { reorged: raw.reorged, sink_blue_score: raw.sink_blue_score, blocks });
     let mut c = cache.lock().await;
     c.map.insert(low, (std::time::Instant::now(), decoded.clone()));
     c.order.push_back(low);
@@ -818,25 +900,39 @@ impl WalletEntry {
                     return;
                 }
                 Ok(Err(e)) => {
-                    // Distinguish "cursor no longer known" (pruned / relaunched — needs a
-                    // rescan) from a transient node failure. Only a definitive
-                    // `BlockNotFound` for our cursor counts: any other error (timeout,
-                    // transport, node busy) leaves the checkpoint alone, because it is not
-                    // evidence about the cursor at all. Even then, take a single strike and
-                    // require REORG_STRIKES *consecutive* passes to agree — a node that is
-                    // merely slow must never be able to delete a wallet's scan history.
-                    // Both probes are timed out too — they run on the same shared loop, so a
-                    // hang here would freeze every wallet just as surely as the fetch above.
-                    let gone = match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block(self.low, false)).await {
-                        Ok(Err(probe)) => probe.to_string().contains(BLOCK_NOT_FOUND),
-                        Ok(Ok(_)) => false,
-                        Err(_) => false, // timed out: says nothing about the cursor
+                    // Distinguish "cursor unusable" (pruned / stale-branch / relaunched —
+                    // needs a rescan) from a transient node failure.
+                    //
+                    // FIRST, read the page error itself: if the node *answered* with one of
+                    // the definitive cursor-gone verdicts (see [`CURSOR_GONE_MARKERS`]),
+                    // that IS the evidence — no probe needed. Probing `get_block` here was
+                    // the trap that froze wallets for hours: a cursor below the retention
+                    // root still *exists* (probe succeeds → "transient") while every page
+                    // fetch is deterministically refused. The node answering at all also
+                    // proves it is alive.
+                    //
+                    // Otherwise (timeout, transport, node busy), the error says nothing
+                    // about the cursor: probe it, and only a definitive verdict on a live
+                    // node counts. Either way, take a single strike and require
+                    // REORG_STRIKES *consecutive* passes to agree — a merely-slow node must
+                    // never be able to delete a wallet's scan history (2026-07-12 outage).
+                    // Probes are timed out too — they run on the same shared loop.
+                    let gone = if cursor_gone(&e.to_string()) {
+                        true
+                    } else {
+                        let probe_gone = match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block(self.low, false)).await {
+                            Ok(Err(probe)) => cursor_gone(&probe.to_string()),
+                            Ok(Ok(_)) => false,
+                            Err(_) => false, // timed out: says nothing about the cursor
+                        };
+                        let node_alive =
+                            matches!(tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block_dag_info()).await, Ok(Ok(_)));
+                        probe_gone && node_alive
                     };
-                    let node_alive =
-                        matches!(tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block_dag_info()).await, Ok(Ok(_)));
-                    if gone && node_alive {
+                    if gone {
                         self.reorged_strikes += 1;
-                        self.error = Some("wallet cursor no longer known to the node; rescanning".into());
+                        self.error = Some("wallet cursor no longer usable on the node; rescanning".into());
+                        log::info!("wallet cursor unusable (strike {}/{REORG_STRIKES}): {e}", self.reorged_strikes);
                     } else {
                         log::debug!("wallet sync page failed (transient, checkpoint kept): {e}");
                         self.error = Some(format!("get_shielded_blocks failed: {e}"));
@@ -854,53 +950,58 @@ impl WalletEntry {
             self.reorged_strikes = 0;
             self.sink_blue = resp.sink_blue_score;
             let settled = resp.sink_blue_score.saturating_sub(SYNC_TIP_MARGIN);
-            let mut advanced = false;
-            let mut at_margin = false;
-            for (i, b) in resp.blocks.iter().enumerate() {
-                if b.blue_score > settled {
-                    // Everything from here to the tip is inside the reorg margin and must
-                    // not be appended to the tree. Preview it instead, so a payment shows
-                    // up as pending the moment it is mined rather than ~3 minutes later
-                    // when the margin clears. Recomputed from scratch each pass (not
-                    // accumulated), so it self-corrects if a block drops out.
-                    let mut preview = Preview::default();
-                    let mut nulls = HashSet::new();
-                    for u in &resp.blocks[i..] {
-                        let bundle_refs: Vec<&ShieldedBundle> = u.bundles.iter().collect();
-                        let cb: Vec<(CoinbaseNoteDesc, u64)> =
-                            u.coinbase.iter().map(|(d, v, _)| (d.clone(), *v)).collect();
-                        preview.add(self.db.preview_block(&cb, &bundle_refs));
-                        // Remember what these blocks spend, so the same tx still sitting in
-                        // the mempool is not counted a second time (see `mempool`).
-                        for b in &bundle_refs {
-                            for a in &b.actions {
-                                nulls.insert(a.nullifier);
+            // This section is synchronous trial-decryption/tree work. Mark it as
+            // blocking so Tokio starts replacement workers for HTTP and RPC tasks
+            // while up to three wallets continue ingesting in parallel.
+            let (advanced, at_margin) = tokio::task::block_in_place(|| {
+                let mut advanced = false;
+                let mut at_margin = false;
+                for (i, b) in resp.blocks.iter().enumerate() {
+                    if b.blue_score > settled {
+                        // Everything from here to the tip is inside the reorg margin and must
+                        // not be appended to the tree. Preview it instead, so a payment shows
+                        // up as pending the moment it is mined rather than ~3 minutes later
+                        // when the margin clears. Recomputed from scratch each pass (not
+                        // accumulated), so it self-corrects if a block drops out.
+                        let mut preview = Preview::default();
+                        let mut nulls = HashSet::new();
+                        for u in &resp.blocks[i..] {
+                            let bundle_refs: Vec<&ShieldedBundle> = u.bundles.iter().collect();
+                            let cb: Vec<(CoinbaseNoteDesc, u64)> = u.coinbase.iter().map(|(d, v, _)| (d.clone(), *v)).collect();
+                            preview.add(self.db.preview_block(&cb, &bundle_refs));
+                            // Remember what these blocks spend, so the same tx still sitting in
+                            // the mempool is not counted a second time (see `mempool`).
+                            for b in &bundle_refs {
+                                for a in &b.actions {
+                                    nulls.insert(a.nullifier);
+                                }
                             }
                         }
+                        self.preview = preview;
+                        self.unsettled_nulls = nulls;
+                        at_margin = true;
+                        break;
                     }
-                    self.preview = preview;
-                    self.unsettled_nulls = nulls;
-                    at_margin = true;
-                    break;
+                    // Ingest with the coinbase commitments the shared cache already
+                    // computed for this block — the Sinsemilla work is not repeated per
+                    // wallet.
+                    let bundle_refs: Vec<&ShieldedBundle> = b.bundles.iter().collect();
+                    self.db.ingest_block_precomputed(&b.coinbase, &bundle_refs);
+                    self.low = b.hash;
+                    self.scanned = b.daa_score as usize;
+                    self.boundaries.push_back((b.blue_score, self.db.size()));
+                    if self.boundaries.len() > MATURED_RING {
+                        self.boundaries.pop_front();
+                    }
+                    advanced = true;
                 }
-                // Ingest with the coinbase commitments the shared cache already
-                // computed for this block — the Sinsemilla work is not repeated per
-                // wallet.
-                let bundle_refs: Vec<&ShieldedBundle> = b.bundles.iter().collect();
-                self.db.ingest_block_precomputed(&b.coinbase, &bundle_refs);
-                self.low = b.hash;
-                self.scanned = b.daa_score as usize;
-                self.boundaries.push_back((b.blue_score, self.db.size()));
-                if self.boundaries.len() > MATURED_RING {
-                    self.boundaries.pop_front();
+                if !at_margin {
+                    // No unsettled blocks in this page — nothing is pending from the margin.
+                    self.preview = Preview::default();
+                    self.unsettled_nulls.clear();
                 }
-                advanced = true;
-            }
-            if !at_margin {
-                // No unsettled blocks in this page — nothing is pending from the margin.
-                self.preview = Preview::default();
-                self.unsettled_nulls.clear();
-            }
+                (advanced, at_margin)
+            });
             if !advanced || at_margin {
                 self.caught_up = true;
                 break;
@@ -1054,6 +1155,12 @@ struct AppState {
     /// runtime worker and starve even `/health` (a live outage). With a small cap, most
     /// workers stay free for HTTP and loads queue briefly instead of melting the box.
     load_gate: tokio::sync::Semaphore,
+    /// Payment preparation is deliberately serialized. Witness reconstruction and
+    /// Halo2 proving are CPU-heavy synchronous work; browser retries used to start
+    /// overlapping copies after the first request timed out, exhausting every runtime
+    /// worker and taking the whole wallet API offline. A caller that races an existing
+    /// preparation gets a fast 429 and can retry after the original finishes.
+    prepare_gate: tokio::sync::Semaphore,
     /// Last known virtual DAA score, refreshed by the sync loop and successful status
     /// calls, so status can answer instantly when the node RPC is momentarily contended.
     node_tip: Mutex<(u64, std::time::Instant)>,
@@ -1102,7 +1209,10 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
     StatusSnap {
         address,
         watch_only: e.key.is_watch_only(),
-        synced: e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip,
+        // `tip > 0` guard: when the pass's dag-info call times out, `chain_len` is 0 and
+        // `scanned + margin >= 0` is trivially true — the UI then flashed "synced" on a
+        // wallet that was mid-scan (observed live 2026-07-16). No tip info ⇒ not synced.
+        synced: tip > 0 && (e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip),
         scanned: e.scanned,
         chain_len: tip,
         balance_sompi: total,
@@ -1226,13 +1336,16 @@ impl AppState {
         // (metadata only, no tree work) and start the tree from *that* block's frontier.
         // Sound because a birthday asserts the wallet holds no notes before it. Any failure
         // (RPC hiccup, tip reached early) falls back to the checkpoint start.
-        let (start_hash, start_daa, start_size, start_leaf, start_ommers) =
-            match self.birthday_start(cp.block_hash, birthday).await {
-                Some(s) => s,
-                None => (cp.block_hash, cp.daa_score, cp.size, cp.leaf, cp.ommers),
-            };
+        let (start_hash, start_daa, start_size, start_leaf, start_ommers) = match self.birthday_start(cp.block_hash, birthday).await {
+            Some(s) => s,
+            None => (cp.block_hash, cp.daa_score, cp.size, cp.leaf, cp.ommers),
+        };
         if start_daa > cp.daa_score {
-            log::info!("fast-sync from birthday block daa {start_daa} (checkpoint daa {}) — skipped {} blocks of replay", cp.daa_score, start_daa - cp.daa_score);
+            log::info!(
+                "fast-sync from birthday block daa {start_daa} (checkpoint daa {}) — skipped {} blocks of replay",
+                cp.daa_score,
+                start_daa - cp.daa_score
+            );
         }
         let fs = FrontierState {
             size: start_size,
@@ -1488,6 +1601,78 @@ async fn mempool_loop(state: Arc<AppState>) {
     }
 }
 
+/// What advancing one wallet a chunk told the loop it must do afterwards.
+enum SyncOutcome {
+    /// Cursor is gone (pruned/unknown) for `REORG_STRIKES` passes: its checkpoint was
+    /// retired to `.bak`; the loop must evict it so the next request reloads it clean.
+    Retired(String),
+    /// Still catching up (or taking reorg strikes): the loop should spin its fast path.
+    Behind,
+    /// Caught up to the tip.
+    Idle,
+}
+
+/// Advance a single wallet by one chunk and do its post-chunk bookkeeping (witness
+/// catch-up, reorg-strike handling, checkpoint, status snapshot). Factored out of
+/// [`sync_loop`] so several wallets can run **concurrently** (see [`SYNC_CONCURRENCY`]);
+/// the logic is identical to the old sequential body.
+async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_len: u64) -> SyncOutcome {
+    let mut e = w.lock().await;
+    e.chain_len = chain_len;
+    // Advance one chunk from `low` (also the cheap tip catch-up once already synced).
+    let was_caught_up = e.caught_up;
+    e.caught_up = false;
+    e.sync_chunk(&state.sync_client, &state.page_cache).await;
+    // NB: NO eager witness advance here. Its cost is `leaves × note_count × TREE_DEPTH(32)`
+    // Sinsemilla hashes, so for a many-note wallet even a small leaf cap cost 13–15 s per
+    // pass — it ran on the sync path and froze every wallet's scan (observed live
+    // 2026-07-16). It is only ever a spend-latency optimization: a spend rebuilds the
+    // witness it needs on demand from the persisted leaf stream (`witness_path_at`, which
+    // already falls back to a fresh rebuild). Dropping it keeps this function O(scan) and
+    // non-blocking; the one-time rebuild cost moves to spend time, paid only for the notes
+    // a spend actually selects. (`WITNESS_ADVANCE_*` consts retained for a future
+    // work-budgeted re-enable.)
+    if e.reorged_strikes >= REORG_STRIKES {
+        // Cursor off the selected chain (or pruned away) for enough passes: retire the
+        // checkpoint to .bak and let the caller evict + reload it from a fresh anchor.
+        let scan = scan_path(&state.wallet_dir, &token);
+        log::warn!(
+            "wallet '{token}': cursor off the selected chain for {} consecutive passes ({}) \
+             — retiring checkpoint to .bak and rescanning",
+            e.reorged_strikes,
+            e.error.as_deref().unwrap_or("no error recorded")
+        );
+        let _ = std::fs::rename(&scan, format!("{scan}.bak"));
+        return SyncOutcome::Retired(token);
+    }
+    if e.reorged_strikes > 0 {
+        // Striking but not yet retired: don't checkpoint a suspect cursor. Come back next pass.
+        return SyncOutcome::Behind;
+    }
+    let behind = !e.caught_up;
+    // Persist a checkpoint once enough new blocks accrue, or the first time this wallet
+    // reaches the tip, so a restart resumes here instead of rescanning from birthday.
+    let advanced = e.scanned.saturating_sub(e.saved_scanned);
+    let just_caught_up = e.caught_up && !was_caught_up;
+    if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0)) {
+        if let Err(err) =
+            save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue)
+        {
+            eprintln!("checkpoint write failed for {token}: {err}");
+        } else {
+            e.saved_scanned = e.scanned;
+        }
+    }
+    // Refresh the out-of-band status snapshot while we still hold the lock.
+    let snap = snap_from_entry(state.address_of(&e.db), &e, chain_len);
+    drop(e);
+    state.snapshots.lock().await.insert(token.clone(), snap);
+    // A real sleep (not just yield_now) after each wallet, so HTTP handlers get a cycle
+    // even while scans run. With bounded concurrency each in-flight scan still yields here.
+    tokio::time::sleep(std::time::Duration::from_millis(SYNC_WALLET_THROTTLE_MS)).await;
+    if behind { SyncOutcome::Behind } else { SyncOutcome::Idle }
+}
+
 async fn sync_loop(state: Arc<AppState>) {
     loop {
         let wallets: Vec<(String, Wallet)> = { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
@@ -1518,99 +1703,33 @@ async fn sync_loop(state: Arc<AppState>) {
             if chain_len > 0 {
                 *state.node_tip.lock().await = (chain_len, std::time::Instant::now());
             }
+            // Advance the active wallets with BOUNDED CONCURRENCY across the idle cores.
+            // A single sequential loop pinned exactly one core (the per-wallet scan and
+            // witness step are CPU-bound), so one wallet's heavy step — e.g. a 7–15 s
+            // witness advance on a many-note wallet — froze every other wallet's scan.
+            // Running up to `SYNC_CONCURRENCY` at once uses the otherwise-idle cores while
+            // still leaving headroom for the HTTP handlers, the node RPC, and the mempool
+            // loop. Per-wallet correctness is unchanged (each holds only its own lock).
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(SYNC_CONCURRENCY));
+            let mut set = tokio::task::JoinSet::new();
             for (token, w) in wallets {
                 if !active.contains(&token) {
                     continue; // parked: nobody is looking at this wallet right now
                 }
-                let mut e = w.lock().await;
-                e.chain_len = chain_len;
-                // Advance one chunk from `low` (also serves as the cheap tip catch-up
-                // once already synced).
-                let was_caught_up = e.caught_up;
-                e.caught_up = false;
-                e.sync_chunk(&state.sync_client, &state.page_cache).await;
-                // Keep spend witnesses close to the matured frontier, a BOUNDED step per
-                // pass. Without this the entire catch-up was paid at spend time, inside the
-                // user's send — the dominant part of a ~29s "Confirm & send". Doing it
-                // eagerly and *unbounded* is what caused a past outage (one call hashing
-                // cap × notes Sinsemilla commitments pinned a worker and starved HTTP), so
-                // it is capped here and the loop simply comes back next pass for the rest.
-                if e.caught_up && e.error.is_none() {
-                    if let Some(matured) = e.matured_leaves() {
-                        let t = std::time::Instant::now();
-                        // Deliberately does NOT set `any_behind`. Doing so put the loop into
-                        // its 10ms fast path, which then ran witness catch-up back-to-back
-                        // with no idle — one worker pinned at 100%, HTTP starved, 138
-                        // connections piled up and the daemon stopped answering. That is the
-                        // very outage the original code removed eager witness advancing to
-                        // avoid. One bounded step per idle pass (~1s) is plenty: it stays
-                        // ahead of a 1 BPS chain and costs nothing when already caught up.
-                        let _more = e.db.advance_witnesses_capped(matured, WITNESS_ADVANCE_CAP);
-                        let took = t.elapsed();
-                        if took > std::time::Duration::from_secs(1) {
-                            log::debug!("witness advance step took {took:.1?} (capped at {WITNESS_ADVANCE_CAP} leaves)");
-                        }
-                    }
+                let permit = sem.clone().acquire_owned().await.expect("sync semaphore closed");
+                let st = state.clone();
+                set.spawn(async move {
+                    let _permit = permit; // held for the wallet's whole chunk, bounding concurrency
+                    sync_one_wallet(st, token, w, chain_len).await
+                });
+            }
+            while let Some(res) = set.join_next().await {
+                match res {
+                    Ok(SyncOutcome::Retired(t)) => reorged_tokens.push(t),
+                    Ok(SyncOutcome::Behind) => any_behind = true,
+                    Ok(SyncOutcome::Idle) => {}
+                    Err(join_err) => log::warn!("wallet sync task failed: {join_err}"),
                 }
-                if e.reorged_strikes >= REORG_STRIKES {
-                    // The append-only tree cannot roll back a deep reorg: retire the
-                    // checkpoint and evict the wallet; the next request reloads it cleanly
-                    // (fast-sync or full scan). Move it aside rather than deleting it — a
-                    // rescan re-derives the same state from chain data, so the old blob is
-                    // only ever needed to *diagnose* a misfire, and having it is the
-                    // difference between explaining an incident and guessing at it.
-                    let scan = scan_path(&state.wallet_dir, &token);
-                    log::warn!(
-                        "wallet '{token}': cursor off the selected chain for {} consecutive passes ({}) \
-                         — retiring checkpoint to .bak and rescanning",
-                        e.reorged_strikes,
-                        e.error.as_deref().unwrap_or("no error recorded")
-                    );
-                    let _ = std::fs::rename(&scan, format!("{scan}.bak"));
-                    reorged_tokens.push(token.clone());
-                    continue;
-                }
-                if e.reorged_strikes > 0 {
-                    any_behind = true;
-                    continue;
-                }
-                if !e.caught_up {
-                    any_behind = true;
-                }
-                // Persist a checkpoint once enough new blocks accrue, or the first time
-                // this wallet reaches the tip, so a restart resumes here instead of
-                // rescanning from birthday.
-                let advanced = e.scanned.saturating_sub(e.saved_scanned);
-                let just_caught_up = e.caught_up && !was_caught_up;
-                if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0)) {
-                    if let Err(err) = save_checkpoint(
-                        &state.wallet_dir,
-                        &token,
-                        &e.genesis,
-                        &e.low,
-                        e.scanned as u64,
-                        &e.db,
-                        &e.boundaries,
-                        e.sink_blue,
-                    ) {
-                        eprintln!("checkpoint write failed for {token}: {err}");
-                    } else {
-                        e.saved_scanned = e.scanned;
-                    }
-                }
-                // Refresh the out-of-band status snapshot while we still hold the lock,
-                // so a `status` call that races the NEXT scan pass answers with these
-                // real numbers instead of the zero default (the balance/progress flicker).
-                let snap = snap_from_entry(state.address_of(&e.db), &e, chain_len);
-                drop(e);
-                state.snapshots.lock().await.insert(token.clone(), snap);
-                // A real sleep (not just yield_now) between wallets. yield_now only hands
-                // off to another ready tokio task, which is useless when every core is
-                // already pinned by CPU-bound scan work — HTTP still can't get a cycle.
-                // A short wall-clock sleep forces the loop to relinquish the CPU so the
-                // HTTP handlers (and wallet loads) actually run. Caps sync throughput but
-                // keeps the daemon responsive under a big rescan.
-                tokio::time::sleep(std::time::Duration::from_millis(SYNC_WALLET_THROTTLE_MS)).await;
             }
         }
         if !reorged_tokens.is_empty() {
@@ -2364,6 +2483,10 @@ async fn wallet_prepare(
 ) -> Result<Json<PrepareResp>, (StatusCode, Json<serde_json::Value>)> {
     use rand::RngCore;
 
+    let _prepare_permit = state.prepare_gate.try_acquire().map_err(|_| {
+        err(StatusCode::TOO_MANY_REQUESTS, "a shielded payment is already being prepared; wait for it to finish before retrying")
+    })?;
+
     // Watch-only: authenticated by possession of the FVK, not a token/seed.
     let fvk_bytes = unhex(&req.fvk_hex)
         .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
@@ -2736,6 +2859,7 @@ async fn main() {
         page_cache: Mutex::new(PageCache::new()),
         last_touch: Mutex::new(HashMap::new()),
         load_gate: tokio::sync::Semaphore::new(2),
+        prepare_gate: tokio::sync::Semaphore::new(1),
         node_tip: Mutex::new((0, std::time::Instant::now())),
         prepared: Mutex::new(HashMap::new()),
         snapshots: Mutex::new(HashMap::new()),

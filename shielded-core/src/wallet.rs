@@ -21,13 +21,13 @@ pub mod scan {
     use crate::bundle::{ActionWire, ShieldedBundle};
     use orchard::{
         Action,
-        keys::{FullViewingKey, IncomingViewingKey, Scope, SpendingKey},
+        keys::{FullViewingKey, IncomingViewingKey, PreparedIncomingViewingKey, Scope, SpendingKey},
         note::{ExtractedNoteCommitment, Note, Nullifier, TransmittedNoteCiphertext},
         note_encryption::OrchardDomain,
         primitives::redpallas::{Signature, SpendAuth, VerificationKey},
         value::ValueCommitment,
     };
-    use zcash_note_encryption::try_note_decryption;
+    use zcash_note_encryption::batch;
 
     /// A note recovered from a bundle: which action carried it (its position
     /// offset within the block's outputs, needed to build a witness later) and
@@ -79,22 +79,57 @@ pub mod scan {
     }
 
     /// Scan a bundle with an incoming viewing key, returning every note addressed
-    /// to the key's holder (trial decryption, §2.10).
+    /// to the key's holder (trial decryption, §2.10). Convenience wrapper that
+    /// prepares the ivk on each call; callers scanning many bundles (the wallet
+    /// sync loop) should prepare once and use [`scan_bundle_prepared`].
     pub fn scan_bundle(ivk: &IncomingViewingKey, bundle: &ShieldedBundle) -> Vec<ReceivedNote> {
-        let prepared = ivk.prepare();
-        let mut received = Vec::new();
+        scan_bundle_prepared(&ivk.prepare(), bundle)
+    }
+
+    /// Trial-decrypt a bundle with an **already-prepared** ivk, batching the
+    /// per-action `epk^ivk` Diffie–Hellman across all of the bundle's actions.
+    ///
+    /// Two wins over the naive per-action loop:
+    /// - The ivk precomputation ([`IncomingViewingKey::prepare`]) is done **once**
+    ///   by the caller and reused for every bundle in a scan, instead of per bundle.
+    /// - [`zcash_note_encryption::batch::try_note_decryption`] shares one batched
+    ///   ephemeral-key preparation (`batch_epk`) across every action, so the field
+    ///   inversion that dominates each trial decryption is amortized (Montgomery's
+    ///   trick) instead of paid per action. This is the same primitive Zcash's
+    ///   light-client batch scanner uses.
+    ///
+    /// Recovery semantics are byte-for-byte identical to the per-action path: the
+    /// batch returns one result per output, in input order, so each recovered note
+    /// is mapped back to the exact action index it came from.
+    pub fn scan_bundle_prepared(prepared: &PreparedIncomingViewingKey, bundle: &ShieldedBundle) -> Vec<ReceivedNote> {
+        // Reconstruct the valid actions, remembering each one's original index (a
+        // malformed action carries no note for us and is simply skipped, exactly as
+        // in the per-action path).
+        let mut idx_map: Vec<usize> = Vec::with_capacity(bundle.actions.len());
+        let mut outputs: Vec<(OrchardDomain, Action<Signature<SpendAuth>>)> = Vec::with_capacity(bundle.actions.len());
         for (i, a) in bundle.actions.iter().enumerate() {
             let Some(action) = reconstruct_action(a) else { continue };
             let domain = OrchardDomain::for_action(&action);
-            if let Some((note, _addr, _memo)) = try_note_decryption(&domain, &prepared, &action) {
-                received.push(ReceivedNote { action_index: i, note });
+            idx_map.push(i);
+            outputs.push((domain, action));
+        }
+        if outputs.is_empty() {
+            return Vec::new();
+        }
+        // One ivk, many outputs: the returned Vec has the same length and order as
+        // `outputs`, each entry `Some(((note, _addr, _memo), ivk_index))` on a hit.
+        let results = batch::try_note_decryption(std::slice::from_ref(prepared), &outputs);
+        let mut received = Vec::new();
+        for (pos, r) in results.into_iter().enumerate() {
+            if let Some(((note, _addr, _memo), _ivk_index)) = r {
+                received.push(ReceivedNote { action_index: idx_map[pos], note });
             }
         }
         received
     }
 }
 
-pub use scan::{ReceivedNote, address_bytes_from_seed, ivk_from_seed, scan_bundle};
+pub use scan::{ReceivedNote, address_bytes_from_seed, ivk_from_seed, scan_bundle, scan_bundle_prepared};
 
 #[cfg(feature = "circuit")]
 pub mod build {
