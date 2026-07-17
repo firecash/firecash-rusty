@@ -491,11 +491,52 @@ const WITNESS_ADVANCE_CAP: u64 = 4000;
 /// `BUDGET / note_count` (floored at [`WITNESS_MIN_STEP`]) bounds the step to roughly this
 /// many hashes regardless of wallet size, keeping the loop responsive. Witnesses that
 /// don't finish catching up here are rebuilt on demand at spend time anyway.
-#[allow(dead_code)]
 const WITNESS_ADVANCE_BUDGET: u64 = 400_000;
 /// Floor on the per-pass leaf cap, so even a huge wallet still makes some progress.
-#[allow(dead_code)]
 const WITNESS_MIN_STEP: u64 = 32;
+
+/// Leaves the background compaction rolls the fast-sync base forward per step. Each step
+/// costs O(step) Sinsemilla work (it rebuilds the frontier at the new base), so it is
+/// bounded like the witness step; a full-scan wallet's base climbs to its own notes over a
+/// couple of minutes of throttled passes, after which every spend replays only the few
+/// thousand leaves above the notes instead of the whole chain. See
+/// [`WalletDb::advance_base_capped`].
+const BASE_ADVANCE_STEP: u64 = 8192;
+
+/// Leaves per step for the ONE-TIME cold warm (base roll + witness build) of a freshly
+/// loaded / full-scan wallet. Larger than the steady step so the ~30–90 s one-time build
+/// converges in a handful of passes instead of crawling for minutes while the user keeps
+/// hitting a COLD send. Each step is one `block_in_place`, so it holds the wallet lock for
+/// ~a few seconds at a time (status calls for that one wallet wait briefly); it runs at
+/// most once per wallet load, then `witnesses_warm` latches and only the cheap incremental
+/// step runs.
+const COLD_WARM_STEP: u64 = 16384;
+
+/// Per-step WORK budget (≈ leaves × witnesses) for the cold warm. Dividing the leaf step
+/// by the note count keeps a 32-note wallet's step as cheap as a 1-note wallet's, so no
+/// single wallet monopolises a warm slot and starves the interactive few-note wallets.
+const COLD_WARM_BUDGET: u64 = 32768;
+
+/// Above this many notes a wallet is NOT eagerly witnessed — witnessing them all costs
+/// leaves × notes and would hog the shared loop for minutes. These are pool/treasury/miner
+/// wallets that rarely spend; the few notes a spend selects rebuild on demand instead. The
+/// interactive web wallets (a handful of notes) are the ones that get the warm fast path.
+const EAGER_WARM_MAX_NOTES: u64 = 32;
+
+/// Longest witness climb a note-heavy (never-eager-warmed) wallet may do inline at
+/// send time. Each climbed leaf costs one Sinsemilla append per live witness (up to
+/// 256, ~15 ms/leaf worst case), so 512 leaves ≈ ≤8 s — and at 1 BPS it comfortably
+/// covers the gap since the wallet's last spend. Anything longer is skipped: the few
+/// selected notes rebuild on demand instead, which is witness-count-free.
+const SPEND_CLIMB_INLINE_MAX: u64 = 512;
+
+/// Minimum wall-clock gap between two background witness pre-advance steps for the SAME
+/// wallet. The sync loop spins as fast as every 10 ms while any wallet is behind, so
+/// without this a caught-up wallet would fire a `WITNESS_ADVANCE_BUDGET` step ~100×/s and
+/// pin every core. One step per second caps the steady witness work to ~`BUDGET` hashes/s
+/// per wallet: a cold miner wallet (≈491 K leaves) warms in ~2–3 min at low CPU, then the
+/// step drops to ~1 leaf/block and idles. See [`WalletEntry::last_witness_advance`].
+const WITNESS_ADVANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// A wallet is synced by the background loop only while it has been touched by a
 /// request within this window; after that it is parked until the next request. Keeps a
@@ -816,6 +857,25 @@ struct WalletEntry {
     /// counting it from both places would briefly double the pending amount — so mempool
     /// bundles whose nullifiers appear here are skipped.
     unsettled_nulls: HashSet<kaspa_shielded_core::nullifier::NullifierBytes>,
+    /// When the background witness pre-advance last ran for this wallet. The sync loop
+    /// spins as fast as every 10 ms while any wallet is behind, so without this throttle
+    /// a caught-up note-heavy wallet fires a full `WITNESS_ADVANCE_BUDGET` step ~100×/s
+    /// and pins every core (observed live: walletd at 214 % CPU that never relents). We
+    /// take at most one witness step per [`WITNESS_ADVANCE_INTERVAL`], which caps the
+    /// steady witness work to ~`BUDGET` hashes/s per wallet — a cold miner wallet warms
+    /// over a couple of minutes at low CPU, then idles (matured grows ~1 leaf/block).
+    last_witness_advance: Option<std::time::Instant>,
+    /// Set once this wallet's witnesses have first been warmed all the way to the matured
+    /// anchor (base compacted to its notes + every note witnessed). Until then the
+    /// caught-up tail does the one-time heavy build in large steps so it converges in a
+    /// few passes instead of crawling; after it, only the cheap ~1-leaf/block incremental
+    /// advance runs.
+    witnesses_warm: bool,
+    /// Request an immediate checkpoint write on the next `sync_one_wallet` pass, regardless
+    /// of the block-count threshold — set the moment the witnesses first warm, so the
+    /// expensive-to-rebuild witness state is persisted at once (a restart seconds later
+    /// must not throw it away and re-do the ~30–90 s warm).
+    force_checkpoint: bool,
 }
 
 /// How many chain-block→leaf boundaries [`WalletEntry`] keeps. Anchor maturity is
@@ -860,6 +920,9 @@ impl WalletEntry {
             preview: Preview::default(),
             mempool: Preview::default(),
             unsettled_nulls: HashSet::new(),
+            last_witness_advance: None,
+            witnesses_warm: false,
+            force_checkpoint: false,
         }
     }
 
@@ -1012,23 +1075,80 @@ impl WalletEntry {
             // `sync_loop`, which runs with the lock released.
             tokio::task::yield_now().await;
         }
-        // Advance the spend witnesses toward the matured anchor a bounded step at a time,
-        // yielding between steps. Only near the tip (`caught_up`): during a long initial
-        // scan the user cannot spend anyway, and advancing witnesses across the whole
-        // 170K-leaf history in one pass is an O(N*k) burst that pins a core and starves
-        // the HTTP handler — the live "wallet won't connect" outage. Near the tip the
-        // catch-up is small and, once done, stays incremental.
-        // NB: no eager witness pre-advancing here. It was the last heavy *synchronous*
-        // step in the sync path — one `advance_witnesses_capped` call hashes
-        // cap × (note count) Sinsemilla commitments with no await inside, which on a
-        // heavy wallet blocks the tokio worker for tens of seconds and stalls every
-        // HTTP request and every other wallet's scan (the "stuck at N%" outage). It was
-        // only ever a spend-latency optimization: a spend that needs a note's witness
-        // rebuilds it on demand from the persisted leaf stream (`witness_path_at`, which
-        // already falls back to a fresh rebuild when no live witness is held). Dropping
-        // the pre-advance keeps sync_chunk O(scan) and non-blocking; the one-time
-        // rebuild cost moves to spend time, where it's paid only for the notes a spend
-        // actually selects.
+        // Keep this wallet's spend-witnesses tracking the matured anchor so pressing Send is
+        // a witness *lookup* (~ms), never a Sinsemilla replay of the chain (measured cold:
+        // 30–36 s, 90 % of a send). Two regimes, only near the tip (`caught_up`):
+        //
+        //   COLD (`!witnesses_warm`): the one-time heavy build for a full-scan / freshly
+        //   loaded wallet — roll the base up to the wallet's notes (dropping the leaves
+        //   below, `advance_base_capped`), then witness every note up to the matured anchor
+        //   (`advance_witnesses_capped`). Done in LARGE steps so it converges in a handful
+        //   of passes instead of crawling for minutes (the earlier throttled version let the
+        //   user keep sending mid-warm — every send stayed COLD). Each big step is a single
+        //   `block_in_place`, so it can't spin the loop; and it latches `witnesses_warm`
+        //   when done, so this heavy path runs at most once per wallet load. The instant it
+        //   warms it asks for a checkpoint (`force_checkpoint`) so the expensive witness
+        //   state is persisted (v5) and a restart never has to redo it.
+        //
+        //   WARM: cheap throttled maintenance — the base only needs a nudge if a note
+        //   arrived below it (rare), and witnesses advance ~1 leaf/block as the anchor moves.
+        //
+        // The base compaction no longer wipes warm witnesses (they are self-contained and
+        // valid above the base — see `advance_base_capped`), so the two no longer fight.
+        // Any note not yet reached still rebuilds on demand in `witness_path_at`, so
+        // correctness never depends on this pre-advance.
+        if self.caught_up {
+            if let Some(matured) = self.matured_leaves() {
+                if !self.witnesses_warm {
+                    let note_count = self.db.notes().len() as u64;
+                    if note_count > EAGER_WARM_MAX_NOTES {
+                        // A pool/treasury/miner wallet with too many notes: warming (and even
+                        // rolling the base) costs leaves×notes and would hog the shared loop
+                        // for minutes, starving the interactive few-note web wallets (the bug
+                        // that left a 1-note wallet's base at +16 K after 30 min). Skip the
+                        // whole eager prepare — such wallets rarely spend, and the few notes a
+                        // spend selects rebuild on demand. Latch so we never retry.
+                        self.witnesses_warm = true;
+                        log::info!("skipping eager warm for note-heavy wallet (notes={note_count}); on-demand at spend");
+                    } else {
+                        // Roll the base up to our notes first (cheap: cost is leaves, not
+                        // leaves×notes), then warm the witnesses to the matured anchor.
+                        let rolling = tokio::task::block_in_place(|| self.db.advance_base_capped(matured, COLD_WARM_STEP));
+                        if !rolling {
+                            // Bound the step by WORK (≈ leaves×notes ≤ COLD_WARM_BUDGET) so a
+                            // 32-note wallet's step is as cheap as a 1-note wallet's.
+                            let wstep = (COLD_WARM_BUDGET / note_count.max(1)).clamp(WITNESS_MIN_STEP, COLD_WARM_STEP);
+                            let more = tokio::task::block_in_place(|| self.db.advance_witnesses_capped(matured, wstep));
+                            if !more {
+                                self.witnesses_warm = true;
+                                self.force_checkpoint = true;
+                                log::info!(
+                                    "witnesses warmed for wallet (notes={}, base_size={}, witnessed_upto={} == matured {})",
+                                    note_count,
+                                    self.db.base_size(),
+                                    self.db.witnessed_upto(),
+                                    matured,
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    let due = self.last_witness_advance.map(|t| t.elapsed() >= WITNESS_ADVANCE_INTERVAL).unwrap_or(true);
+                    if due {
+                        let note_count = self.db.notes().len() as u64;
+                        tokio::task::block_in_place(|| {
+                            self.db.advance_base_capped(matured, BASE_ADVANCE_STEP);
+                            // Only a few-note wallet keeps its witnesses warm incrementally; a
+                            // note-heavy one stays on the on-demand path (see above).
+                            if note_count <= EAGER_WARM_MAX_NOTES && self.db.advance_witnesses_capped(matured, WITNESS_ADVANCE_CAP) {
+                                self.witnesses_warm = false;
+                            }
+                        });
+                        self.last_witness_advance = Some(std::time::Instant::now());
+                    }
+                }
+            }
+        }
         self.error = None;
         self.updated_unix = now_unix();
     }
@@ -1043,6 +1163,33 @@ impl WalletEntry {
     fn advance_spend_witnesses(&mut self) {
         if let Some(matured) = self.matured_leaves() {
             self.db.advance_witnesses(matured);
+        }
+    }
+
+    /// Send-time witness top-up, **bounded**. For a warm wallet this is the cheap
+    /// "climb the few leaves since the last sync tick". But for a note-heavy wallet
+    /// the eager warm is skipped, so its first spend would climb the whole chain
+    /// here — and each climbed leaf costs one append per live witness (up to 256),
+    /// ~15 ms/leaf. Uncapped that was a 40+ minute compute (the 2026-07-17 outage:
+    /// it ran on the async runtime holding the tokio I/O driver, freezing every
+    /// HTTP request). So a note-heavy wallet only climbs a short gap inline; a
+    /// long climb is skipped entirely — the ≤ max-spends notes a send selects
+    /// rebuild on demand in `witness_path_at`, bounded and witness-count-free.
+    fn advance_spend_witnesses_bounded(&mut self) {
+        let note_count = self.db.notes().len() as u64;
+        if note_count <= EAGER_WARM_MAX_NOTES {
+            self.advance_spend_witnesses();
+            return;
+        }
+        if let Some(matured) = self.matured_leaves() {
+            let climb = matured.saturating_sub(self.db.witnessed_upto());
+            if climb <= SPEND_CLIMB_INLINE_MAX {
+                self.db.advance_witnesses(matured);
+            } else {
+                log::info!(
+                    "send: skipping inline witness climb of {climb} leaves on note-heavy wallet (notes={note_count}); selected notes rebuild on demand"
+                );
+            }
         }
     }
 }
@@ -1226,6 +1373,11 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
         note_count: e.db.notes().len(),
         updated_unix: e.updated_unix,
         error: e.error.clone(),
+        // Synced, but still doing the ONE-TIME witness warm-up (building/persisting the
+        // spend paths) — sends work but the first one is slow until this finishes. Lets the
+        // UI show "Preparing wallet for fast sends…" instead of a confusing "syncing 100%".
+        // Note-heavy wallets skip the eager warm, so they are never reported as warming.
+        warming: e.caught_up && !e.witnesses_warm && (e.db.notes().len() as u64) <= EAGER_WARM_MAX_NOTES,
     }
 }
 
@@ -1250,6 +1402,7 @@ fn fill_status_from_snap(resp: &mut StatusResp, s: &StatusSnap) {
     resp.note_count = s.note_count;
     resp.updated_unix = s.updated_unix;
     resp.error = s.error.clone();
+    resp.warming = s.warming;
 }
 
 /// Last-known-good status for a loaded wallet, kept OUTSIDE the wallet mutex so the
@@ -1274,6 +1427,7 @@ struct StatusSnap {
     note_count: usize,
     updated_unix: u64,
     error: Option<String>,
+    warming: bool,
 }
 
 /// A non-custodial payment proven and awaiting on-device spend-auth signatures.
@@ -1623,15 +1777,13 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     let was_caught_up = e.caught_up;
     e.caught_up = false;
     e.sync_chunk(&state.sync_client, &state.page_cache).await;
-    // NB: NO eager witness advance here. Its cost is `leaves × note_count × TREE_DEPTH(32)`
-    // Sinsemilla hashes, so for a many-note wallet even a small leaf cap cost 13–15 s per
-    // pass — it ran on the sync path and froze every wallet's scan (observed live
-    // 2026-07-16). It is only ever a spend-latency optimization: a spend rebuilds the
-    // witness it needs on demand from the persisted leaf stream (`witness_path_at`, which
-    // already falls back to a fresh rebuild). Dropping it keeps this function O(scan) and
-    // non-blocking; the one-time rebuild cost moves to spend time, paid only for the notes
-    // a spend actually selects. (`WITNESS_ADVANCE_*` consts retained for a future
-    // work-budgeted re-enable.)
+    // NB: the eager witness pre-advance and base compaction live in `sync_chunk`'s
+    // `caught_up` tail, THROTTLED to one bounded step per `WITNESS_ADVANCE_INTERVAL` per
+    // wallet (an unthrottled advance on the 10 ms sync spin pinned every core, observed
+    // live 2026-07-16). Together with the v5 checkpoint persisting the resulting witnesses,
+    // a spend becomes a lookup instead of an O(chain) Sinsemilla replay; `witness_path_at`
+    // still rebuilds on demand for any note whose witness isn't held (correctness never
+    // depends on the pre-advance).
     if e.reorged_strikes >= REORG_STRIKES {
         // Cursor off the selected chain (or pruned away) for enough passes: retire the
         // checkpoint to .bak and let the caller evict + reload it from a fresh anchor.
@@ -1654,13 +1806,18 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // reaches the tip, so a restart resumes here instead of rescanning from birthday.
     let advanced = e.scanned.saturating_sub(e.saved_scanned);
     let just_caught_up = e.caught_up && !was_caught_up;
-    if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0)) {
+    // `force_checkpoint` is set the instant the witnesses first warm, so the expensive
+    // witness state (v5) is persisted immediately — a restart seconds later must not throw
+    // it away and re-do the ~30–90 s warm.
+    let force = e.force_checkpoint;
+    if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0) || force) {
         if let Err(err) =
             save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue)
         {
             eprintln!("checkpoint write failed for {token}: {err}");
         } else {
             e.saved_scanned = e.scanned;
+            e.force_checkpoint = false;
         }
     }
     // Refresh the out-of-band status snapshot while we still hold the lock.
@@ -1787,6 +1944,11 @@ struct StatusResp {
     node_connected: bool,
     daa_score: u64,
     synced: bool,
+    /// Synced, but still doing the one-time witness warm-up. The SPA shows a "preparing for
+    /// fast sends" notice; sends still work (the first is just slower). Absent/false on
+    /// older daemons and on note-heavy wallets (which skip the eager warm).
+    #[serde(default)]
+    warming: bool,
     scanned_blocks: usize,
     chain_len: u64,
     balance_sompi: String,
@@ -1835,6 +1997,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         node_connected,
         daa_score,
         synced: false,
+        warming: false,
         scanned_blocks: 0,
         chain_len: daa_score,
         balance_sompi: "0".into(),
@@ -2055,9 +2218,37 @@ async fn wallet_watch(
     let db = key.empty_db().ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?;
     let address = state.address_of(&db);
 
+    // If this EXACT key is already registered under this token and has a resumable
+    // checkpoint, a reconnect must NOT discard it and fast-sync from the client-supplied
+    // birthday. A browser reconnecting after a daemon restart re-registers with
+    // birthday ≈ tip; trusting that would skip the blocks where the wallet actually
+    // received funds and show a ZERO balance for coins it still holds (live incident
+    // 2026-07-16: a restart→re-register set birthday to the tip and the wallet's real note
+    // sat in the skipped window). Resume the existing checkpoint instead, and never let the
+    // persisted birthday move forward (min with the old value) so a later cold load can't
+    // skip those notes either. Only a genuinely new/changed key, or a missing checkpoint,
+    // takes the rescan-from-birthday path below.
+    let existing = load_wallet_meta(&state.wallet_dir, &token, state.wallet_secret.as_deref());
+    let same_key = matches!(&existing, Some((WalletKey::Fvk(f), _)) if *f == fvk);
+    let has_checkpoint = checkpoint_cursor(&state.wallet_dir, &token, &state.genesis).is_some();
+    if same_key && has_checkpoint {
+        let stored_birthday = existing.as_ref().map(|(_, b)| *b).unwrap_or(0);
+        let keep_birthday = stored_birthday.min(req.birthday);
+        save_fvk(&state.wallet_dir, &token, &state.network, &fvk, keep_birthday)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
+        // Evict any stale in-RAM entry so the next load resumes from the preserved checkpoint.
+        state.wallets.lock().await.remove(&token);
+        state
+            .get_wallet(&token)
+            .await
+            .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "failed to resume wallet from checkpoint"))?;
+        log::info!("re-registered watch-only wallet for token {token}: resumed from checkpoint (birthday kept {keep_birthday})");
+        return Ok(Json(AddressResp { address }));
+    }
+
     save_fvk(&state.wallet_dir, &token, &state.network, &fvk, req.birthday)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
-    // A re-registered key must rescan from its own birthday, not resume another
+    // A new or changed key must rescan from its own birthday, not resume another
     // wallet's checkpoint stream.
     let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
     let entry = match state.fast_sync_entry(key, state.genesis, req.birthday).await {
@@ -2210,7 +2401,9 @@ async fn wallet_send(
         let mut e = w.lock().await;
         // Top up the live witnesses to the current matured anchor (a no-op unless a
         // block landed since the last sync tick), so witnessing below is a lookup.
-        e.advance_spend_witnesses();
+        // block_in_place: this is CPU-bound Sinsemilla; run inline on the async
+        // runtime it can capture the tokio I/O driver and freeze ALL of HTTP.
+        tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded());
         let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
             let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
@@ -2225,9 +2418,10 @@ async fn wallet_send(
                         let mut inputs = Vec::with_capacity(n_notes);
                         let mut positions = Vec::with_capacity(n_notes);
                         for note in &candidates[idx..idx + n_notes] {
-                            let path =
-                                e.db.witness_path_at(note.position, matured)
-                                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                            // block_in_place: a cold note's on-demand rebuild is an
+                            // O(chain) Sinsemilla replay — must not pin a runtime worker.
+                            let path = tokio::task::block_in_place(|| e.db.witness_path_at(note.position, matured))
+                                .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
                             inputs.push((note.note.clone(), path));
                             positions.push(note.position);
                         }
@@ -2380,9 +2574,10 @@ async fn wallet_consolidate(
         let mut inputs = Vec::with_capacity(candidates.len());
         let mut positions = Vec::with_capacity(candidates.len());
         for n in &candidates {
-            let path =
-                e.db.witness_path_at(n.position, matured)
-                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+            // block_in_place: an on-demand rebuild is an O(chain) Sinsemilla replay —
+            // must not pin a runtime worker (it can hold the tokio I/O driver).
+            let path = tokio::task::block_in_place(|| e.db.witness_path_at(n.position, matured))
+                .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
             inputs.push((n.note.clone(), path));
             positions.push(n.position);
         }
@@ -2522,9 +2717,24 @@ async fn wallet_prepare(
         if let Some(w) = state.get_wallet(&token).await {
             let mut e = w.lock().await;
             if e.db.fvk().to_bytes() == fvk_bytes {
+                let matured_leaves = e.matured_leaves().unwrap_or(0);
+                let warm_before = e.db.witnessed_upto();
+                let climb = matured_leaves.saturating_sub(warm_before);
                 let t_w = std::time::Instant::now();
-                e.advance_spend_witnesses();
-                log::info!("prepare: witness advance took {:.1?}", t_w.elapsed());
+                // Bounded + block_in_place: the uncapped inline climb here is what froze
+                // the whole daemon for ~50 min on 2026-07-17 (3,304-note wallet).
+                tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded());
+                log::info!(
+                    "prepare: witness advance took {:.1?} (notes={}, base_size={}, witnessed_upto {}→{} of matured {}, climbed {} leaves; {} at send time)",
+                    t_w.elapsed(),
+                    e.db.notes().len(),
+                    e.db.base_size(),
+                    warm_before,
+                    e.db.witnessed_upto(),
+                    matured_leaves,
+                    climb,
+                    if climb == 0 { "WARM — background pre-advance kept up" } else { "COLD — witnesses were behind" },
+                );
                 let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
                     let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
@@ -2535,9 +2745,10 @@ async fn wallet_prepare(
                             break;
                         }
                         let t_p = std::time::Instant::now();
-                        let path =
-                            e.db.witness_path_at(n.position, matured)
-                                .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                        // block_in_place: a cold note's rebuild is an O(chain) Sinsemilla
+                        // replay — must not pin a runtime worker.
+                        let path = tokio::task::block_in_place(|| e.db.witness_path_at(n.position, matured))
+                            .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
                         log::info!("prepare: witness_path_at(note@{}) took {:.1?}", n.position, t_p.elapsed());
                         inputs.push((n.note.clone(), path));
                         selected += n.value();
