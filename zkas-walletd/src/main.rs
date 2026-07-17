@@ -166,6 +166,58 @@ fn max_spends_per_tx() -> usize {
     n
 }
 
+/// Mempool `DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE` (sompi per kilogram of mass).
+const RELAY_FEE_PER_KG: u64 = 100_000;
+/// Envelope bytes the node wraps around the bundle payload (~94 observed live;
+/// padded a little so the computed fee always clears the node's own figure).
+const TX_ENVELOPE_BYTES_FEE: u64 = 128;
+/// The wallet's flat default fee (0.03 ZKAS) — the floor for small payments.
+const DEFAULT_FEE_SOMPI: u64 = 3_000_000;
+
+/// The node's minimum relay fee for a payment spending `n_spends` notes.
+///
+/// The mempool prices a tx at `max(compute_mass, normalized_transient_mass) ×
+/// relay_fee/1000`, and for byte-heavy shielded bundles the transient term
+/// dominates: `bytes × TRANSIENT_BYTE_TO_MASS_FACTOR(4) × cofactor(compute
+/// limit 500 000 / transient limit 1 000 000 = ½) × 100 000/1000` = bytes×200.
+/// A 6-spend bundle is ~21.9 KB → ~4.38 ZKAS-cents — which is how a flat
+/// 0.03 fee got a real 300-coin send rejected with "under the required amount
+/// of 437…". A payment bundle carries `max(spends, 2)` actions (recipient +
+/// change are padded in).
+fn min_relay_fee_for_spends(n_spends: usize) -> u64 {
+    let bytes = expected_wire_len(n_spends.max(2)) as u64 + TX_ENVELOPE_BYTES_FEE;
+    bytes * TRANSIENT_BYTE_TO_MASS_FACTOR / 2 * RELAY_FEE_PER_KG / 1000
+}
+
+/// The fee a chunk spending `n` notes actually pays: the caller's fee (or the
+/// flat default) — but never below what the node will relay.
+fn chunk_fee(base_fee: u64, n_spends: usize) -> u64 {
+    base_fee.max(min_relay_fee_for_spends(n_spends))
+}
+
+/// How many value-descending notes a single tx must spend to cover `amount`,
+/// solved together with the byte-proportional fee (more notes → bigger tx →
+/// higher fee → possibly one more note). `chunk_fee` is monotonic in the note
+/// count, so this converges in at most `max_per` rounds. Returns `(n, fee)`;
+/// when the funds don't stretch, `n` is the count tried and the caller's
+/// sum-vs-need check reports insufficiency.
+fn select_spend_count(values: &[u64], amount: u64, base_fee: u64, max_per: usize) -> (usize, u64) {
+    let mut fee = chunk_fee(base_fee, 1);
+    loop {
+        let mut sum = 0u64;
+        let mut n = 0usize;
+        while n < max_per && n < values.len() && sum < amount.saturating_add(fee) {
+            sum = sum.saturating_add(values[n]);
+            n += 1;
+        }
+        let req = chunk_fee(base_fee, n.max(1));
+        if req <= fee {
+            return (n, fee);
+        }
+        fee = req;
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "zkas-walletd", about = "ZKas shielded wallet daemon (self-hosted or hosted)")]
 struct Cli {
@@ -2318,26 +2370,32 @@ struct SendResp {
 
 /// Greedy chunk planning over **value-descending** candidate notes: each
 /// transaction spends at most `max_per` notes and pays `min(remaining,
-/// chunk_sum − fee)` to the recipient, until `amount` is covered. Returns the
-/// per-chunk `(note_count, pay)` plan, or `None` if the notes run out
-/// (insufficient funds once per-tx fees are accounted).
-fn plan_chunks(values: &[u64], amount: u64, fee: u64, max_per: usize) -> Option<Vec<(usize, u64)>> {
+/// chunk_sum − fee)` to the recipient, until `amount` is covered. The fee is
+/// **byte-proportional per chunk** (`chunk_fee`): the node's minimum relay fee
+/// grows with the number of spends, so a flat fee that clears a 1-spend tx is
+/// rejected for a 5-spend one. Returns the per-chunk `(note_count, pay, fee)`
+/// plan, or `None` if the notes run out (insufficient funds once per-tx fees
+/// are accounted).
+fn plan_chunks(values: &[u64], amount: u64, base_fee: u64, max_per: usize) -> Option<Vec<(usize, u64, u64)>> {
     let mut chunks = Vec::new();
     let mut remaining = amount;
     let mut i = 0usize;
     while remaining > 0 {
         let mut sum = 0u64;
         let mut n = 0usize;
-        while n < max_per && i < values.len() && sum < remaining.saturating_add(fee) {
+        // The fee this chunk must clear rises as notes are added — re-evaluate the
+        // target as we fill (chunk_fee is monotonic in n, so this converges).
+        while n < max_per && i < values.len() && sum < remaining.saturating_add(chunk_fee(base_fee, n.max(1))) {
             sum = sum.saturating_add(values[i]);
             i += 1;
             n += 1;
         }
+        let fee = chunk_fee(base_fee, n);
         if sum <= fee {
             return None;
         }
         let pay = remaining.min(sum - fee);
-        chunks.push((n, pay));
+        chunks.push((n, pay, fee));
         remaining -= pay;
     }
     Some(chunks)
@@ -2357,7 +2415,9 @@ async fn wallet_send(
         (None, Some(fc)) => (fc * SOMPI_PER_ZKAS as f64).round() as u64,
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "specify amount_sompi or amount_fc")),
     };
-    let fee = req.fee.unwrap_or(3_000_000);
+    // Floor fee: plan_chunks raises each chunk's fee to the node's
+    // byte-proportional minimum for however many notes that chunk spends.
+    let fee = req.fee.unwrap_or(DEFAULT_FEE_SOMPI);
 
     let client = &state.client;
     // The shielded sighash network domain: the GENESIS hash — what consensus
@@ -2396,7 +2456,7 @@ async fn wallet_send(
     // slack` blue units below the sink — a matured, canonical chain-block root
     // consensus accepts (`is_shielded_anchor_final`; maturity is measured in blue
     // score). The entry lock is held only for selection + witness building.
-    let mut planned: Option<(Vec<(Vec<_>, u64, Vec<u64>)>, u64, bool)> = None;
+    let mut planned: Option<(Vec<(Vec<_>, u64, Vec<u64>, u64)>, u64, bool)> = None;
     {
         let mut e = w.lock().await;
         // Top up the live witnesses to the current matured anchor (a no-op unless a
@@ -2414,7 +2474,7 @@ async fn wallet_send(
                 Some(plan) => {
                     let mut chunks = Vec::with_capacity(plan.len());
                     let mut idx = 0usize;
-                    for (n_notes, pay) in plan {
+                    for (n_notes, pay, cfee) in plan {
                         let mut inputs = Vec::with_capacity(n_notes);
                         let mut positions = Vec::with_capacity(n_notes);
                         for note in &candidates[idx..idx + n_notes] {
@@ -2426,7 +2486,7 @@ async fn wallet_send(
                             positions.push(note.position);
                         }
                         idx += n_notes;
-                        chunks.push((inputs, pay, positions));
+                        chunks.push((inputs, pay, positions, cfee));
                     }
                     planned = Some((chunks, have, e.caught_up));
                 }
@@ -2454,7 +2514,7 @@ async fn wallet_send(
             let plan = plan_chunks(&values, amount, fee, max_per_tx).ok_or_else(|| insufficient(have))?;
             let mut chunks = Vec::with_capacity(plan.len());
             let mut idx = 0usize;
-            for (n_notes, pay) in plan {
+            for (n_notes, pay, cfee) in plan {
                 let mut inputs = Vec::with_capacity(n_notes);
                 let mut positions = Vec::with_capacity(n_notes);
                 for note in &candidates[idx..idx + n_notes] {
@@ -2465,7 +2525,7 @@ async fn wallet_send(
                     positions.push(note.position);
                 }
                 idx += n_notes;
-                chunks.push((inputs, pay, positions));
+                chunks.push((inputs, pay, positions, cfee));
             }
             chunks
         }
@@ -2479,11 +2539,12 @@ async fn wallet_send(
     let tx_count = chunks.len();
     let mut txids: Vec<String> = Vec::with_capacity(tx_count);
     let mut sent = 0u64;
-    for (ci, (inputs, pay, positions)) in chunks.into_iter().enumerate() {
-        log::info!("send: building Orchard proof for tx {}/{tx_count} ({} spends, {pay} sompi + {fee} fee)...", ci + 1, inputs.len());
+    let mut total_fee = 0u64;
+    for (ci, (inputs, pay, positions, cfee)) in chunks.into_iter().enumerate() {
+        log::info!("send: building Orchard proof for tx {}/{tx_count} ({} spends, {pay} sompi + {cfee} fee)...", ci + 1, inputs.len());
         let ctx2 = ctx.clone();
         let started = std::time::Instant::now();
-        let payload = tokio::task::spawn_blocking(move || build_wallet_payment(seed, inputs, recipient, pay, fee, &net, &ctx2))
+        let payload = tokio::task::spawn_blocking(move || build_wallet_payment(seed, inputs, recipient, pay, cfee, &net, &ctx2))
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build payment: {e:?}")))?;
@@ -2494,6 +2555,7 @@ async fn wallet_send(
             Ok(accepted) => {
                 txids.push(accepted.to_string());
                 sent += pay;
+                total_fee += cfee;
                 let mut e = w.lock().await;
                 for p in positions {
                     e.db.mark_spent(p);
@@ -2514,7 +2576,6 @@ async fn wallet_send(
         }
     }
 
-    let total_fee = fee * tx_count as u64;
     Ok(Json(SendResp { txid: txids[0].clone(), amount_sompi: amount, fee_sompi: total_fee, txids, tx_count }))
 }
 
@@ -2548,14 +2609,14 @@ async fn wallet_consolidate(
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let seed = { w.lock().await.key.seed()? };
-    let fee = body.and_then(|Json(b)| b.fee).unwrap_or(3_000_000);
+    let base_fee = body.and_then(|Json(b)| b.fee).unwrap_or(DEFAULT_FEE_SOMPI);
     let own_recipient =
         address_bytes_from_seed(seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "seed is not a valid spending key"))?;
 
     let net: [u8; 32] = state.genesis.as_bytes();
 
     // Select up to a tx-full of the smallest matured notes under the entry lock.
-    let (inputs, positions, sum) = {
+    let (inputs, positions, sum, fee) = {
         let e = w.lock().await;
         let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
         let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) else {
@@ -2568,6 +2629,9 @@ async fn wallet_consolidate(
         if candidates.len() < 2 {
             return Err(err(StatusCode::CONFLICT, "nothing to consolidate: fewer than 2 matured notes"));
         }
+        // A full consolidation tx is the biggest standard tx there is — its fee
+        // must clear the node's byte-proportional minimum for that size.
+        let fee = chunk_fee(base_fee, candidates.len());
         if sum <= fee {
             return Err(err(StatusCode::CONFLICT, format!("smallest notes sum to {sum}, not more than the {fee} fee")));
         }
@@ -2581,7 +2645,7 @@ async fn wallet_consolidate(
             inputs.push((n.note.clone(), path));
             positions.push(n.position);
         }
-        (inputs, positions, sum)
+        (inputs, positions, sum, fee)
     };
 
     let consolidated = inputs.len();
@@ -2692,7 +2756,11 @@ async fn wallet_prepare(
         (None, Some(fc)) => (fc * SOMPI_PER_ZKAS as f64).round() as u64,
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "specify amount_sompi or amount_fc")),
     };
-    let fee = req.fee.unwrap_or(3_000_000);
+    // The caller's fee (or the flat default) is a FLOOR: the actual fee is raised
+    // to the node's byte-proportional minimum once the input count is known
+    // (`select_spend_count`), so multi-note payments are never relay-rejected.
+    let base_fee = req.fee.unwrap_or(DEFAULT_FEE_SOMPI);
+    let mut fee = chunk_fee(base_fee, 1);
 
     let client = &state.client;
     let net: [u8; 32] = state.genesis.as_bytes();
@@ -2701,7 +2769,7 @@ async fn wallet_prepare(
         Address::try_from(req.to.as_str()).map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid recipient address: {e}")))?;
     let recipient = orchard_recipient_bytes(&to_addr)
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "recipient is not a shielded Orchard address"))?;
-    let need = amount.checked_add(fee).ok_or_else(|| err(StatusCode::BAD_REQUEST, "amount + fee overflows"))?;
+    let mut need = amount.checked_add(fee).ok_or_else(|| err(StatusCode::BAD_REQUEST, "amount + fee overflows"))?;
 
     let max_per_tx = max_spends_per_tx();
 
@@ -2740,10 +2808,11 @@ async fn wallet_prepare(
                     let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
                     candidates.sort_by(|a, b| b.value().cmp(&a.value()));
                     have_total = Some(candidates.iter().map(|n| n.value()).sum());
-                    for n in &candidates {
-                        if selected >= need || inputs.len() == max_per_tx {
-                            break;
-                        }
+                    let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
+                    let (take, dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
+                    fee = dyn_fee;
+                    need = amount.saturating_add(fee);
+                    for n in candidates.iter().take(take) {
                         let t_p = std::time::Instant::now();
                         // block_in_place: a cold note's rebuild is an O(chain) Sinsemilla
                         // replay — must not pin a runtime worker.
@@ -2769,10 +2838,11 @@ async fn wallet_prepare(
         let mut candidates = db.notes().to_vec();
         candidates.sort_by(|a, b| b.value().cmp(&a.value()));
         have_total = Some(candidates.iter().map(|n| n.value()).sum());
-        for n in &candidates {
-            if selected >= need || inputs.len() == max_per_tx {
-                break;
-            }
+        let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
+        let (take, dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
+        fee = dyn_fee;
+        need = amount.saturating_add(fee);
+        for n in candidates.iter().take(take) {
             let path = db
                 .witness_path(n.position)
                 .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
@@ -3152,4 +3222,54 @@ async fn main() {
         log::error!("server error: {e}");
         std::process::exit(1);
     });
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+
+    /// The live rejection that motivated the dynamic fee: a 6-spend bundle is
+    /// 21 773 payload bytes (+94 envelope) → the node demanded 4 373 400 sompi
+    /// while the wallet offered the flat 3 000 000. Our computed minimum must
+    /// clear the node's figure (padding makes it slightly higher, never lower).
+    #[test]
+    fn six_spend_min_fee_clears_the_observed_rejection() {
+        let node_required = (expected_wire_len(6) as u64 + 94) * TRANSIENT_BYTE_TO_MASS_FACTOR / 2 * RELAY_FEE_PER_KG / 1000;
+        assert_eq!(node_required, 4_373_400);
+        assert!(min_relay_fee_for_spends(6) >= node_required);
+        // 1–2 spend payments stay at the flat default (the floor dominates).
+        assert!(min_relay_fee_for_spends(1) < DEFAULT_FEE_SOMPI);
+        assert_eq!(chunk_fee(DEFAULT_FEE_SOMPI, 1), DEFAULT_FEE_SOMPI);
+        // 4+ spends exceed the old flat fee — the exact class of send that failed.
+        assert!(min_relay_fee_for_spends(4) > DEFAULT_FEE_SOMPI);
+    }
+
+    #[test]
+    fn plan_chunks_prices_each_chunk_by_its_size() {
+        // 5 × 60-coin notes cover a 300-coin send minus fees: the plan must spend
+        // all five in one chunk and price it at the 5-spend minimum, not the flat fee.
+        let values = vec![6_000_000_000u64; 6];
+        let amount = 29_000_000_000u64; // 290 coins + fee fits in 5 notes
+        let plan = plan_chunks(&values, amount, DEFAULT_FEE_SOMPI, 6).expect("plan");
+        assert_eq!(plan.len(), 1);
+        let (n, pay, fee) = plan[0];
+        assert_eq!(n, 5);
+        assert_eq!(pay, amount);
+        assert_eq!(fee, chunk_fee(DEFAULT_FEE_SOMPI, 5));
+        assert!(fee > DEFAULT_FEE_SOMPI);
+    }
+
+    #[test]
+    fn select_spend_count_reaches_fee_fixpoint() {
+        // Needing a 4th note pushes the fee above the flat floor, which must not
+        // loop forever and must return the 4-note fee.
+        let values = vec![6_000_000_000u64; 6];
+        let amount = 20_000_000_000u64; // needs 4 notes once the higher fee lands
+        let (n, fee) = select_spend_count(&values, amount, DEFAULT_FEE_SOMPI, 6);
+        assert_eq!(n, 4);
+        assert_eq!(fee, chunk_fee(DEFAULT_FEE_SOMPI, 4));
+        // Insufficient funds: n maxes out and the caller's need-check reports it.
+        let (n, _fee) = select_spend_count(&values, 60_000_000_000, DEFAULT_FEE_SOMPI, 6);
+        assert_eq!(n, 6);
+    }
 }
