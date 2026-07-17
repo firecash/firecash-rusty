@@ -1,0 +1,33 @@
+[package]
+name = "zkas-sdk"
+description = "Public Rust SDK for ZKas shielded wallets and integrations"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+hex.workspace = true
+kaspa-addresses.workspace = true
+kaspa-shielded-core.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+zkas-signer.workspace = true
+zkas-wallet-engine.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[[example]]
+name = "payment_plan"
+path = "examples/payment_plan.rs"
+
+[[example]]
+name = "sign_prepared_payment"
+path = "examples/sign_prepared_payment.rs"

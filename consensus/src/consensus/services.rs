@@ -186,6 +186,7 @@ impl ConsensusServices {
             params.ghostdag_k(),
             params.skip_proof_of_work,
             params.toccata_activation,
+            params.merged_mining_activation,
             is_consensus_exiting,
         ));
 

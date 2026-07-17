@@ -37,6 +37,8 @@ pub mod scan {
         pub action_index: usize,
         /// The recovered note (spendable via `wallet::build_spend_bundle`).
         pub note: Note,
+        /// The output's memo, trimmed ([`trim_memo`]); empty = no memo.
+        pub memo: Vec<u8>,
     }
 
     impl ReceivedNote {
@@ -60,11 +62,21 @@ pub mod scan {
         Some(FullViewingKey::from(&sk).address_at(0u32, Scope::External).to_raw_address_bytes())
     }
 
+    /// Strip a memo to its meaningful bytes: trailing zeros go (our builders
+    /// zero-fill), and the Zcash "no memo" marker (a lone leading `0xF6`) reads
+    /// as empty too.
+    pub fn trim_memo(memo: &[u8]) -> Vec<u8> {
+        let end = memo.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        let trimmed = &memo[..end];
+        if trimmed == [0xf6] { Vec::new() } else { trimmed.to_vec() }
+    }
+
     /// Reconstruct an Orchard action from its wire form (auth = its spend-auth
     /// signature). Returns `None` if any field is malformed (such an action can
     /// carry no note for us). This mirrors the verifier's reconstruction and thus
-    /// enforces the identity `rk`/`epk` rules via `Action::from_parts`.
-    fn reconstruct_action(a: &ActionWire) -> Option<Action<Signature<SpendAuth>>> {
+    /// enforces the identity `rk`/`epk` rules via `Action::from_parts`. Crate-public:
+    /// `walletdb`'s history recorder reuses it for OVK output recovery.
+    pub(crate) fn reconstruct_action(a: &ActionWire) -> Option<Action<Signature<SpendAuth>>> {
         let nf: Nullifier = Option::from(Nullifier::from_bytes(&a.nullifier))?;
         let rk = VerificationKey::<SpendAuth>::try_from(a.rk).ok()?;
         let cmx: ExtractedNoteCommitment = Option::from(ExtractedNoteCommitment::from_bytes(&a.cmx))?;
@@ -121,15 +133,15 @@ pub mod scan {
         let results = batch::try_note_decryption(std::slice::from_ref(prepared), &outputs);
         let mut received = Vec::new();
         for (pos, r) in results.into_iter().enumerate() {
-            if let Some(((note, _addr, _memo), _ivk_index)) = r {
-                received.push(ReceivedNote { action_index: idx_map[pos], note });
+            if let Some(((note, _addr, memo), _ivk_index)) = r {
+                received.push(ReceivedNote { action_index: idx_map[pos], note, memo: trim_memo(&memo) });
             }
         }
         received
     }
 }
 
-pub use scan::{ReceivedNote, address_bytes_from_seed, ivk_from_seed, scan_bundle, scan_bundle_prepared};
+pub use scan::{ReceivedNote, address_bytes_from_seed, ivk_from_seed, scan_bundle, scan_bundle_prepared, trim_memo};
 
 #[cfg(feature = "circuit")]
 pub mod build {
@@ -435,6 +447,11 @@ pub mod build {
     /// state, so this holds. Every spend is authorized by the sender's single spend
     /// authority. Builds its own `ProvingKey`; heavy (a real Halo 2 proof whose cost
     /// grows with the number of inputs).
+    /// `recoverable` encrypts each output's details to the sender's own OVK
+    /// (Zcash-standard), so the wallet's chain-derived history can recover the
+    /// recipient/amount/memo of this send after any seed restore. Off = the old
+    /// behaviour: even the sender cannot recover who was paid. `memo` rides in
+    /// the recipient's encrypted note (zeros = no memo).
     #[allow(clippy::too_many_arguments)]
     pub fn build_wallet_payment(
         owner_seed: [u8; 32],
@@ -444,11 +461,14 @@ pub mod build {
         fee: u64,
         network_domain: &[u8; 32],
         tx_context: &[u8],
+        recoverable: bool,
+        memo: [u8; 512],
     ) -> Result<Vec<u8>, BuildError> {
         let (first_note, first_path) = inputs.first().ok_or(BuildError::Empty)?;
         let keys = ShieldedKeys::from_seed(owner_seed).ok_or(BuildError::Empty)?;
         let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
         let change_addr = keys.address();
+        let ovk = recoverable.then(|| keys.fvk.to_ovk(Scope::External));
 
         let total_in: u64 = inputs.iter().map(|(n, _)| n.value().inner()).sum();
         let change = total_in.checked_sub(amount).and_then(|v| v.checked_sub(fee)).ok_or(BuildError::Empty)?;
@@ -460,10 +480,10 @@ pub mod build {
             builder.add_spend(keys.fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
         builder
-            .add_output(None, recipient, NoteValue::from_raw(amount), [0u8; 512])
+            .add_output(ovk.clone(), recipient, NoteValue::from_raw(amount), memo)
             .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         builder
-            .add_output(None, change_addr, NoteValue::from_raw(change), [0u8; 512])
+            .add_output(ovk, change_addr, NoteValue::from_raw(change), [0u8; 512])
             .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
 
         let pk = proving_key();
@@ -519,6 +539,8 @@ pub mod build {
     /// SERVER role (viewing key + proving key only): build + prove a payment and sign
     /// its padding dummies. Returns the sighash and the per-spend randomizers the
     /// device must sign. Never sees the spend authority.
+    /// `recoverable`/`memo`: see [`build_wallet_payment`].
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_payment(
         fvk: &FullViewingKey,
         inputs: Vec<(Note, MerklePath)>,
@@ -527,8 +549,11 @@ pub mod build {
         fee: u64,
         network_domain: &[u8; 32],
         tx_context: &[u8],
+        recoverable: bool,
+        memo: [u8; 512],
     ) -> Result<PreparedPayment, BuildError> {
         use group::ff::PrimeField;
+        let ovk = recoverable.then(|| fvk.to_ovk(Scope::External));
 
         let (first_note, first_path) = inputs.first().ok_or(BuildError::Empty)?;
         let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
@@ -542,11 +567,11 @@ pub mod build {
             builder.add_spend(fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
         builder
-            .add_output(None, recipient, NoteValue::from_raw(amount), [0u8; 512])
+            .add_output(ovk.clone(), recipient, NoteValue::from_raw(amount), memo)
             .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         if change > 0 {
             builder
-                .add_output(None, change_addr, NoteValue::from_raw(change), [0u8; 512])
+                .add_output(ovk, change_addr, NoteValue::from_raw(change), [0u8; 512])
                 .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
 
@@ -770,7 +795,7 @@ pub mod build {
             // bundle paying `attacker` instead. (Everything else is honest, so only the
             // device's checks stand between the user and the theft.)
             let evil =
-                prepare_payment(&keys.fvk, vec![(note.clone(), merkle_path.clone())], attacker, 6_000, 1_000, &net, ctx).unwrap();
+                prepare_payment(&keys.fvk, vec![(note.clone(), merkle_path.clone())], attacker, 6_000, 1_000, &net, ctx, true, [0u8; 512]).unwrap();
 
             // The device checks the bundle against what the USER asked for, and refuses.
             // (Which action index carries the theft depends on the builder's shuffle.)
@@ -781,7 +806,7 @@ pub mod build {
             );
 
             // And the honest payment it DID ask for passes.
-            let good = prepare_payment(&keys.fvk, vec![(note, merkle_path)], intended, 6_000, 1_000, &net, ctx).unwrap();
+            let good = prepare_payment(&keys.fvk, vec![(note, merkle_path)], intended, 6_000, 1_000, &net, ctx, true, [0u8; 512]).unwrap();
             check_prepared_payment(&good.effects, &good.disclosure, &keys.fvk, &intended, 6_000, 1_000)
                 .expect("the payment the user asked for must verify");
 
@@ -839,7 +864,7 @@ pub mod build {
 
             // SERVER (viewing key only): pay 6_000, fee 1_000 → change 3_000.
             let prepared =
-                prepare_payment(&keys.fvk, vec![(note, merkle_path)], recipient.to_raw_address_bytes(), 6_000, 1_000, &net, ctx)
+                prepare_payment(&keys.fvk, vec![(note, merkle_path)], recipient.to_raw_address_bytes(), 6_000, 1_000, &net, ctx, true, [0u8; 512])
                     .expect("prepare");
             assert_eq!(prepared.value_balance, 1_000);
             assert_eq!(prepared.spend_auth_requests.len(), 1, "exactly one real spend to authorize");

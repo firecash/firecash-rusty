@@ -551,7 +551,7 @@ async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64,
 
     let ctx = payment_tx_context();
     log::info!("building real Orchard payment proof (Halo 2) — this takes a few seconds...");
-    let payload = build_wallet_payment(owner_seed, inputs, recipient, amount, fee, &net, &ctx)
+    let payload = build_wallet_payment(owner_seed, inputs, recipient, amount, fee, &net, &ctx, true, [0u8; 512])
         .unwrap_or_else(|e| fatal(format!("failed to build wallet payment: {e:?}")));
 
     let tx: Transaction = payment_tx(payload);

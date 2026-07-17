@@ -276,6 +276,8 @@ message RpcShieldedChainBlock {
   string coinbaseTxid = 4;
   repeated RpcShieldedCoinbaseOutput coinbaseOutputs = 5;
   repeated string acceptedBundles = 6;  // hex shielded payloads, consensus accepted order
+  repeated string acceptedTxids = 7;    // txid per accepted bundle (parallel to acceptedBundles)
+  uint64 timestamp = 8;                 // chain block header timestamp (ms since epoch)
 }
 
 message GetShieldedBlocksResponseMessage {

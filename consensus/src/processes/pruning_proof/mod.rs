@@ -29,7 +29,6 @@ use kaspa_consensus_core::{
 use kaspa_core::info;
 use kaspa_database::prelude::StoreResultExt;
 use kaspa_hashes::Hash;
-use kaspa_pow::calc_block_level;
 use thiserror::Error;
 
 use crate::{
@@ -120,6 +119,7 @@ pub struct PruningProofManager {
     ghostdag_k: KType,
     skip_proof_of_work: bool,
     toccata_activation: ForkActivation,
+    merged_mining_activation: ForkActivation,
 
     is_consensus_exiting: Arc<AtomicBool>,
 }
@@ -142,6 +142,7 @@ impl PruningProofManager {
         ghostdag_k: KType,
         skip_proof_of_work: bool,
         toccata_activation: ForkActivation,
+        merged_mining_activation: ForkActivation,
         is_consensus_exiting: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -178,6 +179,7 @@ impl PruningProofManager {
             ghostdag_k,
             skip_proof_of_work,
             toccata_activation,
+            merged_mining_activation,
 
             is_consensus_exiting,
         }
@@ -208,7 +210,12 @@ impl PruningProofManager {
                 continue;
             }
 
-            let block_level = calc_block_level(header, self.max_block_level, self.skip_proof_of_work);
+            let block_level = kaspa_pow::calc_block_level_gated(
+                header,
+                self.max_block_level,
+                self.skip_proof_of_work,
+                self.merged_mining_activation.is_active(header.daa_score),
+            );
             self.headers_store.insert(header.hash, header.clone(), block_level).unwrap();
         }
 

@@ -1,0 +1,26 @@
+[package]
+name = "zkas-gateway"
+description = "Self-hosted and hosted merchant payment gateway for ZKas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "zkas-gateway"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+hex.workspace = true
+kaspa-addresses.workspace = true
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
+zkas-payment-gateway.workspace = true

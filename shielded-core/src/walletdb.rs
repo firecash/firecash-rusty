@@ -35,18 +35,20 @@ use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
 use incrementalmerkletree::witness::IncrementalWitness;
 use orchard::{
     Address,
-    keys::{FullViewingKey, IncomingViewingKey, PreparedIncomingViewingKey, Scope, SpendingKey},
+    keys::{FullViewingKey, IncomingViewingKey, OutgoingViewingKey, PreparedIncomingViewingKey, Scope, SpendingKey},
     note::{ExtractedNoteCommitment, Note, RandomSeed, Rho},
+    note_encryption::OrchardDomain,
     tree::{MerkleHashOrchard, MerklePath},
     value::NoteValue,
 };
 use std::cell::OnceCell;
 use std::collections::HashSet;
+use zcash_note_encryption::try_output_recovery_with_ovk;
 
 use crate::bundle::ShieldedBundle;
 use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};
 use crate::tree::{FrontierState, GlobalTree, TREE_DEPTH};
-use crate::wallet::scan::scan_bundle_prepared;
+use crate::wallet::scan::{ReceivedNote, reconstruct_action, scan_bundle_prepared, trim_memo};
 
 /// A note the wallet owns and can spend. The membership witness is **not** held
 /// live per note (that made scanning O(N²) — every leaf advanced every owned
@@ -70,6 +72,58 @@ impl OwnedNote {
     pub fn value(&self) -> u64 {
         self.note.value().inner()
     }
+}
+
+/// What a history row is: mint, money in, or money out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryKind {
+    /// A coinbase note minted to this wallet (mining reward).
+    Coinbase = 0,
+    /// A shielded payment arriving (none of our notes were spent by the tx).
+    Received = 1,
+    /// Our own spend — includes a pure consolidation (`amount == 0`).
+    Sent = 2,
+}
+
+/// One row of the wallet's chain-derived transaction history, recorded during
+/// ingest and persisted in the checkpoint (v6 section) — so it survives restarts
+/// and, unlike the browser-local 0-conf list, a seed restore (for everything the
+/// wallet can still derive from chain).
+///
+/// Derivation is purely local: incoming amounts from IVK trial decryption, spends
+/// from our own nullifiers, and — when the send was built with our OVK
+/// (`recoverable history`) — the recipient/amount/memo of our own past sends.
+/// Nothing here is readable by anyone without this wallet's keys.
+#[derive(Clone, Debug)]
+pub struct HistoryEntry {
+    pub kind: HistoryKind,
+    /// The enclosing transaction id (coinbase txid for mint rows).
+    pub txid: [u8; 32],
+    /// DAA score of the chain block that applied it.
+    pub daa_score: u64,
+    /// Chain block header timestamp, ms since epoch (0 if the node predates the
+    /// v2 `GetShieldedBlocks` fields).
+    pub timestamp_ms: u64,
+    /// Coinbase/Received: value arriving. Sent: value paid to others (fee not
+    /// included; OVK-recovered when available, else net outflow minus fee).
+    pub amount: u64,
+    /// Sent rows: the public fee the bundle burned (`value_balance`); else 0.
+    pub fee: u64,
+    /// Sent rows: the recipient's raw Orchard address, when recoverable via our
+    /// OVK. `None` for pre-OVK sends (recipient unknowable even to us).
+    pub recipient: Option<[u8; 43]>,
+    /// Trimmed memo bytes (empty = no memo).
+    pub memo: Vec<u8>,
+}
+
+/// Chain-block metadata for dating history rows, from the v2 `GetShieldedBlocks`
+/// fields. `txids` is parallel to the ingested bundle slice.
+#[derive(Clone, Debug)]
+pub struct BlockMeta {
+    pub coinbase_txid: [u8; 32],
+    pub txids: Vec<[u8; 32]>,
+    pub timestamp_ms: u64,
+    pub daa_score: u64,
 }
 
 /// The balance effect of blocks too close to the tip to be safely ingested — value
@@ -165,12 +219,26 @@ pub struct WalletDb {
     /// parallel DAG blocks both carried the same tx) double-counts its outputs
     /// and shifts every later leaf position off the consensus tree.
     spent_nullifiers: HashSet<[u8; 32]>,
+    /// Outgoing viewing key (external scope) — recovers the recipient/amount/memo
+    /// of our own past sends *if* they were built with it (`recoverable history`).
+    /// Derived from the FVK, so a watch-only wallet has it too.
+    ovk: OutgoingViewingKey,
+    /// Chain-derived transaction history, in ingest (chronological) order,
+    /// capped at [`HISTORY_CAP`]. Only recorded when the ingest caller supplies
+    /// [`BlockMeta`] (i.e. the node serves the v2 fields).
+    history: Vec<HistoryEntry>,
 }
 
 /// How many owned notes keep a live witness. Beyond this, advancing every witness on
 /// every leaf would reintroduce the O(N·k) scan that once made a wallet op take 33
 /// minutes; the excess notes fall back to the on-demand rebuild.
 const MAX_LIVE_WITNESSES: usize = 256;
+
+/// History rows kept (oldest dropped beyond this). A pool/miner wallet mints one
+/// row per block, so an uncapped history would grow by ~86K rows/day at 1 BPS;
+/// 20K keeps weeks of ordinary use and days of solo mining while bounding the
+/// checkpoint blob.
+const HISTORY_CAP: usize = 20_000;
 
 impl WalletDb {
     /// Build a wallet view from a 32-byte seed. Returns `None` if the seed is not
@@ -181,6 +249,7 @@ impl WalletDb {
         let ivk = fvk.to_ivk(Scope::External);
         let prepared_ivk = ivk.prepare();
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let ovk = fvk.to_ovk(Scope::External);
         Some(Self {
             ivk,
             prepared_ivk,
@@ -197,6 +266,8 @@ impl WalletDb {
             lag_tree: CommitmentTree::empty(),
             witnessed_upto: 0,
             spent_nullifiers: HashSet::new(),
+            ovk,
+            history: Vec::new(),
         })
     }
 
@@ -213,6 +284,7 @@ impl WalletDb {
         let ivk = fvk.to_ivk(Scope::External);
         let prepared_ivk = ivk.prepare();
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let ovk = fvk.to_ovk(Scope::External);
         Some(Self {
             ivk,
             prepared_ivk,
@@ -229,6 +301,8 @@ impl WalletDb {
             lag_tree: CommitmentTree::empty(),
             witnessed_upto: 0,
             spent_nullifiers: HashSet::new(),
+            ovk,
+            history: Vec::new(),
         })
     }
 
@@ -340,6 +414,13 @@ impl WalletDb {
     /// dropped transactions must not be passed — they contribute no leaves, just
     /// as in [`crate::state::apply_chain_block_to`]).
     pub fn ingest_block(&mut self, coinbase: &[(CoinbaseNoteDesc, u64)], txs: &[&ShieldedBundle]) {
+        self.ingest_block_with_meta(coinbase, txs, None);
+    }
+
+    /// [`Self::ingest_block`] with the block's dating metadata, so ingest also
+    /// records [`HistoryEntry`] rows (with `meta: None` no history is written —
+    /// the wallet still syncs correctly against a pre-v2 node).
+    pub fn ingest_block_with_meta(&mut self, coinbase: &[(CoinbaseNoteDesc, u64)], txs: &[&ShieldedBundle], meta: Option<&BlockMeta>) {
         // Coinbase notes first, in the coinbase's own note order.
         for (desc, value) in coinbase {
             // Recompute the leaf exactly as consensus does; skip a malformed one
@@ -347,9 +428,14 @@ impl WalletDb {
             // defensive — an un-appendable leaf can carry no note for us either).
             let Ok(cmx) = coinbase_note_commitment(desc, *value) else { continue };
             let owned = self.recover_coinbase_note(desc, *value);
+            if owned.is_some() {
+                if let Some(m) = meta {
+                    self.record_coinbase_history(*value, m);
+                }
+            }
             self.append_leaf(cmx, owned);
         }
-        self.ingest_bundles(txs);
+        self.ingest_bundles(txs, meta);
     }
 
     /// Like [`Self::ingest_block`], but the caller has **already computed** each
@@ -362,22 +448,46 @@ impl WalletDb {
     /// order (skip a note whose `coinbase_note_commitment` errors), so the leaf
     /// stream is byte-identical to the non-shared path.
     pub fn ingest_block_precomputed(&mut self, coinbase: &[(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)], txs: &[&ShieldedBundle]) {
+        self.ingest_block_precomputed_with_meta(coinbase, txs, None);
+    }
+
+    /// [`Self::ingest_block_precomputed`] with dating metadata — see
+    /// [`Self::ingest_block_with_meta`].
+    pub fn ingest_block_precomputed_with_meta(
+        &mut self,
+        coinbase: &[(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)],
+        txs: &[&ShieldedBundle],
+        meta: Option<&BlockMeta>,
+    ) {
         for (desc, value, cmx) in coinbase {
             let owned = self.recover_coinbase_note(desc, *value);
+            if owned.is_some() {
+                if let Some(m) = meta {
+                    self.record_coinbase_history(*value, m);
+                }
+            }
             self.append_leaf(*cmx, owned);
         }
-        self.ingest_bundles(txs);
+        self.ingest_bundles(txs, meta);
     }
 
     /// Ingest every accepted transaction's actions, in order — applying the same
     /// drop rule as the consensus transition: a bundle whose nullifier was already
     /// spent in this stream appends nothing (see `spent_nullifiers`). Shared by both
     /// ingest paths above.
-    fn ingest_bundles(&mut self, txs: &[&ShieldedBundle]) {
-        for bundle in txs {
+    fn ingest_bundles(&mut self, txs: &[&ShieldedBundle], meta: Option<&BlockMeta>) {
+        for (bi, bundle) in txs.iter().enumerate() {
             if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
                 continue;
             }
+            // What this bundle takes from us — measured BEFORE the retain below
+            // removes the spent notes from the unspent set.
+            let spent: u64 = bundle
+                .actions
+                .iter()
+                .filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier))
+                .map(|n| n.value())
+                .sum();
             let received = scan_bundle_prepared(&self.prepared_ivk, bundle);
             for (i, action) in bundle.actions.iter().enumerate() {
                 // Each action reveals the nullifier of the note it spends. If that is
@@ -392,7 +502,103 @@ impl WalletDb {
                 let owned = received.iter().find(|r| r.action_index == i).map(|r| r.note.clone());
                 self.append_leaf(cmx, owned);
             }
+            if let Some(m) = meta {
+                if let Some(txid) = m.txids.get(bi).copied() {
+                    self.record_bundle_history(bundle, spent, &received, txid, m);
+                }
+            }
         }
+    }
+
+    /// Record a mining-reward history row (one per owned coinbase note).
+    fn record_coinbase_history(&mut self, value: u64, meta: &BlockMeta) {
+        self.push_history(HistoryEntry {
+            kind: HistoryKind::Coinbase,
+            txid: meta.coinbase_txid,
+            daa_score: meta.daa_score,
+            timestamp_ms: meta.timestamp_ms,
+            amount: value,
+            fee: 0,
+            recipient: None,
+            memo: Vec::new(),
+        });
+    }
+
+    /// Turn one ingested bundle's effect on this wallet into a history row.
+    ///
+    /// `spent` is the value of our notes the bundle consumed (0 ⇒ nothing of ours
+    /// left, so any decryptable output is money genuinely arriving). For our own
+    /// spends the recipient/paid-amount/memo are recovered with our OVK when the
+    /// send was built with it; otherwise the row falls back to `net outflow − fee`
+    /// with no recipient — still a correct amount, just less descriptive.
+    fn record_bundle_history(&mut self, bundle: &ShieldedBundle, spent: u64, received: &[ReceivedNote], txid: [u8; 32], meta: &BlockMeta) {
+        let received_value: u64 = received.iter().map(|r| r.value()).sum();
+        if spent == 0 && received_value == 0 {
+            return; // not our transaction
+        }
+        let entry = if spent > 0 {
+            // Our own spend: `received` here is change coming back, not income.
+            let fee = bundle.value_balance.max(0) as u64;
+            let net_out = spent.saturating_sub(received_value);
+            let mut recipient = None;
+            let mut memo = Vec::new();
+            let mut recovered_paid = 0u64;
+            for a in &bundle.actions {
+                let Some(action) = reconstruct_action(a) else { continue };
+                let domain = OrchardDomain::for_action(&action);
+                let Some((note, addr, m)) = try_output_recovery_with_ovk(&domain, &self.ovk, &action, action.cv_net(), &a.out_ciphertext)
+                else {
+                    continue;
+                };
+                let addr_bytes = addr.to_raw_address_bytes();
+                if addr_bytes == self.my_address {
+                    continue; // our own change
+                }
+                recovered_paid = recovered_paid.saturating_add(note.value().inner());
+                if recipient.is_none() {
+                    recipient = Some(addr_bytes);
+                    memo = trim_memo(&m);
+                }
+            }
+            HistoryEntry {
+                kind: HistoryKind::Sent,
+                txid,
+                daa_score: meta.daa_score,
+                timestamp_ms: meta.timestamp_ms,
+                amount: if recipient.is_some() { recovered_paid } else { net_out.saturating_sub(fee) },
+                fee,
+                recipient,
+                memo,
+            }
+        } else {
+            HistoryEntry {
+                kind: HistoryKind::Received,
+                txid,
+                daa_score: meta.daa_score,
+                timestamp_ms: meta.timestamp_ms,
+                amount: received_value,
+                fee: 0,
+                // A diversified address is private on-chain but visible to this
+                // wallet's FVK. Preserve it so a watch-only merchant gateway can
+                // reconcile one unique invoice address without amount matching.
+                recipient: received.first().map(|note| note.note.recipient().to_raw_address_bytes()),
+                memo: received.iter().find(|r| !r.memo.is_empty()).map(|r| r.memo.clone()).unwrap_or_default(),
+            }
+        };
+        self.push_history(entry);
+    }
+
+    fn push_history(&mut self, entry: HistoryEntry) {
+        if self.history.len() >= HISTORY_CAP {
+            // Drop the oldest half in one move instead of shifting per push.
+            self.history.drain(..HISTORY_CAP / 2);
+        }
+        self.history.push(entry);
+    }
+
+    /// The chain-derived history rows, oldest first.
+    pub fn history(&self) -> &[HistoryEntry] {
+        &self.history
     }
 
     /// What an **unsettled** block would do to this wallet's balance, without touching
@@ -760,6 +966,32 @@ impl WalletDb {
         }
         out.extend_from_slice(&(wsec.len() as u64).to_le_bytes());
         out.extend_from_slice(&wsec);
+
+        // v6: the chain-derived history rows, length-prefixed and best-effort like
+        // the witness section — parse trouble degrades to "history starts fresh",
+        // never a failed restore.
+        let mut hsec = Vec::new();
+        hsec.extend_from_slice(&(self.history.len() as u64).to_le_bytes());
+        for h in &self.history {
+            hsec.push(h.kind as u8);
+            hsec.extend_from_slice(&h.txid);
+            hsec.extend_from_slice(&h.daa_score.to_le_bytes());
+            hsec.extend_from_slice(&h.timestamp_ms.to_le_bytes());
+            hsec.extend_from_slice(&h.amount.to_le_bytes());
+            hsec.extend_from_slice(&h.fee.to_le_bytes());
+            match &h.recipient {
+                Some(r) => {
+                    hsec.push(1);
+                    hsec.extend_from_slice(r);
+                }
+                None => hsec.push(0),
+            }
+            let memo_len = h.memo.len().min(u16::MAX as usize) as u16;
+            hsec.extend_from_slice(&memo_len.to_le_bytes());
+            hsec.extend_from_slice(&h.memo[..memo_len as usize]);
+        }
+        out.extend_from_slice(&(hsec.len() as u64).to_le_bytes());
+        out.extend_from_slice(&hsec);
         out
     }
 
@@ -807,10 +1039,10 @@ impl WalletDb {
         // wallet into a full rescan; they simply pay the old O(N) tree rebuild once and
         // are rewritten as v4 by the next checkpoint.
         let version = r.u8()?;
-        if version != CHECKPOINT_VERSION && version != CHECKPOINT_VERSION_V4 && version != CHECKPOINT_VERSION_V3 {
+        if !(CHECKPOINT_VERSION_V3..=CHECKPOINT_VERSION).contains(&version) {
             return None;
         }
-        let has_tip_frontier = version == CHECKPOINT_VERSION || version == CHECKPOINT_VERSION_V4;
+        let has_tip_frontier = version >= CHECKPOINT_VERSION_V4;
         let base_size = r.u64()?;
         let base_frontier = read_frontier(&mut r, base_size)?;
         db.base_frontier = base_frontier;
@@ -868,10 +1100,18 @@ impl WalletDb {
         // section on a sub-cursor so any trouble inside it degrades to "no witnesses,
         // rebuild on demand" without corrupting the outer read position — witnesses are a
         // pure optimisation, never load-bearing for correctness or balance.
-        if version == CHECKPOINT_VERSION {
+        if version >= CHECKPOINT_VERSION_V5 {
             if let Some(wlen) = r.u64() {
                 if let Some(wbuf) = r.take(wlen as usize) {
                     Self::read_witness_section(&mut db, wbuf);
+                }
+            }
+        }
+        // v6: the history section — same length-prefixed best-effort contract.
+        if version >= CHECKPOINT_VERSION {
+            if let Some(hlen) = r.u64() {
+                if let Some(hbuf) = r.take(hlen as usize) {
+                    Self::read_history_section(&mut db, hbuf);
                 }
             }
         }
@@ -879,6 +1119,41 @@ impl WalletDb {
             return None;
         }
         Some(db)
+    }
+
+    /// Best-effort restore of the v6 history section. Any malformed row drops the
+    /// whole section (history restarts from here on) — never fails the restore.
+    fn read_history_section(db: &mut Self, buf: &[u8]) {
+        let mut r = Cursor { buf, pos: 0 };
+        let parse = |r: &mut Cursor<'_>| -> Option<Vec<HistoryEntry>> {
+            let n = (r.u64()? as usize).min(HISTORY_CAP);
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                let kind = match r.u8()? {
+                    0 => HistoryKind::Coinbase,
+                    1 => HistoryKind::Received,
+                    2 => HistoryKind::Sent,
+                    _ => return None,
+                };
+                let txid = r.arr::<32>()?;
+                let daa_score = r.u64()?;
+                let timestamp_ms = r.u64()?;
+                let amount = r.u64()?;
+                let fee = r.u64()?;
+                let recipient = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.arr::<43>()?),
+                    _ => return None,
+                };
+                let memo_len = u16::from_le_bytes(r.arr::<2>()?) as usize;
+                let memo = r.take(memo_len)?.to_vec();
+                out.push(HistoryEntry { kind, txid, daa_score, timestamp_ms, amount, fee, recipient, memo });
+            }
+            r.done().then_some(out)
+        };
+        if let Some(h) = parse(&mut r) {
+            db.history = h;
+        }
     }
 
     /// Best-effort restore of the v5 witness section (see `to_checkpoint`). On any parse
@@ -1016,7 +1291,11 @@ fn read_witness(r: &mut Cursor<'_>) -> Option<IncrementalWitness<MerkleHashOrcha
 /// section is length-prefixed and best-effort — a parse failure simply drops the
 /// witnesses (rebuild on demand, the old behaviour), so it can never fail a restore or
 /// lose funds. v5 is a pure suffix of v4, so v4/v3 blobs still restore.
-const CHECKPOINT_VERSION: u8 = 5;
+/// v6 appends the **chain-derived history rows** ([`HistoryEntry`]) as another
+/// length-prefixed best-effort section — a pure suffix of v5.
+const CHECKPOINT_VERSION: u8 = 6;
+/// v5 appended the persisted witnesses. A pure suffix of v4.
+const CHECKPOINT_VERSION_V5: u8 = 5;
 /// v4 appended the tip frontier (O(1) restore). A pure suffix of v3.
 const CHECKPOINT_VERSION_V4: u8 = 4;
 /// v4 is a pure suffix of v3, so v3 blobs still restore correctly (paying the old O(N)
@@ -1849,7 +2128,7 @@ mod circuit_tests {
         let sel: Vec<_> = db.notes().iter().map(|o| (o.note.clone(), o.position)).collect();
         let inputs: Vec<_> = sel.into_iter().map(|(note, pos)| (note, db.witness_path(pos).unwrap())).collect();
         let recipient = address_bytes_from_seed([42u8; 32]).unwrap();
-        let payload = build_wallet_payment(miner, inputs, recipient, 5_000, 1_000, &net, ctx).expect("multi-note payment builds");
+        let payload = build_wallet_payment(miner, inputs, recipient, 5_000, 1_000, &net, ctx, true, [0u8; 512]).expect("multi-note payment builds");
         let wire = ShieldedBundle::from_bytes(&payload).expect("payload decodes to a bundle");
 
         // Two real spends that actually verify against the shared anchor.
@@ -1866,5 +2145,100 @@ mod circuit_tests {
         assert!(!db.notes().iter().any(|n| n.position == 0 || n.position == 1), "spent input notes dropped by nullifier");
         assert_eq!(db.notes().len(), 1, "only the recovered change note remains");
         assert_eq!(db.balance(), 2_000, "balance == change after the multi-note spend");
+    }
+
+    /// End-to-end chain-derived history: mint → OVK send with a memo → receive.
+    /// The sender's row recovers the recipient/amount/memo via its own OVK; the
+    /// receiver's row carries the amount+memo from IVK decryption; a checkpoint
+    /// round-trip (v6) preserves every row; and a NON-recoverable send still
+    /// yields a correct Sent row, just without a recipient.
+    #[test]
+    fn history_records_mint_send_receive_and_survives_checkpoint() {
+        let miner = [33u8; 32];
+        let friend = [44u8; 32];
+        let net = [0x5au8; 32];
+        let ctx = b"firecash-walletdb-history";
+
+        let mut a = WalletDb::from_seed(miner).unwrap();
+        let mut b = WalletDb::from_seed(friend).unwrap();
+
+        // Block 1: coinbase mints one 8_000 note to A.
+        let mine = cb(address_bytes_from_seed(miner).unwrap(), b"blk1||0", 8_000);
+        let meta1 = BlockMeta { coinbase_txid: [0xaa; 32], txids: vec![], timestamp_ms: 1_000, daa_score: 10 };
+        a.ingest_block_with_meta(&[mine.clone()], &[], Some(&meta1));
+        b.ingest_block_with_meta(&[mine], &[], Some(&meta1));
+        assert_eq!(a.history().len(), 1, "A recorded its mint");
+        assert!(b.history().is_empty(), "B saw nothing of its own");
+        let mint_row = &a.history()[0];
+        assert_eq!(mint_row.kind, HistoryKind::Coinbase);
+        assert_eq!((mint_row.amount, mint_row.txid, mint_row.timestamp_ms), (8_000, [0xaa; 32], 1_000));
+
+        // A pays B 5_000 (fee 1_000, change 2_000) — recoverable, with a memo.
+        let mut memo = [0u8; 512];
+        memo[..7].copy_from_slice(b"thanks!");
+        let inputs = vec![(a.notes()[0].note.clone(), a.witness_path(a.notes()[0].position).unwrap())];
+        let payload = crate::wallet::build::build_wallet_payment(
+            miner,
+            inputs,
+            address_bytes_from_seed(friend).unwrap(),
+            5_000,
+            1_000,
+            &net,
+            ctx,
+            true,
+            memo,
+        )
+        .expect("payment builds");
+        let wire = ShieldedBundle::from_bytes(&payload).unwrap();
+
+        let meta2 = BlockMeta { coinbase_txid: [0xbb; 32], txids: vec![[0xcc; 32]], timestamp_ms: 2_000, daa_score: 20 };
+        a.ingest_block_with_meta(&[], &[&wire], Some(&meta2));
+        b.ingest_block_with_meta(&[], &[&wire], Some(&meta2));
+
+        // Sender: a Sent row with the OVK-recovered recipient, amount and memo.
+        assert_eq!(a.history().len(), 2);
+        let sent = &a.history()[1];
+        assert_eq!(sent.kind, HistoryKind::Sent);
+        assert_eq!((sent.amount, sent.fee, sent.txid), (5_000, 1_000, [0xcc; 32]));
+        assert_eq!(sent.recipient, Some(address_bytes_from_seed(friend).unwrap()), "OVK recovers who was paid");
+        assert_eq!(sent.memo, b"thanks!".to_vec(), "OVK recovers the memo");
+
+        // Receiver: a Received row with the amount and the decrypted memo.
+        assert_eq!(b.history().len(), 1);
+        let recv = &b.history()[0];
+        assert_eq!(recv.kind, HistoryKind::Received);
+        assert_eq!((recv.amount, recv.txid, recv.timestamp_ms), (5_000, [0xcc; 32], 2_000));
+        assert_eq!(recv.memo, b"thanks!".to_vec());
+
+        // v6 checkpoint round-trip preserves the rows bit-for-bit.
+        let blob = a.to_checkpoint();
+        assert_eq!(blob[0], CHECKPOINT_VERSION, "current checkpoints are v6");
+        let a2 = WalletDb::from_checkpoint(miner, &blob).expect("v6 restores");
+        assert_eq!(a2.history().len(), 2);
+        assert_eq!(a2.history()[1].recipient, sent.recipient);
+        assert_eq!(a2.history()[1].memo, sent.memo);
+
+        // A NON-recoverable send (ovk withheld): B pays A back 3_000 (fee 500).
+        let mut b2 = b;
+        let inputs = vec![(b2.notes()[0].note.clone(), b2.witness_path(b2.notes()[0].position).unwrap())];
+        let payload = crate::wallet::build::build_wallet_payment(
+            friend,
+            inputs,
+            address_bytes_from_seed(miner).unwrap(),
+            3_000,
+            500,
+            &net,
+            ctx,
+            false,
+            [0u8; 512],
+        )
+        .expect("non-recoverable payment builds");
+        let wire = ShieldedBundle::from_bytes(&payload).unwrap();
+        let meta3 = BlockMeta { coinbase_txid: [0xdd; 32], txids: vec![[0xee; 32]], timestamp_ms: 3_000, daa_score: 30 };
+        b2.ingest_block_with_meta(&[], &[&wire], Some(&meta3));
+        let sent = b2.history().last().unwrap();
+        assert_eq!(sent.kind, HistoryKind::Sent);
+        assert_eq!(sent.amount, 3_000, "net-outflow fallback still prices the send right");
+        assert_eq!(sent.recipient, None, "without the OVK not even the sender can recover the recipient");
     }
 }

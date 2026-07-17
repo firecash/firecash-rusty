@@ -54,6 +54,12 @@ pub struct ShieldedChainBlockData {
     /// Accepted shielded bundle payloads in consensus accepted order, after the
     /// anchor-finality retain (i.e. exactly the bundles that appended leaves).
     pub accepted_bundles: Vec<Vec<u8>>,
+    /// Transaction id of each accepted bundle, parallel to `accepted_bundles` —
+    /// lets a wallet date/link its history rows to real transactions.
+    pub accepted_txids: Vec<Hash>,
+    /// The chain block's header timestamp (ms since epoch) — the display time of
+    /// everything this block applied.
+    pub timestamp: u64,
 }
 
 pub type BlockValidationFuture = BoxFuture<'static, BlockProcessResult<BlockStatus>>;

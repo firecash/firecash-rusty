@@ -580,31 +580,41 @@ pub struct RpcShieldedChainBlock {
     pub coinbase_outputs: Vec<RpcShieldedCoinbaseOutput>,
     /// Accepted shielded bundle payloads, consensus accepted order, post-retain.
     pub accepted_bundles: Vec<Vec<u8>>,
+    /// Transaction id of each accepted bundle, parallel to `accepted_bundles`
+    /// (empty from a pre-v2 node) — dates/links wallet history rows.
+    pub accepted_txids: Vec<RpcHash>,
+    /// Chain block header timestamp, ms since epoch (0 from a pre-v2 node).
+    pub timestamp: u64,
 }
 
 impl Serializer for RpcShieldedChainBlock {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         store!(RpcHash, &self.hash, writer)?;
         store!(u64, &self.blue_score, writer)?;
         store!(u64, &self.daa_score, writer)?;
         store!(RpcHash, &self.coinbase_txid, writer)?;
         serialize!(Vec<RpcShieldedCoinbaseOutput>, &self.coinbase_outputs, writer)?;
         store!(Vec<Vec<u8>>, &self.accepted_bundles, writer)?;
+        store!(Vec<RpcHash>, &self.accepted_txids, writer)?;
+        store!(u64, &self.timestamp, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for RpcShieldedChainBlock {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let hash = load!(RpcHash, reader)?;
         let blue_score = load!(u64, reader)?;
         let daa_score = load!(u64, reader)?;
         let coinbase_txid = load!(RpcHash, reader)?;
         let coinbase_outputs = deserialize!(Vec<RpcShieldedCoinbaseOutput>, reader)?;
         let accepted_bundles = load!(Vec<Vec<u8>>, reader)?;
-        Ok(Self { hash, blue_score, daa_score, coinbase_txid, coinbase_outputs, accepted_bundles })
+        // v2 appended the history-dating fields; a v1 blob simply lacks them.
+        let (accepted_txids, timestamp) =
+            if version >= 2 { (load!(Vec<RpcHash>, reader)?, load!(u64, reader)?) } else { (Vec::new(), 0) };
+        Ok(Self { hash, blue_score, daa_score, coinbase_txid, coinbase_outputs, accepted_bundles, accepted_txids, timestamp })
     }
 }
 

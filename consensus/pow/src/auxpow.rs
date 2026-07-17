@@ -314,4 +314,57 @@ mod tests {
         assert!(!verify_aux_pow(&aux, fc_b.hash, target(EASY_BITS)), "same PoW cannot be stolen for fc_b");
         assert!(!check_pow_dual(&fc_b, Some(&aux)).0, "dual gate rejects the stolen-PoW block");
     }
+
+    /// Regression for the IBD headers-proof failure ("level is 0 when it's expected
+    /// to be at least N"): a merged-mined block whose native PoW misses its target is
+    /// accepted via aux, and its block LEVEL derives from the parent's pow. Any code
+    /// that re-derives a stored level (pruning-proof validate/apply) must reproduce
+    /// that with `calc_block_level_check_pow_gated` — the native-only calc computes
+    /// level 0 for the same header and rejects valid proofs.
+    #[test]
+    fn aux_accepted_block_level_rederives_consistently() {
+        use crate::{calc_block_level_check_pow, calc_block_level_check_pow_gated, calc_level_from_pow};
+        // Realistic scale: mainnet max_block_level ≈ 250; a random (failed-native)
+        // pow has ~255 leading bits → level ~0, while the Kaspa parent mined to
+        // 2^240 (HARD_BITS) yields level ≥ 10 — the gap the proof relies on.
+        const MAX_LEVEL: crate::BlockLevel = 250;
+        const HARD_BITS: u32 = 0x1f01_0000; // compact target 2^240
+
+        // A ZKas block whose nonce is ground AWAY from the target, so native PoW
+        // fails — like a real merged-mined block that only met the Kaspa target.
+        let mut fc = zkas_header(20, EASY_BITS);
+        let state = State::new(&fc);
+        let mut nonce = 0u64;
+        while state.check_pow(nonce).0 {
+            nonce += 1;
+        }
+        fc.nonce = nonce;
+        fc.finalize();
+        let cb = coinbase_committing(fc.hash);
+        let (parent, branch) = mine_parent(&[cb.clone()], HARD_BITS);
+
+        let mut header = fc.clone();
+        header.aux_pow = Some(Box::new(AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: branch }));
+
+        // Acceptance-time level (what header validation stores):
+        let (passed, pow) = check_pow_gated(&header, header.aux_pow.as_deref(), true);
+        assert!(passed, "aux path accepts the block");
+        let stored_level = calc_level_from_pow(pow, MAX_LEVEL);
+
+        // Native-only re-derivation DISAGREES (this was the IBD bug)…
+        let (native_level, native_ok) = calc_block_level_check_pow(&header, MAX_LEVEL, false);
+        assert!(!native_ok, "native pow alone fails for this block");
+        assert!(native_level < stored_level, "native-only level under-computes an aux-accepted block");
+
+        // …while the gated re-derivation reproduces the stored level exactly.
+        let (gated_level, gated_ok) = calc_block_level_check_pow_gated(&header, MAX_LEVEL, false, true);
+        assert!(gated_ok);
+        assert_eq!(gated_level, stored_level, "proof validation must re-derive the acceptance-time level");
+
+        // Before activation the gate is off: the same header re-derives native-only,
+        // so pre-activation blocks keep their historical levels.
+        let (pre_level, pre_ok) = calc_block_level_check_pow_gated(&header, MAX_LEVEL, false, false);
+        assert!(!pre_ok);
+        assert_eq!(pre_level, native_level);
+    }
 }

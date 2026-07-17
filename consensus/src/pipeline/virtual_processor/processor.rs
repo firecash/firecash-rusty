@@ -359,6 +359,7 @@ impl VirtualStateProcessor {
         let blue_score = ghostdag.blue_score;
         let selected_parent = ghostdag.selected_parent;
         let daa_score = self.headers_store.get_daa_score(block).map_err(|e| format!("daa score for {block}: {e}"))?;
+        let timestamp = self.headers_store.get_timestamp(block).map_err(|e| format!("timestamp for {block}: {e}"))?;
 
         // Walk the acceptance data in its stored (consensus) order: selected parent
         // first, then the consensus-ordered mergeset — the same order
@@ -367,6 +368,7 @@ impl VirtualStateProcessor {
         // its index points into the merged block's own slot 0).
         let acceptance = self.acceptance_data_store.get(block).map_err(|e| format!("acceptance data for {block}: {e}"))?;
         let mut accepted_bundles = Vec::new();
+        let mut accepted_txids = Vec::new();
         for mergeset_block in acceptance.iter() {
             let merged_txs = self
                 .block_transactions_store
@@ -387,6 +389,7 @@ impl VirtualStateProcessor {
                     continue;
                 }
                 accepted_bundles.push(tx.payload.clone());
+                accepted_txids.push(entry.transaction_id);
             }
         }
 
@@ -397,6 +400,8 @@ impl VirtualStateProcessor {
             coinbase_txid,
             coinbase_outputs,
             accepted_bundles,
+            accepted_txids,
+            timestamp,
         })
     }
 

@@ -20,6 +20,11 @@ members = [
     "consensus/smt-store",
     "shielded-core",
     "shielded-wallet",
+    "sdk/wallet-engine",
+    "sdk/signer",
+    "sdk/core",
+    "gateway/core",
+    "gateway/service",
     "shielded-pay",
     "zkas-api",
     "zkas-walletd",
@@ -135,6 +140,10 @@ kaspa-rpc-core = { version = "2.0.1", path = "rpc/core" }
 kaspa-seq-commit = { version = "2.0.1", path = "consensus/seq-commit" }
 kaspa-shielded-core = { version = "2.0.1", path = "shielded-core" }
 kaspa-shielded-wallet = { version = "2.0.1", path = "shielded-wallet" }
+zkas-wallet-engine = { version = "2.0.1", path = "sdk/wallet-engine" }
+zkas-signer = { version = "2.0.1", path = "sdk/signer" }
+zkas-sdk = { version = "2.0.1", path = "sdk/core" }
+zkas-payment-gateway = { version = "2.0.1", path = "gateway/core" }
 kaspa-rpc-macros = { version = "2.0.1", path = "rpc/macros" }
 kaspa-rpc-service = { version = "2.0.1", path = "rpc/service" }
 kaspa-txscript = { version = "2.0.1", path = "crypto/txscript" }

@@ -6312,6 +6312,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quinn"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9791,6 +9797,70 @@ dependencies = [
 ]
 
 [[package]]
+name = "zkas-gateway"
+version = "2.0.1"
+dependencies = [
+ "axum 0.7.9",
+ "hex",
+ "kaspa-addresses",
+ "qrcode",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zkas-payment-gateway",
+]
+
+[[package]]
+name = "zkas-payment-gateway"
+version = "2.0.1"
+dependencies = [
+ "hex",
+ "hmac",
+ "kaspa-addresses",
+ "kaspa-shielded-core",
+ "orchard",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "zkas-sdk"
+version = "2.0.1"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "hex",
+ "kaspa-addresses",
+ "kaspa-shielded-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zkas-signer",
+ "zkas-wallet-engine",
+]
+
+[[package]]
+name = "zkas-signer"
+version = "2.0.1"
+dependencies = [
+ "kaspa-shielded-core",
+ "orchard",
+ "rand 0.8.6",
+ "zeroize",
+]
+
+[[package]]
+name = "zkas-wallet-engine"
+version = "2.0.1"
+dependencies = [
+ "kaspa-shielded-core",
+ "serde",
+]
+
+[[package]]
 name = "zkas-walletd"
 version = "2.0.1"
 dependencies = [
@@ -9812,6 +9882,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower-http",
+ "zkas-sdk",
+ "zkas-wallet-engine",
 ]
 
 [[package]]

@@ -1,0 +1,15 @@
+[package]
+name = "zkas-wallet-engine"
+description = "Transport-independent wallet policy and state engine for ZKas shielded wallets"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kaspa-shielded-core.workspace = true
+serde = { workspace = true, features = ["derive"] }

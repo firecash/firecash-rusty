@@ -81,6 +81,39 @@ pub fn calc_block_level_check_pow(header: &Header, max_block_level: BlockLevel, 
     (block_level, passed)
 }
 
+/// Aux-aware variant of [`calc_block_level_check_pow`]: past the merged-mining
+/// activation a block may earn its level via a valid AuxPoW witness (the level then
+/// derives from the Kaspa parent's pow, exactly as header validation assigned it).
+/// Every consumer that RE-derives a stored level (pruning-proof validation/apply)
+/// must use this, or merged-mined blocks recompute to level 0 and valid proofs are
+/// rejected ("level is 0 when it's expected to be at least N").
+pub fn calc_block_level_check_pow_gated(
+    header: &Header,
+    max_block_level: BlockLevel,
+    skip_pow: bool,
+    merged_mining_active: bool,
+) -> (BlockLevel, bool) {
+    if header.parents_by_level.is_empty() {
+        return (max_block_level, true); // Genesis has the max block level
+    }
+    if skip_pow {
+        let pow = State::new_skip_pow(header).check_pow(header.nonce).1;
+        return (calc_level_from_pow(pow, max_block_level), true);
+    }
+    let (passed, pow) = auxpow::check_pow_gated(header, header.aux_pow.as_deref(), merged_mining_active);
+    (calc_level_from_pow(pow, max_block_level), passed)
+}
+
+/// Aux-aware variant of [`calc_block_level`]; see [`calc_block_level_check_pow_gated`].
+pub fn calc_block_level_gated(
+    header: &Header,
+    max_block_level: BlockLevel,
+    skip_pow: bool,
+    merged_mining_active: bool,
+) -> BlockLevel {
+    calc_block_level_check_pow_gated(header, max_block_level, skip_pow, merged_mining_active).0
+}
+
 pub fn calc_level_from_pow(pow: Uint256, max_block_level: BlockLevel) -> BlockLevel {
     let signed_block_level = max_block_level as i64 - pow.bits() as i64;
     max(signed_block_level, 0) as BlockLevel

@@ -1,0 +1,24 @@
+[package]
+name = "zkas-payment-gateway"
+description = "Merchant invoice and payment reconciliation core for ZKas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hex.workspace = true
+hmac.workspace = true
+kaspa-addresses.workspace = true
+orchard = { version = "=0.14.0", default-features = false, features = ["std"] }
+rand.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+kaspa-shielded-core.workspace = true

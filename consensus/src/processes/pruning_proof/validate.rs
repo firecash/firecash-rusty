@@ -11,13 +11,13 @@ use kaspa_consensus_core::{
     header::Header,
     pruning::{PruningPointProof, PruningProofMetadata},
 };
-use kaspa_core::info;
+use kaspa_core::{info, warn};
 use kaspa_database::{
     prelude::{CachePolicy, ConnBuilder, StoreResultUnitExt},
     utils::DbLifetime,
 };
 use kaspa_hashes::Hash;
-use kaspa_pow::{calc_block_level, calc_block_level_check_pow};
+use kaspa_pow::calc_block_level_check_pow_gated;
 use kaspa_utils::vec::VecExtensions;
 use parking_lot::RwLock;
 use rocksdb::WriteBatch;
@@ -165,7 +165,12 @@ impl ProofContext {
         }
 
         let proof_pp_header = proof[0].last().expect("checked if empty").clone();
-        let proof_pp_level = calc_block_level(&proof_pp_header, ppm.max_block_level, ppm.skip_proof_of_work);
+        let proof_pp_level = kaspa_pow::calc_block_level_gated(
+            &proof_pp_header,
+            ppm.max_block_level,
+            ppm.skip_proof_of_work,
+            ppm.merged_mining_activation.is_active(proof_pp_header.daa_score),
+        );
         let proof_pp = proof_pp_header.hash;
 
         //
@@ -186,8 +191,25 @@ impl ProofContext {
             let mut selected_tip =
                 proof[level_idx].first().map(|header| header.hash).ok_or(PruningImportError::PruningProofNotEnoughHeaders)?;
             for (i, header) in proof[level_idx].iter().enumerate() {
-                let (header_level, pow_passes) = calc_block_level_check_pow(header, ppm.max_block_level, ppm.skip_proof_of_work);
+                let (header_level, pow_passes) = calc_block_level_check_pow_gated(
+                    header,
+                    ppm.max_block_level,
+                    ppm.skip_proof_of_work,
+                    ppm.merged_mining_activation.is_active(header.daa_score),
+                );
                 if header_level < level {
+                    // A merged-mined block missing its aux witness here means the prover
+                    // stripped it (or pre-fix peer); log enough to tell that apart from a
+                    // genuinely under-leveled header.
+                    warn!(
+                        "proof header {} at proof level {} computes level {}: daa={} bits={:#x} aux_witness={}",
+                        header.hash,
+                        level,
+                        header_level,
+                        header.daa_score,
+                        header.bits,
+                        header.aux_pow.is_some(),
+                    );
                     return Err(PruningImportError::PruningProofWrongBlockLevel(header.hash, header_level, level));
                 }
                 if !ppm.skip_proof_of_work && !pow_passes {
