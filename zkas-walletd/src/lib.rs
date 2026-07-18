@@ -246,16 +246,16 @@ struct WalletFile {
     /// authority. Absent in v1 files, which are all seed wallets.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     fvk_hex: String,
-    /// Encrypt each send's details to the wallet's own OVK (Zcash-standard), so
-    /// chain-derived history recovers recipient/amount/memo after a seed restore.
-    /// Trade-off: someone the user hands the FULL VIEWING KEY to (message-sign
-    /// verification!) then also sees outgoing recipients. Default on.
-    #[serde(default = "default_true")]
+    /// Transaction history, **opt-in**: when on, ingest records readable history
+    /// rows in the scan checkpoint AND each send's details are encrypted to the
+    /// wallet's own OVK (Zcash-standard), so history recovers recipient/amount/
+    /// memo even after a seed restore. Trade-offs the user accepts by enabling:
+    /// anyone holding this wallet's file/token reads the record, and someone the
+    /// user hands the FULL VIEWING KEY to (message-sign verification!) also sees
+    /// outgoing recipients. Default off — nothing readable is stored until the
+    /// user activates it.
+    #[serde(default)]
     recoverable_history: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// What key material the daemon holds for a wallet.
@@ -397,7 +397,10 @@ fn save_seed(dir: &str, token: &str, network: &str, seed: &[u8; 32], birthday: u
         encrypted,
         birthday,
         fvk_hex: String::new(),
-        recoverable_history: true,
+        // History is opt-in: nothing readable is recorded until the user
+        // explicitly enables it (accepting that anyone holding the wallet
+        // file / server token could read the record).
+        recoverable_history: false,
     };
     write_wallet_file(dir, token, &wf)
 }
@@ -413,7 +416,8 @@ fn save_fvk(dir: &str, token: &str, network: &str, fvk: &[u8; 96], birthday: u64
         encrypted: false,
         birthday,
         fvk_hex: hex(fvk),
-        recoverable_history: true,
+        // Opt-in, same as the seed path above.
+        recoverable_history: false,
     };
     write_wallet_file(dir, token, &wf)
 }
@@ -898,6 +902,14 @@ const MATURED_RING: usize = (DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK) as usize + 64;
 /// as synced (~32 s at 1 BPS).
 const SYNC_MARGIN: u64 = 32;
 
+/// How long (chain DAA ≈ seconds at 1 BPS) a submitted spend may stay unobserved
+/// on-chain before the wallet concludes the transaction was lost and returns its
+/// notes to the spendable set. Long enough to ride out mempool latency, ingest
+/// maturity lag (~3 min) and a node restart with room to spare; short enough that
+/// a user whose send evaporated gets their balance back within the hour instead
+/// of never.
+const PENDING_SPEND_EXPIRY_DAA: u64 = 3_600;
+
 impl WalletEntry {
     /// Rebuild an entry from a wallet view + cursor (a fresh frontier start or a
     /// persisted checkpoint): the background sync resumes strictly after `low`.
@@ -914,6 +926,12 @@ impl WalletEntry {
         boundaries: VecDeque<(u64, u64)>,
         sink_blue: u64,
     ) -> Self {
+        let mut db = db;
+        // History is opt-in per wallet: the same flag that makes sends
+        // OVK-recoverable also authorizes recording rows at all. Applying it here
+        // (the one place every entry is built) also purges rows persisted while
+        // the flag was on if the user has since turned it off.
+        db.set_history_enabled(recoverable_history);
         Self {
             key,
             recoverable_history,
@@ -1821,6 +1839,21 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         // Striking but not yet retired: don't checkpoint a suspect cursor. Come back next pass.
         return SyncOutcome::Behind;
     }
+    // A submitted spend the chain has still not shown after an hour of chain time
+    // is lost — a node that crashed with it in the mempool, an eviction, or a
+    // consensus-dropped shielded spend. Hand the notes back (live report
+    // 2026-07-18: "ZKAS disappeared without a trace" was exactly this). Only
+    // judged when caught up, so "unobserved" means the chain really doesn't have
+    // it, not that we haven't looked yet.
+    if e.caught_up {
+        for (txid, value) in e.db.reclaim_expired(PENDING_SPEND_EXPIRY_DAA) {
+            e.force_checkpoint = true; // persist the returned note promptly
+            log::warn!(
+                "wallet '{token}': submitted spend {} ({value} sompi) never appeared on-chain within ~{PENDING_SPEND_EXPIRY_DAA}s of chain time — note returned to the spendable balance",
+                RpcHash::from_bytes(txid)
+            );
+        }
+    }
     let behind = !e.caught_up;
     // Persist a checkpoint once enough new blocks accrue, or the first time this wallet
     // reaches the tip, so a restart resumes here instead of rescanning from birthday.
@@ -2158,10 +2191,12 @@ async fn load_new_wallet(
     let _ = std::fs::remove_file(scan_path(&state.wallet_dir, token));
     // Fast-sync from the node's frontier when the wallet is born after the
     // checkpoint (complete by construction); otherwise the pruning-point full scan.
-    let entry = match state.fast_sync_entry(WalletKey::Seed(seed), true, state.genesis, birthday).await {
+    // History starts OFF (opt-in) — must match what `save_seed` just wrote, or
+    // the in-memory entry records rows the user never consented to.
+    let entry = match state.fast_sync_entry(WalletKey::Seed(seed), false, state.genesis, birthday).await {
         Some(e) => e,
         None => state
-            .full_scan_entry(WalletKey::Seed(seed), true, state.genesis)
+            .full_scan_entry(WalletKey::Seed(seed), false, state.genesis)
             .await
             .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "cannot anchor a full scan (node unreachable or too old)"))?,
     };
@@ -2271,10 +2306,11 @@ async fn wallet_watch(
     // A new or changed key must rescan from its own birthday, not resume another
     // wallet's checkpoint stream.
     let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
-    let entry = match state.fast_sync_entry(key, true, state.genesis, req.birthday).await {
+    // History starts OFF (opt-in), matching what `save_fvk` just wrote.
+    let entry = match state.fast_sync_entry(key, false, state.genesis, req.birthday).await {
         Some(e) => e,
         None => state
-            .full_scan_entry(key, true, state.genesis)
+            .full_scan_entry(key, false, state.genesis)
             .await
             .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "cannot anchor a full scan (node unreachable or too old)"))?,
     };
@@ -2404,12 +2440,28 @@ async fn wallet_history(
                 })
             })
             .collect();
+    // Spends submitted from this daemon but not yet observed on-chain — surfaced
+    // so "where did my money go" is answerable while a send is in flight (the
+    // notes come back automatically if the tx is lost; see `reclaim_expired`).
+    let pending: Vec<serde_json::Value> =
+        e.db.pending_spends()
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "txid": hex(&p.txid),
+                    "amountSompi": p.note.value(),
+                    "amountZkas": p.note.value() as f64 / SOMPI_PER_ZKAS as f64,
+                    "submittedDaa": p.submitted_daa,
+                })
+            })
+            .collect();
     Ok(Json(serde_json::json!({
         "recoverableHistory": e.recoverable_history,
         "total": e.db.history().len(),
         "offset": offset,
         "limit": history_page,
         "rows": rows,
+        "pendingOutgoing": pending,
     })))
 }
 
@@ -2434,8 +2486,13 @@ async fn wallet_settings(
     write_wallet_file(&state.wallet_dir, &token, &wf)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
     // Keep a loaded entry in step so the next send honours the change immediately.
+    // The same flag gates history-row recording: turning it OFF also purges the
+    // rows already recorded (withdrawing consent removes the readable record).
     if let Some(w) = state.cached_wallet(&token).await {
-        w.lock().await.recoverable_history = wf.recoverable_history;
+        let mut e = w.lock().await;
+        e.recoverable_history = wf.recoverable_history;
+        e.db.set_history_enabled(wf.recoverable_history);
+        e.force_checkpoint = true; // persist the purge/enable promptly
     }
     Ok(Json(serde_json::json!({ "recoverableHistory": wf.recoverable_history })))
 }
@@ -2618,7 +2675,7 @@ async fn wallet_send(
                 total_fee += cfee;
                 let mut e = w.lock().await;
                 for p in positions {
-                    e.db.mark_spent(p);
+                    e.db.mark_spent(p, accepted.as_bytes());
                 }
             }
             Err(e) if txids.is_empty() => return Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payment: {e}"))),
@@ -2735,7 +2792,7 @@ async fn wallet_consolidate(
         Ok(accepted) => {
             let mut e = w.lock().await;
             for p in positions {
-                e.db.mark_spent(p);
+                e.db.mark_spent(p, accepted.as_bytes());
             }
             let notes_remaining = e.db.notes().len();
             Ok(Json(ConsolidateResp { txid: accepted.to_string(), consolidated, value_sompi: value, notes_remaining }))

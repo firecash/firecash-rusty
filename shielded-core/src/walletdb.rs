@@ -74,6 +74,23 @@ impl OwnedNote {
     }
 }
 
+/// A note whose spend has been **submitted** to the network but not yet observed
+/// on-chain. Parked here (not deleted) so the money cannot silently vanish: if the
+/// transaction never applies — a node that crashes with it still in the mempool, a
+/// mempool eviction, or a consensus-dropped shielded spend (the drop-not-disqualify
+/// rule applies a block but skips the spend) — [`WalletDb::reclaim_expired`] hands
+/// the note back to the spendable set.
+#[derive(Clone)]
+pub struct PendingSpend {
+    /// The parked note, unchanged — its position/witness stay valid.
+    pub note: OwnedNote,
+    /// Transaction id the spend was submitted in (zeros when unknown).
+    pub txid: [u8; 32],
+    /// The wallet's DAA clock ([`WalletDb::last_daa`]) at submit time — the
+    /// expiry countdown starts here.
+    pub submitted_daa: u64,
+}
+
 /// What a history row is: mint, money in, or money out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryKind {
@@ -227,6 +244,20 @@ pub struct WalletDb {
     /// capped at [`HISTORY_CAP`]. Only recorded when the ingest caller supplies
     /// [`BlockMeta`] (i.e. the node serves the v2 fields).
     history: Vec<HistoryEntry>,
+    /// Whether ingest records `history` rows at all. History is an opt-in
+    /// convenience: it stores a readable record of the wallet's transactions in
+    /// the checkpoint, which anyone holding the wallet file can read — so the
+    /// holder must explicitly accept that before anything is written. Turning it
+    /// off purges what was recorded ([`Self::set_history_enabled`]).
+    history_enabled: bool,
+    /// Spends submitted but not yet observed on-chain — see [`PendingSpend`].
+    /// Excluded from the balance and from spend selection (like spent notes), but
+    /// recoverable if the transaction is lost.
+    pending_spends: Vec<PendingSpend>,
+    /// DAA score of the newest block ingested with [`BlockMeta`] — the wallet's
+    /// chain clock. Only advances as blocks are actually ingested, so pending-spend
+    /// expiry never runs ahead of what the wallet has really seen.
+    last_daa: u64,
 }
 
 /// How many owned notes keep a live witness. Beyond this, advancing every witness on
@@ -268,6 +299,9 @@ impl WalletDb {
             spent_nullifiers: HashSet::new(),
             ovk,
             history: Vec::new(),
+            history_enabled: true,
+            pending_spends: Vec::new(),
+            last_daa: 0,
         })
     }
 
@@ -303,6 +337,9 @@ impl WalletDb {
             spent_nullifiers: HashSet::new(),
             ovk,
             history: Vec::new(),
+            history_enabled: true,
+            pending_spends: Vec::new(),
+            last_daa: 0,
         })
     }
 
@@ -421,6 +458,9 @@ impl WalletDb {
     /// records [`HistoryEntry`] rows (with `meta: None` no history is written —
     /// the wallet still syncs correctly against a pre-v2 node).
     pub fn ingest_block_with_meta(&mut self, coinbase: &[(CoinbaseNoteDesc, u64)], txs: &[&ShieldedBundle], meta: Option<&BlockMeta>) {
+        if let Some(m) = meta {
+            self.last_daa = self.last_daa.max(m.daa_score);
+        }
         // Coinbase notes first, in the coinbase's own note order.
         for (desc, value) in coinbase {
             // Recompute the leaf exactly as consensus does; skip a malformed one
@@ -459,6 +499,9 @@ impl WalletDb {
         txs: &[&ShieldedBundle],
         meta: Option<&BlockMeta>,
     ) {
+        if let Some(m) = meta {
+            self.last_daa = self.last_daa.max(m.daa_score);
+        }
         for (desc, value, cmx) in coinbase {
             let owned = self.recover_coinbase_note(desc, *value);
             if owned.is_some() {
@@ -481,19 +524,20 @@ impl WalletDb {
                 continue;
             }
             // What this bundle takes from us — measured BEFORE the retain below
-            // removes the spent notes from the unspent set.
-            let spent: u64 = bundle
-                .actions
-                .iter()
-                .filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier))
-                .map(|n| n.value())
-                .sum();
+            // removes the spent notes from the unspent set. Pending spends count
+            // too: our own submitted send's notes are already parked there, and
+            // missing them here would make the wallet record its own confirmed
+            // send as a "Received <change>" row instead of a Sent one.
+            let spent: u64 = bundle.actions.iter().filter_map(|a| self.owned_note_value(&a.nullifier)).sum();
             let received = scan_bundle_prepared(&self.prepared_ivk, bundle);
             for (i, action) in bundle.actions.iter().enumerate() {
                 // Each action reveals the nullifier of the note it spends. If that is
                 // one of ours, the note is now spent — drop it from the unspent set so
-                // balance and spend-selection never count or re-offer it.
+                // balance and spend-selection never count or re-offer it. A pending
+                // spend whose nullifier appears is CONFIRMED: the parked note is gone
+                // for good.
                 self.notes.retain(|n| n.nullifier != action.nullifier);
+                self.pending_spends.retain(|p| p.note.nullifier != action.nullifier);
                 self.spent_nullifiers.insert(action.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&action.cmx)) else {
@@ -510,8 +554,21 @@ impl WalletDb {
         }
     }
 
+    /// Value of the owned note (unspent or pending-spend) this nullifier would
+    /// reveal, if it is one of ours.
+    fn owned_note_value(&self, nullifier: &[u8; 32]) -> Option<u64> {
+        self.notes
+            .iter()
+            .find(|n| &n.nullifier == nullifier)
+            .or_else(|| self.pending_spends.iter().map(|p| &p.note).find(|n| &n.nullifier == nullifier))
+            .map(|n| n.value())
+    }
+
     /// Record a mining-reward history row (one per owned coinbase note).
     fn record_coinbase_history(&mut self, value: u64, meta: &BlockMeta) {
+        if !self.history_enabled {
+            return;
+        }
         self.push_history(HistoryEntry {
             kind: HistoryKind::Coinbase,
             txid: meta.coinbase_txid,
@@ -532,6 +589,9 @@ impl WalletDb {
     /// send was built with it; otherwise the row falls back to `net outflow − fee`
     /// with no recipient — still a correct amount, just less descriptive.
     fn record_bundle_history(&mut self, bundle: &ShieldedBundle, spent: u64, received: &[ReceivedNote], txid: [u8; 32], meta: &BlockMeta) {
+        if !self.history_enabled {
+            return;
+        }
         let received_value: u64 = received.iter().map(|r| r.value()).sum();
         if spent == 0 && received_value == 0 {
             return; // not our transaction
@@ -601,6 +661,57 @@ impl WalletDb {
         &self.history
     }
 
+    /// Whether ingest records history rows.
+    pub fn history_enabled(&self) -> bool {
+        self.history_enabled
+    }
+
+    /// Turn history recording on or off. Turning it OFF also purges everything
+    /// recorded so far — the user withdrawing consent must actually remove the
+    /// readable record from the checkpoint, not merely stop appending to it.
+    pub fn set_history_enabled(&mut self, on: bool) {
+        self.history_enabled = on;
+        if !on {
+            self.history.clear();
+        }
+    }
+
+    /// Spends submitted but not yet observed on-chain.
+    pub fn pending_spends(&self) -> &[PendingSpend] {
+        &self.pending_spends
+    }
+
+    /// The wallet's chain clock — DAA score of the newest block ingested with meta.
+    pub fn last_daa(&self) -> u64 {
+        self.last_daa
+    }
+
+    /// Return every pending spend older than `max_age_daa` — measured on the
+    /// wallet's own chain clock ([`Self::last_daa`]) — to the unspent set, and
+    /// report `(txid, value)` per reclaimed note. The clock only advances as
+    /// blocks are ingested, so call this when the wallet is caught up to the tip:
+    /// then "this old and still unobserved" really does mean the transaction was
+    /// lost. Reclaiming a note whose spend later confirms anyway is safe — ingest
+    /// removes it again when the nullifier appears (and the network can never
+    /// apply that nullifier twice).
+    pub fn reclaim_expired(&mut self, max_age_daa: u64) -> Vec<([u8; 32], u64)> {
+        let now = self.last_daa;
+        let mut reclaimed = Vec::new();
+        let mut i = 0;
+        while i < self.pending_spends.len() {
+            if now.saturating_sub(self.pending_spends[i].submitted_daa) > max_age_daa {
+                let p = self.pending_spends.remove(i);
+                reclaimed.push((p.txid, p.note.value()));
+                // Keep `notes` in position order, as ingest appends them.
+                let at = self.notes.iter().position(|n| n.position > p.note.position).unwrap_or(self.notes.len());
+                self.notes.insert(at, p.note);
+            } else {
+                i += 1;
+            }
+        }
+        reclaimed
+    }
+
     /// What an **unsettled** block would do to this wallet's balance, without touching
     /// any state.
     ///
@@ -656,12 +767,20 @@ impl WalletDb {
         p
     }
 
-    /// Drop a note the wallet has spent (by leaf position), so it is no longer
-    /// offered for spending. The witness is discarded; the tree mirror is
-    /// untouched (spent notes stay in the tree — only the nullifier marks them
-    /// spent, on-chain).
-    pub fn mark_spent(&mut self, position: u64) {
-        self.notes.retain(|n| n.position != position);
+    /// Park a note whose spend was just **submitted** (by leaf position): it leaves
+    /// the unspent set immediately — the balance drops and a concurrent send cannot
+    /// re-select it — but it is NOT forgotten. It waits in [`Self::pending_spends`]
+    /// until its nullifier is observed on-chain (spend applied ⇒ gone for good) or
+    /// [`Self::reclaim_expired`] concludes the transaction was lost and returns it.
+    /// Deleting outright here is how money used to vanish: a node crash with the tx
+    /// still in its mempool, or a consensus-dropped shielded spend, left the note
+    /// unspent on-chain but permanently invisible to the wallet.
+    pub fn mark_spent(&mut self, position: u64, txid: [u8; 32]) {
+        let submitted_daa = self.last_daa;
+        if let Some(i) = self.notes.iter().position(|n| n.position == position) {
+            let note = self.notes.remove(i);
+            self.pending_spends.push(PendingSpend { note, txid, submitted_daa });
+        }
     }
 
     /// Append one leaf to the wallet's view: record it in the commitment stream,
@@ -992,6 +1111,28 @@ impl WalletDb {
         }
         out.extend_from_slice(&(hsec.len() as u64).to_le_bytes());
         out.extend_from_slice(&hsec);
+
+        // v7: the pending spends + the wallet's DAA clock, length-prefixed and
+        // best-effort like v5/v6. Parse trouble degrades to "no pending spends" —
+        // the pre-v7 status quo (those notes stay invisible until a rescan) —
+        // never a failed restore. Layout: [last_daa:u64][n:u64]
+        // (position:u64, nullifier:32, recipient:43, value:u64, rho:32, rseed:32,
+        //  txid:32, submitted_daa:u64)*.
+        let mut psec = Vec::new();
+        psec.extend_from_slice(&self.last_daa.to_le_bytes());
+        psec.extend_from_slice(&(self.pending_spends.len() as u64).to_le_bytes());
+        for p in &self.pending_spends {
+            psec.extend_from_slice(&p.note.position.to_le_bytes());
+            psec.extend_from_slice(&p.note.nullifier);
+            psec.extend_from_slice(&p.note.note.recipient().to_raw_address_bytes());
+            psec.extend_from_slice(&p.note.note.value().inner().to_le_bytes());
+            psec.extend_from_slice(&p.note.note.rho().to_bytes());
+            psec.extend_from_slice(p.note.note.rseed().as_bytes());
+            psec.extend_from_slice(&p.txid);
+            psec.extend_from_slice(&p.submitted_daa.to_le_bytes());
+        }
+        out.extend_from_slice(&(psec.len() as u64).to_le_bytes());
+        out.extend_from_slice(&psec);
         out
     }
 
@@ -1108,10 +1249,18 @@ impl WalletDb {
             }
         }
         // v6: the history section — same length-prefixed best-effort contract.
-        if version >= CHECKPOINT_VERSION {
+        if version >= CHECKPOINT_VERSION_V6 {
             if let Some(hlen) = r.u64() {
                 if let Some(hbuf) = r.take(hlen as usize) {
                     Self::read_history_section(&mut db, hbuf);
+                }
+            }
+        }
+        // v7: pending spends + DAA clock — same length-prefixed best-effort contract.
+        if version >= CHECKPOINT_VERSION {
+            if let Some(plen) = r.u64() {
+                if let Some(pbuf) = r.take(plen as usize) {
+                    Self::read_pending_section(&mut db, pbuf);
                 }
             }
         }
@@ -1119,6 +1268,38 @@ impl WalletDb {
             return None;
         }
         Some(db)
+    }
+
+    /// Best-effort restore of the v7 pending-spend section — any malformed record
+    /// drops the whole section, never fails the restore.
+    fn read_pending_section(db: &mut Self, buf: &[u8]) {
+        let mut r = Cursor { buf, pos: 0 };
+        let parse = |r: &mut Cursor<'_>| -> Option<(u64, Vec<PendingSpend>)> {
+            let last_daa = r.u64()?;
+            let n = r.u64()? as usize;
+            let mut out = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                let position = r.u64()?;
+                let nullifier = r.arr::<32>()?;
+                let recipient = r.arr::<43>()?;
+                let value = r.u64()?;
+                let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
+                let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
+                let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
+                let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed))?;
+                let txid = r.arr::<32>()?;
+                let submitted_daa = r.u64()?;
+                out.push(PendingSpend { note: OwnedNote { note, position, nullifier }, txid, submitted_daa });
+            }
+            if !r.done() {
+                return None;
+            }
+            Some((last_daa, out))
+        };
+        if let Some((last_daa, pending)) = parse(&mut r) {
+            db.last_daa = last_daa;
+            db.pending_spends = pending;
+        }
     }
 
     /// Best-effort restore of the v6 history section. Any malformed row drops the
@@ -1293,7 +1474,13 @@ fn read_witness(r: &mut Cursor<'_>) -> Option<IncrementalWitness<MerkleHashOrcha
 /// lose funds. v5 is a pure suffix of v4, so v4/v3 blobs still restore.
 /// v6 appends the **chain-derived history rows** ([`HistoryEntry`]) as another
 /// length-prefixed best-effort section — a pure suffix of v5.
-const CHECKPOINT_VERSION: u8 = 6;
+/// v7 appends the **pending spends** ([`PendingSpend`]) and the wallet's DAA
+/// clock as another length-prefixed best-effort section — a pure suffix of v6.
+/// Without it a restart forgot which notes were parked awaiting confirmation,
+/// which is half of how a lost transaction became lost money.
+const CHECKPOINT_VERSION: u8 = 7;
+/// v6 appended the history rows. A pure suffix of v5.
+const CHECKPOINT_VERSION_V6: u8 = 6;
 /// v5 appended the persisted witnesses. A pure suffix of v4.
 const CHECKPOINT_VERSION_V5: u8 = 5;
 /// v4 appended the tip frontier (O(1) restore). A pure suffix of v3.
@@ -1894,8 +2081,9 @@ mod tests {
         let v4 = db.to_checkpoint();
         assert_eq!(v4[0], CHECKPOINT_VERSION, "fresh checkpoints are written as the current version");
 
-        // Reconstruct the v3 encoding: identical bytes, minus the two suffixes newer
-        // versions append — the v4 tip frontier and the v5 witness section.
+        // Reconstruct the v3 encoding: identical bytes, minus the suffixes newer
+        // versions append — the v4 tip frontier plus the length-prefixed v5
+        // (witnesses), v6 (history) and v7 (pending spends) sections.
         let mut tip = Vec::new();
         write_frontier(&mut tip, &db.tree.to_frontier());
         let mut wsec = Vec::new();
@@ -1906,7 +2094,12 @@ mod tests {
             wsec.extend_from_slice(&pos.to_le_bytes());
             write_witness(&mut wsec, w);
         }
-        let suffix_len = tip.len() + 8 + wsec.len();
+        // History and pending are empty here (no metadata ingested, nothing
+        // submitted), so those sections are just their fixed-size headers.
+        assert!(db.history.is_empty() && db.pending_spends.is_empty());
+        let hsec_len = 8; // row count
+        let psec_len = 8 + 8; // last_daa + record count
+        let suffix_len = tip.len() + (8 + wsec.len()) + (8 + hsec_len) + (8 + psec_len);
         let mut v3 = v4[..v4.len() - suffix_len].to_vec();
         v3[0] = CHECKPOINT_VERSION_V3;
 
@@ -2089,8 +2282,8 @@ mod circuit_tests {
         let out = state.apply_chain_block(None, &[stx.clone()]).unwrap();
         assert_eq!(out.accepted, vec![0], "the wallet's real spend is accepted");
 
-        // The wallet marks the note spent; its tracked balance drops to zero.
-        db.mark_spent(owned.position);
+        // The wallet parks the submitted note; its tracked balance drops to zero.
+        db.mark_spent(owned.position, [0u8; 32]);
         assert_eq!(db.balance(), 0, "spent note no longer offered");
 
         // Replaying the same nullifier is dropped (double-spend guard).
@@ -2191,9 +2384,19 @@ mod circuit_tests {
         .expect("payment builds");
         let wire = ShieldedBundle::from_bytes(&payload).unwrap();
 
+        // Mirror walletd: the spent note is PARKED at submit time. The Sent row
+        // below must still come out right — the wallet has to recognise its own
+        // spend from the pending set (before this, a parked note was invisible
+        // and the confirmed send was mis-recorded as "Received <change>").
+        a.mark_spent(a.notes()[0].position, [0xcc; 32]);
+        assert_eq!(a.balance(), 0, "submitted note leaves the balance immediately");
+        assert_eq!(a.pending_spends().len(), 1);
+
         let meta2 = BlockMeta { coinbase_txid: [0xbb; 32], txids: vec![[0xcc; 32]], timestamp_ms: 2_000, daa_score: 20 };
         a.ingest_block_with_meta(&[], &[&wire], Some(&meta2));
         b.ingest_block_with_meta(&[], &[&wire], Some(&meta2));
+        assert!(a.pending_spends().is_empty(), "observed nullifier confirms the pending spend");
+        assert_eq!(a.balance(), 2_000, "change recovered");
 
         // Sender: a Sent row with the OVK-recovered recipient, amount and memo.
         assert_eq!(a.history().len(), 2);
@@ -2210,10 +2413,10 @@ mod circuit_tests {
         assert_eq!((recv.amount, recv.txid, recv.timestamp_ms), (5_000, [0xcc; 32], 2_000));
         assert_eq!(recv.memo, b"thanks!".to_vec());
 
-        // v6 checkpoint round-trip preserves the rows bit-for-bit.
+        // Checkpoint round-trip preserves the rows bit-for-bit.
         let blob = a.to_checkpoint();
-        assert_eq!(blob[0], CHECKPOINT_VERSION, "current checkpoints are v6");
-        let a2 = WalletDb::from_checkpoint(miner, &blob).expect("v6 restores");
+        assert_eq!(blob[0], CHECKPOINT_VERSION, "current checkpoints are v7");
+        let a2 = WalletDb::from_checkpoint(miner, &blob).expect("v7 restores");
         assert_eq!(a2.history().len(), 2);
         assert_eq!(a2.history()[1].recipient, sent.recipient);
         assert_eq!(a2.history()[1].memo, sent.memo);
@@ -2240,5 +2443,84 @@ mod circuit_tests {
         assert_eq!(sent.kind, HistoryKind::Sent);
         assert_eq!(sent.amount, 3_000, "net-outflow fallback still prices the send right");
         assert_eq!(sent.recipient, None, "without the OVK not even the sender can recover the recipient");
+    }
+
+    /// The vanishing-balance regression (live report 2026-07-18): a submitted
+    /// spend's notes must PARK — not vanish — until the chain shows the spend,
+    /// survive a restart parked, and come back if the transaction is lost.
+    #[test]
+    fn pending_spend_parks_reclaims_and_survives_checkpoint() {
+        let seed = [77u8; 32];
+        let addr = address_bytes_from_seed(seed).unwrap();
+        let mut db = WalletDb::from_seed(seed).unwrap();
+        db.ingest_block_with_meta(
+            &[cb(addr, b"blk1||0", 4_000)],
+            &[],
+            Some(&BlockMeta { coinbase_txid: [1; 32], txids: vec![], timestamp_ms: 1, daa_score: 100 }),
+        );
+        db.ingest_block_with_meta(
+            &[cb(addr, b"blk2||0", 6_000)],
+            &[],
+            Some(&BlockMeta { coinbase_txid: [2; 32], txids: vec![], timestamp_ms: 2, daa_score: 110 }),
+        );
+        assert_eq!(db.balance(), 10_000);
+        assert_eq!(db.last_daa(), 110, "ingest advances the DAA clock");
+
+        // Submit a spend of the 4_000 note: it leaves the balance but is parked.
+        let pos = db.notes()[0].position;
+        db.mark_spent(pos, [0xcc; 32]);
+        assert_eq!(db.balance(), 6_000);
+        assert_eq!(db.pending_spends().len(), 1);
+
+        // The parked note and the clock survive a checkpoint round-trip (v7).
+        let blob = db.to_checkpoint();
+        let mut db = WalletDb::from_checkpoint(seed, &blob).expect("v7 restores");
+        assert_eq!(db.pending_spends().len(), 1, "pending spends persist across restart");
+        assert_eq!(db.last_daa(), 110);
+        assert_eq!(db.balance(), 6_000);
+
+        // Too fresh to give up on: nothing reclaimed.
+        assert!(db.reclaim_expired(3_600).is_empty());
+
+        // An hour of chain time passes and the spend never appears — the tx was
+        // lost (node crash with it in the mempool, eviction, consensus drop).
+        db.ingest_block_with_meta(
+            &[],
+            &[],
+            Some(&BlockMeta { coinbase_txid: [3; 32], txids: vec![], timestamp_ms: 3, daa_score: 4_000 }),
+        );
+        let back = db.reclaim_expired(3_600);
+        assert_eq!(back, vec![([0xcc; 32], 4_000)], "the lost spend's note is handed back");
+        assert_eq!(db.balance(), 10_000, "no money vanished");
+        assert!(db.pending_spends().is_empty());
+        assert_eq!(db.notes()[0].position, pos, "reclaimed note returns in position order");
+    }
+
+    /// History is opt-in: with it off nothing is recorded, and turning it off
+    /// purges what was recorded while it was on.
+    #[test]
+    fn history_opt_out_records_nothing_and_purges() {
+        let seed = [78u8; 32];
+        let addr = address_bytes_from_seed(seed).unwrap();
+        let mut db = WalletDb::from_seed(seed).unwrap();
+        db.set_history_enabled(false);
+        db.ingest_block_with_meta(
+            &[cb(addr, b"blk1||0", 4_000)],
+            &[],
+            Some(&BlockMeta { coinbase_txid: [1; 32], txids: vec![], timestamp_ms: 1, daa_score: 100 }),
+        );
+        assert!(db.history().is_empty(), "nothing recorded while off");
+        assert_eq!(db.balance(), 4_000, "balance tracking is unaffected");
+
+        db.set_history_enabled(true);
+        db.ingest_block_with_meta(
+            &[cb(addr, b"blk2||0", 6_000)],
+            &[],
+            Some(&BlockMeta { coinbase_txid: [2; 32], txids: vec![], timestamp_ms: 2, daa_score: 110 }),
+        );
+        assert_eq!(db.history().len(), 1, "recording starts once enabled");
+
+        db.set_history_enabled(false);
+        assert!(db.history().is_empty(), "disabling erases the record");
     }
 }

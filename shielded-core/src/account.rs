@@ -163,8 +163,9 @@ impl ShieldedAccount {
         )
         .map_err(|e| PaymentError::Build(format!("{e:?}")))?;
 
-        // The note is now spent; drop it so it is not offered again.
-        self.db.mark_spent(selected.position);
+        // The note's spend is now in flight; park it so it is not offered again
+        // (txid unknown at build time — the caller submits the wire bytes).
+        self.db.mark_spent(selected.position, [0u8; 32]);
         Ok(wire.to_bytes())
     }
 }
