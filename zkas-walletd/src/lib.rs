@@ -2497,6 +2497,35 @@ async fn wallet_settings(
     Ok(Json(serde_json::json!({ "recoverableHistory": wf.recoverable_history })))
 }
 
+/// Retire this wallet's scan checkpoint and reload it from its birthday — a full
+/// re-derivation of the wallet from the chain itself. Two jobs: BACKFILL history
+/// rows after the user enables history (rows are only recorded while blocks are
+/// scanned), and RECOVER anything the incremental view ever lost (e.g. notes
+/// deleted by the pre-v7 submit-and-forget spend bug — the "my ZKAS vanished"
+/// report). Bounded work: birthday fast-sync + a scan of blocks since birthday.
+async fn wallet_rescan(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let token = token_from(&headers, state.allow_default_token)?;
+    if !wallet_exists(&state.wallet_dir, &token) {
+        return Err(err(StatusCode::NOT_FOUND, "no such wallet"));
+    }
+    // Poison any in-flight sync pass first: checkpoint writes are gated on
+    // `error.is_none()`, so this stops a concurrent pass from re-persisting the
+    // old cursor after we retire it below.
+    if let Some(w) = state.cached_wallet(&token).await {
+        w.lock().await.error = Some("rescanning from birthday".into());
+    }
+    state.wallets.lock().await.remove(&token);
+    let scan = scan_path(&state.wallet_dir, &token);
+    let _ = std::fs::rename(&scan, format!("{scan}.bak"));
+    log::info!("wallet '{token}': rescan requested — checkpoint retired, reloading from birthday");
+    // Reload immediately so the caller sees the fresh scan state (and any error).
+    state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::BAD_GATEWAY, "failed to reload wallet for rescan"))?;
+    Ok(Json(serde_json::json!({ "rescanning": true })))
+}
+
 /// Pack an optional UTF-8 memo into the fixed 512-byte Orchard memo field.
 fn memo_bytes(m: Option<&str>) -> Result<[u8; 512], (StatusCode, Json<serde_json::Value>)> {
     let mut out = [0u8; 512];
@@ -3387,6 +3416,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/balance", get(wallet_balance))
         .route("/api/wallet/history", get(wallet_history))
         .route("/api/wallet/settings", post(wallet_settings))
+        .route("/api/wallet/rescan", post(wallet_rescan))
         .route("/api/wallet/send", post(wallet_send))
         .route("/api/wallet/consolidate", post(wallet_consolidate))
         .route("/api/wallet/prepare", post(wallet_prepare))
