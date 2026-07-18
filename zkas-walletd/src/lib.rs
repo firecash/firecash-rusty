@@ -378,6 +378,167 @@ fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<(Wal
     Some((WalletKey::Seed(seed), wf.birthday, wf.recoverable_history))
 }
 
+/// How a wallet file on disk is protected — what an embedding shell (the desktop
+/// app) must know before it can decide between "ask for a new passphrase",
+/// "ask to unlock", and "offer to encrypt what is already here".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VaultState {
+    /// No wallet yet: the next step is creating one under a fresh passphrase.
+    Missing,
+    /// A wallet exists with its seed in CLEARTEXT (a daemon run without a
+    /// secret, or a wallet from before passphrases). Anyone who reads the file
+    /// holds the funds — it should be encrypted in place.
+    Plaintext,
+    /// Seed encrypted at rest; a passphrase is required to load it.
+    Encrypted,
+    /// Watch-only: no seed on this machine, so there is nothing to encrypt.
+    WatchOnly,
+}
+
+/// Inspect a wallet file's protection ([`VaultState`]) without decrypting it.
+pub fn vault_state(dir: &str, token: &str) -> VaultState {
+    let Ok(bytes) = std::fs::read(wallet_path(dir, token)) else { return VaultState::Missing };
+    let Ok(wf) = serde_json::from_slice::<WalletFile>(&bytes) else { return VaultState::Missing };
+    if !wf.fvk_hex.is_empty() {
+        VaultState::WatchOnly
+    } else if wf.encrypted {
+        VaultState::Encrypted
+    } else {
+        VaultState::Plaintext
+    }
+}
+
+/// Check a passphrase against an encrypted wallet **without** starting a daemon
+/// or loading the wallet — the unlock screen's verification step. `true` for a
+/// wallet that needs no passphrase (plaintext or watch-only), so a caller can
+/// treat "unlocked" uniformly.
+pub fn verify_wallet_secret(dir: &str, token: &str, secret: &str) -> bool {
+    match vault_state(dir, token) {
+        VaultState::Missing => false,
+        VaultState::Plaintext | VaultState::WatchOnly => true,
+        VaultState::Encrypted => load_wallet_meta(dir, token, Some(secret)).is_some(),
+    }
+}
+
+/// Encrypt an existing cleartext wallet in place under `secret`, so a wallet
+/// created before passphrases (or by a secretless daemon) gains protection
+/// without the user re-importing a seed. Writes via the same 0600 path as
+/// creation. No-op for an already-encrypted or watch-only wallet.
+///
+/// The rewrite is atomic in the sense that matters: the new file is only
+/// written after the seed has been successfully re-encrypted, so a failure
+/// leaves the original readable wallet intact rather than a corpse the user
+/// cannot open.
+pub fn encrypt_wallet_in_place(dir: &str, token: &str, secret: &str) -> Result<(), String> {
+    match vault_state(dir, token) {
+        VaultState::Missing => return Err("no wallet to encrypt".into()),
+        VaultState::Encrypted | VaultState::WatchOnly => return Ok(()),
+        VaultState::Plaintext => {}
+    }
+    let bytes = std::fs::read(wallet_path(dir, token)).map_err(|e| format!("read wallet: {e}"))?;
+    let mut wf: WalletFile = serde_json::from_slice(&bytes).map_err(|e| format!("parse wallet: {e}"))?;
+    let seed = unhex(&wf.seed_hex)
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .ok_or_else(|| "wallet seed is not 32 bytes".to_string())?;
+    let blob = encrypt_seed(&seed, secret)?;
+    wf.seed_hex = hex(&blob);
+    wf.encrypted = true;
+    write_wallet_file(dir, token, &wf).map_err(|e| format!("write wallet: {e}"))
+}
+
+/// A portable, self-contained wallet backup: the seed encrypted under a
+/// passphrase of the user's choosing, plus the little bit of metadata a restore
+/// needs. Safe to keep on a USB stick, in cloud storage, or in a password
+/// manager — without the passphrase it is 32 bytes of noise.
+///
+/// Deliberately NOT a copy of the on-disk wallet file: the backup carries its
+/// own salt/nonce and its own passphrase, so exporting cannot leak anything
+/// about the device passphrase, and a user can hand a backup to a restore on
+/// another machine without reusing the daily unlock secret.
+#[derive(Serialize, Deserialize)]
+pub struct WalletBackup {
+    /// Fixed marker so a restore can reject an unrelated JSON file with a clear
+    /// message instead of a decryption error.
+    pub magic: String,
+    pub version: u32,
+    pub network: String,
+    /// Wallet birthday, so a restore syncs from there instead of genesis.
+    pub birthday: u64,
+    /// `salt(16) || nonce(24) || ciphertext` — see [`encrypt_seed`].
+    pub encrypted_seed_hex: String,
+    pub created_unix: u64,
+}
+
+const BACKUP_MAGIC: &str = "zkas-wallet-backup";
+const BACKUP_VERSION: u32 = 1;
+
+/// Produce an encrypted backup of `token`'s seed under `backup_secret`.
+///
+/// `wallet_secret` is the device passphrase, needed only to read the seed that
+/// is being backed up (`None` for a legacy cleartext wallet). Watch-only
+/// wallets have no seed and are refused — backing one up would produce a file
+/// that cannot restore spending ability, which is worse than no backup because
+/// the user would believe they were covered.
+pub fn export_backup(dir: &str, token: &str, wallet_secret: Option<&str>, backup_secret: &str) -> Result<String, String> {
+    if backup_secret.chars().count() < 8 {
+        return Err("backup passphrase must be at least 8 characters".into());
+    }
+    let bytes = std::fs::read(wallet_path(dir, token)).map_err(|_| "no wallet on this device".to_string())?;
+    let wf: WalletFile = serde_json::from_slice(&bytes).map_err(|e| format!("parse wallet: {e}"))?;
+    if !wf.fvk_hex.is_empty() {
+        return Err("this is a watch-only wallet — it holds no seed to back up".into());
+    }
+    let (key, birthday, _) = load_wallet_meta(dir, token, wallet_secret).ok_or("cannot read the wallet seed (wrong passphrase?)")?;
+    let seed = match key {
+        WalletKey::Seed(s) => s,
+        WalletKey::Fvk(_) => return Err("this is a watch-only wallet — it holds no seed to back up".into()),
+    };
+    let blob = encrypt_seed(&seed, backup_secret)?;
+    let backup = WalletBackup {
+        magic: BACKUP_MAGIC.into(),
+        version: BACKUP_VERSION,
+        network: wf.network,
+        birthday,
+        encrypted_seed_hex: hex(&blob),
+        created_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+    serde_json::to_string_pretty(&backup).map_err(|e| format!("serialize backup: {e}"))
+}
+
+/// Restore a wallet from an [`export_backup`] file: decrypt with
+/// `backup_secret`, then write it as `token`'s wallet encrypted under
+/// `wallet_secret` (the device passphrase from here on).
+///
+/// Refuses to clobber an existing wallet — restoring over a live wallet whose
+/// seed the user has not backed up would destroy funds. Any stale scan
+/// checkpoint is dropped so the restored wallet rescans from its birthday
+/// rather than resuming a different wallet's stream.
+pub fn import_backup(dir: &str, token: &str, json: &str, backup_secret: &str, wallet_secret: &str) -> Result<(), String> {
+    if wallet_secret.chars().count() < 8 {
+        return Err("passphrase must be at least 8 characters".into());
+    }
+    let backup: WalletBackup = serde_json::from_str(json).map_err(|_| "not a ZKas wallet backup file".to_string())?;
+    if backup.magic != BACKUP_MAGIC {
+        return Err("not a ZKas wallet backup file".into());
+    }
+    if backup.version > BACKUP_VERSION {
+        return Err(format!("this backup was written by a newer wallet (format v{}) — update the app", backup.version));
+    }
+    if wallet_exists(dir, token) {
+        return Err("a wallet already exists on this device; remove it before restoring".into());
+    }
+    let blob = unhex(&backup.encrypted_seed_hex).ok_or("backup is corrupt (bad seed field)")?;
+    let seed = decrypt_seed(&blob, backup_secret).map_err(|_| "wrong backup passphrase".to_string())?;
+    save_seed(dir, token, &backup.network, &seed, backup.birthday, Some(wallet_secret))
+        .map_err(|e| format!("write wallet: {e}"))?;
+    let _ = std::fs::remove_file(scan_path(dir, token));
+    Ok(())
+}
+
 fn wallet_exists(dir: &str, token: &str) -> bool {
     std::path::Path::new(&wallet_path(dir, token)).exists()
 }
@@ -3477,5 +3638,63 @@ mod sdk_api_tests {
         .unwrap();
         assert_eq!(request.amount_sompi.unwrap().parse("amount_sompi").unwrap(), 100);
         assert_eq!(request.fee.unwrap().parse("fee").unwrap(), 3);
+    }
+
+    /// A backup must restore the SAME wallet on another device, and must refuse
+    /// a wrong passphrase, a foreign file, and clobbering a live wallet. A
+    /// backup that cannot restore is worse than no backup — the user believes
+    /// they are covered.
+    #[test]
+    fn backup_roundtrips_and_refuses_bad_input() {
+        let tmp = std::env::temp_dir().join(format!("zkas-backup-test-{}", std::process::id()));
+        let dir = tmp.to_string_lossy().to_string();
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed = [0x5au8; 32];
+
+        // A device wallet encrypted under the device passphrase.
+        save_seed(&dir, "src", "mainnet", &seed, 4242, Some("device-passphrase")).unwrap();
+        assert_eq!(vault_state(&dir, "src"), VaultState::Encrypted);
+
+        let json = export_backup(&dir, "src", Some("device-passphrase"), "backup-passphrase").unwrap();
+        // The backup must not be readable without its own passphrase.
+        assert!(!json.contains(&hex(&seed)), "backup must not carry the seed in the clear");
+
+        // Restoring on a "new device" (a different wallet dir) recovers the seed.
+        let dir2 = format!("{dir}-restore");
+        std::fs::create_dir_all(&dir2).unwrap();
+        import_backup(&dir2, "dst", &json, "backup-passphrase", "new-device-pass").unwrap();
+        let (key, birthday, _) = load_wallet_meta(&dir2, "dst", Some("new-device-pass")).unwrap();
+        assert_eq!(birthday, 4242, "birthday survives so the restore does not rescan from genesis");
+        match key {
+            WalletKey::Seed(s) => assert_eq!(s, seed, "restored seed is identical"),
+            WalletKey::Fvk(_) => panic!("expected a seed wallet"),
+        }
+        assert_eq!(vault_state(&dir2, "dst"), VaultState::Encrypted, "restored wallet is encrypted at rest");
+
+        // Wrong backup passphrase, foreign file, and clobbering are all refused.
+        let dir3 = format!("{dir}-neg");
+        std::fs::create_dir_all(&dir3).unwrap();
+        assert!(import_backup(&dir3, "x", &json, "not-the-passphrase", "new-device-pass").is_err());
+        assert!(import_backup(&dir3, "x", "{\"hello\":1}", "backup-passphrase", "new-device-pass").is_err());
+        assert!(
+            import_backup(&dir2, "dst", &json, "backup-passphrase", "new-device-pass").is_err(),
+            "must not overwrite an existing wallet"
+        );
+
+        // Wrong DEVICE passphrase cannot export.
+        assert!(export_backup(&dir, "src", Some("wrong"), "backup-passphrase").is_err());
+
+        // A legacy cleartext wallet encrypts in place, then still exports.
+        save_seed(&dir, "legacy", "mainnet", &seed, 0, None).unwrap();
+        assert_eq!(vault_state(&dir, "legacy"), VaultState::Plaintext);
+        encrypt_wallet_in_place(&dir, "legacy", "device-passphrase").unwrap();
+        assert_eq!(vault_state(&dir, "legacy"), VaultState::Encrypted);
+        assert!(verify_wallet_secret(&dir, "legacy", "device-passphrase"));
+        assert!(!verify_wallet_secret(&dir, "legacy", "nope"));
+        assert!(export_backup(&dir, "legacy", Some("device-passphrase"), "backup-passphrase").is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+        std::fs::remove_dir_all(&dir3).ok();
     }
 }
