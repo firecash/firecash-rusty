@@ -1846,7 +1846,8 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // judged when caught up, so "unobserved" means the chain really doesn't have
     // it, not that we haven't looked yet.
     if e.caught_up {
-        for (txid, value) in e.db.reclaim_expired(PENDING_SPEND_EXPIRY_DAA) {
+        let now_daa = e.scanned as u64;
+        for (txid, value) in e.db.reclaim_expired(now_daa, PENDING_SPEND_EXPIRY_DAA) {
             e.force_checkpoint = true; // persist the returned note promptly
             log::warn!(
                 "wallet '{token}': submitted spend {} ({value} sompi) never appeared on-chain within ~{PENDING_SPEND_EXPIRY_DAA}s of chain time — note returned to the spendable balance",
@@ -2703,8 +2704,11 @@ async fn wallet_send(
                 sent += pay;
                 total_fee += cfee;
                 let mut e = w.lock().await;
+                // The wallet's scan cursor is its chain clock — available whether or
+                // not the node serves block metadata, unlike WalletDb's own.
+                let now_daa = e.scanned as u64;
                 for p in positions {
-                    e.db.mark_spent(p, accepted.as_bytes());
+                    e.db.mark_spent(p, accepted.as_bytes(), now_daa);
                 }
             }
             Err(e) if txids.is_empty() => return Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payment: {e}"))),
@@ -2820,8 +2824,9 @@ async fn wallet_consolidate(
     match state.client.submit_transaction(RpcTransaction::from(&tx), false).await {
         Ok(accepted) => {
             let mut e = w.lock().await;
+            let now_daa = e.scanned as u64;
             for p in positions {
-                e.db.mark_spent(p, accepted.as_bytes());
+                e.db.mark_spent(p, accepted.as_bytes(), now_daa);
             }
             let notes_remaining = e.db.notes().len();
             Ok(Json(ConsolidateResp { txid: accepted.to_string(), consolidated, value_sompi: value, notes_remaining }))

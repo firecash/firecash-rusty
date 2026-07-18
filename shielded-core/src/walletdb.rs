@@ -86,8 +86,12 @@ pub struct PendingSpend {
     pub note: OwnedNote,
     /// Transaction id the spend was submitted in (zeros when unknown).
     pub txid: [u8; 32],
-    /// The wallet's DAA clock ([`WalletDb::last_daa`]) at submit time — the
-    /// expiry countdown starts here.
+    /// Chain DAA score at submit time, supplied by the caller — the expiry
+    /// countdown starts here. The caller passes it (rather than this type
+    /// reading a clock of its own) because a wallet syncing against a node that
+    /// serves no block metadata has no clock: `last_daa` stays 0, and an expiry
+    /// measured against it would fire the moment any dated block arrived,
+    /// un-parking a spend that is legitimately still in flight.
     pub submitted_daa: u64,
 }
 
@@ -686,20 +690,24 @@ impl WalletDb {
         self.last_daa
     }
 
-    /// Return every pending spend older than `max_age_daa` — measured on the
-    /// wallet's own chain clock ([`Self::last_daa`]) — to the unspent set, and
-    /// report `(txid, value)` per reclaimed note. The clock only advances as
-    /// blocks are ingested, so call this when the wallet is caught up to the tip:
-    /// then "this old and still unobserved" really does mean the transaction was
-    /// lost. Reclaiming a note whose spend later confirms anyway is safe — ingest
-    /// removes it again when the nullifier appears (and the network can never
-    /// apply that nullifier twice).
-    pub fn reclaim_expired(&mut self, max_age_daa: u64) -> Vec<([u8; 32], u64)> {
-        let now = self.last_daa;
+    /// Return every pending spend older than `max_age_daa` — measured against the
+    /// caller-supplied chain score `now_daa` — to the unspent set, and report
+    /// `(txid, value)` per reclaimed note. Call this only when the wallet is
+    /// caught up to the tip: then "this old and still unobserved" really does mean
+    /// the transaction was lost. Reclaiming a note whose spend later confirms
+    /// anyway is safe — ingest removes it again when the nullifier appears (and
+    /// the network can never apply that nullifier twice).
+    ///
+    /// A spend parked with `submitted_daa == 0` (submitted before the caller had a
+    /// chain score) is never reclaimed on age: the countdown has no origin, so it
+    /// waits for its nullifier rather than risk un-parking an in-flight spend.
+    pub fn reclaim_expired(&mut self, now_daa: u64, max_age_daa: u64) -> Vec<([u8; 32], u64)> {
+        let now = now_daa;
         let mut reclaimed = Vec::new();
         let mut i = 0;
         while i < self.pending_spends.len() {
-            if now.saturating_sub(self.pending_spends[i].submitted_daa) > max_age_daa {
+            let origin = self.pending_spends[i].submitted_daa;
+            if origin != 0 && now.saturating_sub(origin) > max_age_daa {
                 let p = self.pending_spends.remove(i);
                 reclaimed.push((p.txid, p.note.value()));
                 // Keep `notes` in position order, as ingest appends them.
@@ -775,8 +783,7 @@ impl WalletDb {
     /// Deleting outright here is how money used to vanish: a node crash with the tx
     /// still in its mempool, or a consensus-dropped shielded spend, left the note
     /// unspent on-chain but permanently invisible to the wallet.
-    pub fn mark_spent(&mut self, position: u64, txid: [u8; 32]) {
-        let submitted_daa = self.last_daa;
+    pub fn mark_spent(&mut self, position: u64, txid: [u8; 32], submitted_daa: u64) {
         if let Some(i) = self.notes.iter().position(|n| n.position == position) {
             let note = self.notes.remove(i);
             self.pending_spends.push(PendingSpend { note, txid, submitted_daa });
@@ -2283,7 +2290,7 @@ mod circuit_tests {
         assert_eq!(out.accepted, vec![0], "the wallet's real spend is accepted");
 
         // The wallet parks the submitted note; its tracked balance drops to zero.
-        db.mark_spent(owned.position, [0u8; 32]);
+        db.mark_spent(owned.position, [0u8; 32], 0);
         assert_eq!(db.balance(), 0, "spent note no longer offered");
 
         // Replaying the same nullifier is dropped (double-spend guard).
@@ -2388,7 +2395,7 @@ mod circuit_tests {
         // below must still come out right — the wallet has to recognise its own
         // spend from the pending set (before this, a parked note was invisible
         // and the confirmed send was mis-recorded as "Received <change>").
-        a.mark_spent(a.notes()[0].position, [0xcc; 32]);
+        a.mark_spent(a.notes()[0].position, [0xcc; 32], 15);
         assert_eq!(a.balance(), 0, "submitted note leaves the balance immediately");
         assert_eq!(a.pending_spends().len(), 1);
 
@@ -2468,7 +2475,7 @@ mod circuit_tests {
 
         // Submit a spend of the 4_000 note: it leaves the balance but is parked.
         let pos = db.notes()[0].position;
-        db.mark_spent(pos, [0xcc; 32]);
+        db.mark_spent(pos, [0xcc; 32], 110);
         assert_eq!(db.balance(), 6_000);
         assert_eq!(db.pending_spends().len(), 1);
 
@@ -2480,7 +2487,7 @@ mod circuit_tests {
         assert_eq!(db.balance(), 6_000);
 
         // Too fresh to give up on: nothing reclaimed.
-        assert!(db.reclaim_expired(3_600).is_empty());
+        assert!(db.reclaim_expired(120, 3_600).is_empty());
 
         // An hour of chain time passes and the spend never appears — the tx was
         // lost (node crash with it in the mempool, eviction, consensus drop).
@@ -2489,11 +2496,32 @@ mod circuit_tests {
             &[],
             Some(&BlockMeta { coinbase_txid: [3; 32], txids: vec![], timestamp_ms: 3, daa_score: 4_000 }),
         );
-        let back = db.reclaim_expired(3_600);
+        let back = db.reclaim_expired(4_000, 3_600);
         assert_eq!(back, vec![([0xcc; 32], 4_000)], "the lost spend's note is handed back");
         assert_eq!(db.balance(), 10_000, "no money vanished");
         assert!(db.pending_spends().is_empty());
         assert_eq!(db.notes()[0].position, pos, "reclaimed note returns in position order");
+    }
+
+    /// A spend parked with no chain score (the wallet syncs against a node that
+    /// serves no block metadata, so it has no clock) must NEVER be reclaimed on
+    /// age — otherwise the first dated block un-parks a spend that is still in
+    /// flight, and the wallet offers a note the network is about to consume.
+    #[test]
+    fn pending_spend_without_a_clock_is_never_age_reclaimed() {
+        let seed = [79u8; 32];
+        let addr = address_bytes_from_seed(seed).unwrap();
+        let mut db = WalletDb::from_seed(seed).unwrap();
+        db.ingest_block(&[cb(addr, b"blk1||0", 4_000)], &[]); // no meta ⇒ no clock
+        assert_eq!(db.last_daa(), 0);
+
+        db.mark_spent(db.notes()[0].position, [0xcc; 32], 0); // submitted, clock unknown
+        assert_eq!(db.pending_spends().len(), 1);
+
+        // A huge jump in chain score must not expire it.
+        assert!(db.reclaim_expired(1_000_000, 3_600).is_empty(), "no origin ⇒ no age-based expiry");
+        assert_eq!(db.pending_spends().len(), 1, "the spend still waits for its nullifier");
+        assert_eq!(db.balance(), 0, "and the note stays out of the spendable set");
     }
 
     /// History is opt-in: with it off nothing is recorded, and turning it off
