@@ -2521,9 +2521,11 @@ async fn wallet_rescan(
     state.wallets.lock().await.remove(&token);
     let scan = scan_path(&state.wallet_dir, &token);
     let _ = std::fs::rename(&scan, format!("{scan}.bak"));
-    log::info!("wallet '{token}': rescan requested — checkpoint retired, reloading from birthday");
-    // Reload immediately so the caller sees the fresh scan state (and any error).
-    state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::BAD_GATEWAY, "failed to reload wallet for rescan"))?;
+    log::info!("wallet '{token}': rescan requested — checkpoint retired, will reload from birthday");
+    // Return NOW. Reloading a wallet means a fast-sync anchor fetch and a scan
+    // from birthday; doing that inline would hold the request open for minutes and
+    // starve the HTTP path (the 2026-07-12 "wallet won't connect" outage). The
+    // next status/balance poll — or the background sync loop — reloads it lazily.
     Ok(Json(serde_json::json!({ "rescanning": true })))
 }
 
