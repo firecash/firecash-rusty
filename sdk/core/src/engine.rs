@@ -1,3 +1,19 @@
+//! # Reference sync skeleton — NOT the production wallet engine
+//!
+//! This module demonstrates the `ChainSource`/`WalletStore` contracts with a
+//! minimal, deterministic sync loop. The production engine — the one with a
+//! send path, witness maintenance/budgeting, anchor-boundary tracking,
+//! mempool/preview 0-conf, reorg *recovery* (not just detection), birthday
+//! fast-sync (`WalletDb::from_frontier`), and pruning-loss accounting
+//! (`blind_below` / `missing_history`) — lives in `zkas-walletd` today and is
+//! being extracted here incrementally, by moving that code, not rewriting it.
+//!
+//! **Do not build a user-facing wallet on this module as it stands.** In
+//! particular it cannot spend, it starts scanning from the node's earliest
+//! served block with no birthday bound, and a wallet restored through a
+//! pruning node will silently miss notes minted below the pruning point — the
+//! exact failure the production engine refuses to allow.
+
 use kaspa_shielded_core::{
     bundle::ShieldedBundle,
     walletdb::{BlockMeta, HistoryEntry, WalletDb},
@@ -156,6 +172,21 @@ impl Wallet {
             self.cursor = Some(block.hash);
             self.blue_score = block.blue_score;
             self.daa_score = block.daa_score;
+            report.scanned += 1;
+            report.cursor = self.cursor;
+            report.events.push(SyncEvent::BlockCommitted {
+                hash: block.hash,
+                blue_score: block.blue_score,
+                daa_score: block.daa_score,
+            });
+        }
+        // Checkpoint once per batch, not once per block: `to_checkpoint`
+        // serializes the whole wallet, so a per-block save makes initial sync
+        // O(blocks²) in I/O — the same complexity class as the witness bug this
+        // codebase already paid for once. A crash between batches only re-scans
+        // the last batch from the durable cursor; it cannot corrupt state,
+        // because the snapshot pairs the cursor and the tree atomically.
+        if report.scanned > 0 {
             store
                 .save(
                     &self.config.wallet_id,
@@ -169,13 +200,6 @@ impl Wallet {
                 )
                 .await
                 .map_err(SdkError::Store)?;
-            report.scanned += 1;
-            report.cursor = self.cursor;
-            report.events.push(SyncEvent::BlockCommitted {
-                hash: block.hash,
-                blue_score: block.blue_score,
-                daa_score: block.daa_score,
-            });
         }
         report.events.push(SyncEvent::Finished { cursor: self.cursor, balance: self.db.balance() });
         Ok(report)

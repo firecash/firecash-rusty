@@ -15,8 +15,28 @@ use orchard::keys::FullViewingKey;
 use zeroize::Zeroizing;
 
 /// Payment the user explicitly approved in the application UI.
+///
+/// `max_fee` is a **ceiling**, not the fee itself. The fee a prepared payment
+/// actually pays is read from the bundle it authorizes (its public value
+/// balance), never from a number the prover reports out-of-band: a prover that
+/// could name its own "agreed fee" could burn the user's entire change as fee
+/// (collectable by a miner, plausibly the prover's own pool) while every
+/// commitment check still passed. The signer refuses any fee above this bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaymentIntent {
+    pub recipient: [u8; 43],
+    pub amount: u64,
+    /// Largest total fee the user approved for this transaction, in sompi.
+    pub max_fee: u64,
+}
+
+/// What the prover *claims* the payment is, embedded in the prepared envelope so
+/// a detached signer (hardware wallet, CLI, another device) can display the
+/// payment from the envelope alone. Claims are cross-checked against both the
+/// user's approved [`PaymentIntent`] and the bundle itself before signing — a
+/// claim is never trusted, only required to be consistent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimedIntent {
     pub recipient: [u8; 43],
     pub amount: u64,
     pub fee: u64,
@@ -41,10 +61,15 @@ pub struct PreparedPayment {
     pub bundle: ShieldedBundle,
     pub disclosure: Vec<ActionDisclosure>,
     pub spend_auth: Vec<SpendAuthRequest>,
+    /// The prover's own statement of what this payment is (recipient, amount,
+    /// fee). Verified against the user's intent and the bundle before signing.
+    pub claimed: ClaimedIntent,
 }
 
 impl PreparedPayment {
-    pub const VERSION: u16 = 1;
+    /// Version 2 added the embedded [`ClaimedIntent`]; version 1 envelopes,
+    /// which carried intent out-of-band, are no longer accepted.
+    pub const VERSION: u16 = 2;
 }
 
 /// Signature returned for one action. The prover/finalizer applies it only at
@@ -65,6 +90,14 @@ pub enum SignerError {
     InvalidSpendRandomizer { action_index: usize },
     DuplicateAction { action_index: usize },
     MissingAction { action_index: usize },
+    /// The bundle's public value balance is zero or negative, so it pays no fee
+    /// — a shielded payment always pays a positive public fee.
+    NonPositiveFee { value_balance: i64 },
+    /// The bundle pays a larger fee than the user approved.
+    FeeAboveApprovedMaximum { fee: u64, max_fee: u64 },
+    /// The envelope's claimed intent does not match what the user approved or
+    /// what the bundle actually pays.
+    ClaimedIntentMismatch(&'static str),
 }
 
 impl core::fmt::Display for SignerError {
@@ -78,6 +111,15 @@ impl core::fmt::Display for SignerError {
             Self::InvalidSpendRandomizer { action_index } => write!(f, "action {action_index} has an invalid spend randomizer"),
             Self::DuplicateAction { action_index } => write!(f, "action {action_index} is requested more than once"),
             Self::MissingAction { action_index } => write!(f, "bundle action {action_index} does not exist"),
+            Self::NonPositiveFee { value_balance } => {
+                write!(f, "bundle's value balance is {value_balance}; a payment must pay a positive public fee")
+            }
+            Self::FeeAboveApprovedMaximum { fee, max_fee } => {
+                write!(f, "refusing to sign: bundle pays a fee of {fee} sompi, above the approved maximum of {max_fee}")
+            }
+            Self::ClaimedIntentMismatch(what) => {
+                write!(f, "refusing to sign: the envelope's claimed {what} does not match the approved payment")
+            }
         }
     }
 }
@@ -124,8 +166,32 @@ impl SoftwareSigner {
             return Err(SignerError::WrongNetwork);
         }
 
+        // The fee is what the BUNDLE pays — its public value balance — never a
+        // number the prover reported alongside it. The user bounds it; anything
+        // above the bound is refused before any signature exists.
+        let fee = match u64::try_from(prepared.bundle.value_balance) {
+            Ok(fee) if fee > 0 => fee,
+            _ => return Err(SignerError::NonPositiveFee { value_balance: prepared.bundle.value_balance }),
+        };
+        if fee > intent.max_fee {
+            return Err(SignerError::FeeAboveApprovedMaximum { fee, max_fee: intent.max_fee });
+        }
+
+        // The claims a detached signer would display must be the payment the
+        // user approved and the payment the bundle pays. A prover that shows one
+        // thing and pays another is refused here.
+        if prepared.claimed.recipient != intent.recipient {
+            return Err(SignerError::ClaimedIntentMismatch("recipient"));
+        }
+        if prepared.claimed.amount != intent.amount {
+            return Err(SignerError::ClaimedIntentMismatch("amount"));
+        }
+        if prepared.claimed.fee != fee {
+            return Err(SignerError::ClaimedIntentMismatch("fee"));
+        }
+
         let fvk = FullViewingKey::from_bytes(&self.full_viewing_key()).ok_or(SignerError::InvalidViewingKey)?;
-        check_prepared_payment(&prepared.bundle, &prepared.disclosure, &fvk, &intent.recipient, intent.amount, intent.fee)
+        check_prepared_payment(&prepared.bundle, &prepared.disclosure, &fvk, &intent.recipient, intent.amount, fee)
             .map_err(SignerError::PaymentRejected)?;
 
         let action_count = prepared.bundle.actions.len();
@@ -156,6 +222,76 @@ mod tests {
         let signer = SoftwareSigner::new([7; 32]).unwrap();
         assert_eq!(signer.address_bytes(), address_bytes_from_seed([7; 32]).unwrap());
         assert_eq!(signer.full_viewing_key(), fvk_bytes_from_seed([7; 32]).unwrap());
+    }
+
+    fn prepared(value_balance: i64, claimed: ClaimedIntent) -> PreparedPayment {
+        PreparedPayment {
+            version: PreparedPayment::VERSION,
+            network_domain: [1; 32],
+            tx_context: vec![2, 0],
+            bundle: ShieldedBundle { actions: vec![], flags: 0, value_balance, anchor: [0; 32], proof: vec![], binding_sig: [0; 64] },
+            disclosure: vec![],
+            spend_auth: vec![],
+            claimed,
+        }
+    }
+
+    fn intent(signer: &SoftwareSigner, amount: u64, max_fee: u64) -> PaymentIntent {
+        PaymentIntent { recipient: signer.address_bytes(), amount, max_fee }
+    }
+
+    #[test]
+    fn fee_is_read_from_the_bundle_and_bounded_by_the_user() {
+        let signer = SoftwareSigner::new([7; 32]).unwrap();
+        let approved = intent(&signer, 1_000, 50);
+        let claimed = ClaimedIntent { recipient: approved.recipient, amount: 1_000, fee: 100 };
+        // The bundle pays 100 sompi of fee; the user approved at most 50.
+        match signer.verify_and_sign(&[1; 32], &approved, &prepared(100, claimed)) {
+            Err(SignerError::FeeAboveApprovedMaximum { fee: 100, max_fee: 50 }) => {}
+            other => panic!("expected fee refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_or_negative_fee_bundles_are_refused() {
+        let signer = SoftwareSigner::new([7; 32]).unwrap();
+        let approved = intent(&signer, 1_000, 50);
+        let claimed = ClaimedIntent { recipient: approved.recipient, amount: 1_000, fee: 0 };
+        for value_balance in [0i64, -5] {
+            match signer.verify_and_sign(&[1; 32], &approved, &prepared(value_balance, claimed)) {
+                Err(SignerError::NonPositiveFee { .. }) => {}
+                other => panic!("expected non-positive-fee refusal for {value_balance}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn claims_must_match_the_approved_payment_and_the_bundle() {
+        let signer = SoftwareSigner::new([7; 32]).unwrap();
+        let approved = intent(&signer, 1_000, 50);
+        let honest = ClaimedIntent { recipient: approved.recipient, amount: 1_000, fee: 30 };
+
+        let mut wrong_recipient = honest;
+        wrong_recipient.recipient = [9; 43];
+        let mut wrong_amount = honest;
+        wrong_amount.amount = 999;
+        let mut wrong_fee = honest;
+        wrong_fee.fee = 20; // bundle pays 30
+
+        for (claimed, what) in [(wrong_recipient, "recipient"), (wrong_amount, "amount"), (wrong_fee, "fee")] {
+            match signer.verify_and_sign(&[1; 32], &approved, &prepared(30, claimed)) {
+                Err(SignerError::ClaimedIntentMismatch(field)) => assert_eq!(field, what),
+                other => panic!("expected claimed-{what} refusal, got {other:?}"),
+            }
+        }
+
+        // Honest claims within the fee bound pass every intent gate; the empty
+        // test bundle is then rejected by the commitment checks, proving the
+        // full payment check still runs after the new gates.
+        match signer.verify_and_sign(&[1; 32], &approved, &prepared(30, honest)) {
+            Err(SignerError::PaymentRejected(PaymentCheckError::ValueImbalance)) => {}
+            other => panic!("expected the payment check to run, got {other:?}"),
+        }
     }
 
     #[test]

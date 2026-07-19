@@ -45,17 +45,25 @@ ZKas sync semantics differ from ordinary linear chains:
 
 1. The local signer derives an FVK and registers a watch-only wallet.
 2. Walletd scans, selects matured notes, builds the Halo 2 proof, and returns
-   `preparedPayment` from `/prepare`.
-3. Deserialize it with `PreparedPaymentV1::to_typed`.
-4. Construct `PaymentIntent` from the recipient, integer amount, and maximum fee
-   that the user actually approved—not values copied from the server.
+   `preparedPayment` (envelope version 2) from `/prepare`.
+3. Deserialize it with `PreparedPaymentEnvelope::to_typed`.
+4. Construct `PaymentIntent` from the recipient, integer amount, and **`max_fee`
+   — a fee ceiling the user approved**, never a fee figure copied from the
+   server. The signer reads the fee the bundle actually pays (its public value
+   balance) and refuses anything above the ceiling; without that bound a
+   malicious prover could burn the wallet's entire change as "fee".
 5. Call `SoftwareSigner::verify_and_sign` with the locally configured genesis.
 6. Return the indexed signatures to `/submit`.
 
+The version-2 envelope embeds the prover's *claimed* recipient/amount/fee so a
+detached signer (hardware wallet, CLI on another machine) can display the
+payment from the envelope alone. Claims are display data: the signer
+cross-checks them against the user's approval and the bundle before signing.
+
 The envelope checksum detects transport/storage corruption. Security does not
 depend on that checksum: the signer independently checks note/value commitments,
-recipient, amount, fee, change, network domain, action indices, and recomputed
-sighash before signing.
+recipient, amount, the fee bound, change, network domain, action indices, and
+the recomputed sighash before signing.
 
 ## Amounts
 
@@ -67,5 +75,5 @@ strings or `bigint`; never use floating point for payment construction.
 ```bash
 cargo run -p zkas-sdk --example payment_plan
 cargo run -p zkas-sdk --example sign_prepared_payment -- \
-  prepared.json SEED_HEX zkas:ADDRESS AMOUNT_SOMPI FEE_SOMPI
+  prepared.json SEED_HEX zkas:ADDRESS AMOUNT_SOMPI MAX_FEE_SOMPI
 ```

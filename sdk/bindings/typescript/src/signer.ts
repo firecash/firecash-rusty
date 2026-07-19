@@ -7,7 +7,12 @@ export interface PaymentSigner {
     network: Network;
     recipient: string;
     amountSompi: bigint;
-    feeSompi: bigint;
+    /**
+     * Fee CEILING, not the fee. The signer reads the fee the bundle actually
+     * pays (its public value balance) and refuses anything above this bound —
+     * never trust a fee figure reported by the prover.
+     */
+    maxFeeSompi: bigint;
     prepared: PrepareResponse;
   }): Promise<DeviceSignature[]>;
 }
@@ -21,7 +26,7 @@ export function wasmPaymentSigner(input: {
     network: Network,
     recipient: string,
     amountSompi: bigint,
-    feeSompi: bigint,
+    maxFeeSompi: bigint,
     bundleHex: string,
     disclosureJson: string,
     alphasJson: string,
@@ -29,13 +34,13 @@ export function wasmPaymentSigner(input: {
 }): PaymentSigner {
   return {
     fullViewingKeyHex: () => input.fvkHex(input.seedHex),
-    verifyAndSign: ({ network, recipient, amountSompi, feeSompi, prepared }) =>
+    verifyAndSign: ({ network, recipient, amountSompi, maxFeeSompi, prepared }) =>
       input.verifyAndSignPayment(
         input.seedHex,
         network,
         recipient,
         amountSompi,
-        feeSompi,
+        maxFeeSompi,
         prepared.bundle_hex,
         JSON.stringify(prepared.disclosure),
         JSON.stringify(prepared.spend_auth),
@@ -46,6 +51,6 @@ export function wasmPaymentSigner(input: {
 export function assertPaymentRequest(request: PaymentRequest): void {
   if (request.amountSompi <= 0n) throw new RangeError("amountSompi must be positive");
   if (request.feeSompi !== undefined && request.feeSompi < 0n) throw new RangeError("feeSompi cannot be negative");
+  if (request.maxFeeSompi !== undefined && request.maxFeeSompi <= 0n) throw new RangeError("maxFeeSompi must be positive");
   if (!request.to.trim()) throw new TypeError("recipient is required");
 }
-

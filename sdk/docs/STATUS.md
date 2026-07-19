@@ -1,5 +1,25 @@
 # SDK Status
 
+## 2026-07-19 security & scope revision
+
+- **Fee ceiling enforced by the signer.** `PaymentIntent.fee` became
+  `PaymentIntent.max_fee`: the signer now reads the fee a bundle actually pays
+  from its value balance, requires it positive and at or below the user's
+  ceiling, and refuses otherwise. Previously both TypeScript clients passed the
+  *server-reported* fee into the intent, so a malicious prover could burn a
+  wallet's entire change as fee while every commitment check passed.
+- **Envelope v2** (`PreparedPaymentEnvelope`, format `zkas-prepared-payment`,
+  version 2): embeds the prover's claimed recipient/amount/fee for detached
+  display; claims are cross-checked against the approved intent and the bundle.
+  Version-1 envelopes are no longer accepted. Walletd emits v2.
+- **`@zkas/sdk` 0.2.0**: chunked sends (`allow_partial` loop with progress),
+  fee-ceiling refusal before signing, and the missing wallet surface
+  (status/watch/balance/history/rescan). Tested against a scripted fake daemon
+  (`npm test`).
+- **`zkas_sdk::engine` demoted to a reference skeleton** (see its module doc):
+  it is not the production engine and must not carry a user-facing wallet. Its
+  per-block checkpointing (O(blocks²) I/O) was fixed to per-batch.
+
 ## Delivered v1 foundation
 
 - Public Rust facade (`zkas-sdk`).

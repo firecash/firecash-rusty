@@ -1,6 +1,6 @@
 {
   "name": "@zkas/sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TypeScript SDK for ZKas shielded wallets",
   "type": "module",
   "main": "dist/index.js",
@@ -11,12 +11,17 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json && node --test dist/*.test.js"
   },
   "devDependencies": {
+    "@types/node": "^26.1.1",
     "typescript": "^5.8.0"
   },
   "engines": {
@@ -24,4 +29,3 @@
   },
   "license": "ISC"
 }
-

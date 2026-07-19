@@ -53,7 +53,10 @@ use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use tokio::sync::Mutex;
-use zkas_sdk::{PreparedPayment as SdkPreparedPayment, PreparedPaymentV1, SpendAuthRequest as SdkSpendAuthRequest};
+use zkas_sdk::{
+    ClaimedIntent as SdkClaimedIntent, Network as SdkNetwork, PreparedPayment as SdkPreparedPayment, PreparedPaymentEnvelope,
+    SpendAuthRequest as SdkSpendAuthRequest,
+};
 use zkas_wallet_engine::{
     DEFAULT_FEE_SOMPI, chunk_fee, max_spends_per_tx, plan_payment, select_spend_count as engine_select_spend_count,
 };
@@ -3344,7 +3347,7 @@ struct PrepareResp {
     /// Stable SDK envelope. Legacy fields above remain during the compatibility
     /// window; new clients should deserialize and verify this object.
     #[serde(rename = "preparedPayment")]
-    prepared_payment: PreparedPaymentV1,
+    prepared_payment: PreparedPaymentEnvelope,
 }
 
 /// [`kaspa_shielded_core::wallet::build::ActionDisclosure`] over the wire.
@@ -3594,18 +3597,33 @@ async fn wallet_prepare(
         })
         .collect();
 
-    let prepared_payment = PreparedPaymentV1::from_typed(&SdkPreparedPayment {
-        version: SdkPreparedPayment::VERSION,
-        network_domain: net,
-        tx_context: payment_tx_context(),
-        bundle: payment.effects.clone(),
-        disclosure: payment.disclosure.clone(),
-        spend_auth: payment
-            .spend_auth_requests
-            .iter()
-            .map(|(action_index, alpha)| SdkSpendAuthRequest { action_index: *action_index, alpha: *alpha })
-            .collect(),
-    });
+    let sdk_network = match state.network.as_str() {
+        "testnet" => SdkNetwork::Testnet,
+        "devnet" => SdkNetwork::Devnet,
+        "simnet" => SdkNetwork::Simnet,
+        _ => SdkNetwork::Mainnet,
+    };
+    let prepared_payment = PreparedPaymentEnvelope::from_typed(
+        &SdkPreparedPayment {
+            version: SdkPreparedPayment::VERSION,
+            network_domain: net,
+            tx_context: payment_tx_context(),
+            bundle: payment.effects.clone(),
+            disclosure: payment.disclosure.clone(),
+            spend_auth: payment
+                .spend_auth_requests
+                .iter()
+                .map(|(action_index, alpha)| SdkSpendAuthRequest { action_index: *action_index, alpha: *alpha })
+                .collect(),
+            // What this payment IS, embedded so a detached signer can display and
+            // verify it from the envelope alone. The device cross-checks these
+            // against the user's approval and the bundle — lying here only makes
+            // the device refuse to sign.
+            claimed: SdkClaimedIntent { recipient, amount, fee },
+        },
+        &sdk_network,
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build prepared envelope: {e}")))?;
 
     // Park the awaiting-signature payment under a random, unguessable session id.
     let mut sid = [0u8; 24];
