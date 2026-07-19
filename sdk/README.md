@@ -11,7 +11,8 @@ language packages are bindings around the same reviewed code.
 - `signer/` — reusable key custody and anti-blind payment authorization.
 - `core/` — public `zkas-sdk` facade, BlockDAG sync API, stores, addresses,
   prepared-payment format, and examples.
-- `bindings/` — WASM/TypeScript and native-language bindings.
+- `bindings/` — pointers to out-of-tree bindings; the TypeScript package lives
+  at <https://github.com/firecash/zkas-sdk>.
 - `docs/ARCHITECTURE.md` — target architecture and phased implementation plan.
 - `docs/RESEARCH.md` — external SDK and wallet designs reviewed for this work.
 - `docs/USAGE.md` — integration and security guide.

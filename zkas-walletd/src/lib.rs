@@ -4067,4 +4067,20 @@ mod sdk_api_tests {
         std::fs::remove_dir_all(&dir2).ok();
         std::fs::remove_dir_all(&dir3).ok();
     }
+
+    /// The SDK republishes this daemon's timing constants and genesis so that
+    /// external wallets hold back / anchor exactly like the production engine.
+    /// They are separate definitions in separate crates — this is the tripwire
+    /// that keeps them the same numbers.
+    #[test]
+    fn sdk_network_config_matches_walletd_and_consensus() {
+        let cfg = zkas_sdk::NetworkConfig::mainnet();
+        assert_eq!(cfg.settlement_blue_score, SYNC_TIP_MARGIN, "SDK settlement margin drifted from walletd");
+        assert_eq!(cfg.anchor_depth, DEFAULT_ANCHOR_DEPTH, "SDK anchor depth drifted from walletd");
+        assert_eq!(
+            cfg.genesis,
+            kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes(),
+            "SDK genesis drifted from consensus"
+        );
+    }
 }
