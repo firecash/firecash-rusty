@@ -613,7 +613,9 @@ const SCAN_MAGIC: &[u8; 4] = b"FCWS";
 /// Bumping from v1 deliberately invalidates every v1 checkpoint: those were built
 /// from DAG-ordered `get_blocks` ingestion, which double-counts non-chain
 /// coinbases and mis-orders leaves on a wide DAG (the live balance-mismatch bug).
-const SCAN_VERSION: u8 = 3;
+const SCAN_VERSION: u8 = 4;
+/// v3 checkpoints (no `blind_below` trailer) still load — the field defaults to 0.
+const SCAN_VERSION_PREV: u8 = 3;
 /// magic(4) + version(1) + genesis(32) + low(32) + scanned(8).
 const SCAN_HEADER_LEN: usize = 77;
 /// Rewrite the checkpoint after this many newly-scanned blocks (and once a wallet
@@ -780,6 +782,7 @@ fn save_checkpoint(
     db: &WalletDb,
     boundaries: &VecDeque<(u64, u64)>,
     sink_blue: u64,
+    blind_below: u64,
 ) -> std::io::Result<()> {
     let db_blob = db.to_checkpoint();
     let mut buf = Vec::with_capacity(SCAN_HEADER_LEN + 8 + db_blob.len() + 4 + boundaries.len() * 16 + 8);
@@ -796,6 +799,7 @@ fn save_checkpoint(
         buf.extend_from_slice(&leaves.to_le_bytes());
     }
     buf.extend_from_slice(&sink_blue.to_le_bytes());
+    buf.extend_from_slice(&blind_below.to_le_bytes());
     let path = scan_path(dir, token);
     let tmp = format!("{path}.tmp");
     std::fs::write(&tmp, &buf)?;
@@ -812,7 +816,7 @@ fn save_checkpoint(
 /// *at that block* so the restore can skip the leaf replay.
 fn checkpoint_cursor(dir: &str, token: &str, current_genesis: &RpcHash) -> Option<RpcHash> {
     let buf = std::fs::read(scan_path(dir, token)).ok()?;
-    if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || buf[4] != SCAN_VERSION {
+    if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || !matches!(buf[4], SCAN_VERSION | SCAN_VERSION_PREV) {
         return None;
     }
     if RpcHash::from_bytes(buf[5..37].try_into().ok()?) != *current_genesis {
@@ -833,9 +837,9 @@ fn load_checkpoint(
     key: WalletKey,
     current_genesis: &RpcHash,
     tip: Option<&kaspa_shielded_core::tree::FrontierState>,
-) -> Option<(WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64)> {
+) -> Option<(WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64, u64)> {
     let buf = std::fs::read(scan_path(dir, token)).ok()?;
-    if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || buf[4] != SCAN_VERSION {
+    if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || !matches!(buf[4], SCAN_VERSION | SCAN_VERSION_PREV) {
         return None;
     }
     let saved_genesis = RpcHash::from_bytes(buf[5..37].try_into().ok()?);
@@ -865,10 +869,13 @@ fn load_checkpoint(
         boundaries.push_back((blue, leaves));
     }
     let sink_blue = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
+    // v4 trailer: the frontier size this view was anchored on while the wallet may
+    // hold OLDER notes it cannot see (0 = complete view). v3 files predate it.
+    let blind_below = if buf[4] == SCAN_VERSION { u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?) } else { 0 };
     if pos != buf.len() {
         return None;
     }
-    Some((db, low, scanned, boundaries, sink_blue))
+    Some((db, low, scanned, boundaries, sink_blue, blind_below))
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,6 +1097,14 @@ struct WalletEntry {
     /// expensive-to-rebuild witness state is persisted at once (a restart seconds later
     /// must not throw it away and re-do the ~30–90 s warm).
     force_checkpoint: bool,
+    /// Tree size of the frontier this view was anchored on when the wallet may hold
+    /// notes MINTED BELOW it — notes this view can never discover, because the node
+    /// has pruned their blocks (0 = complete view). Set on a full-scan rebuild of a
+    /// wallet whose birthday predates the pruning point, persisted in the v4
+    /// checkpoint, and surfaced as `missing_history` in status — the 2026-07-19
+    /// incident was a wallet silently "losing" 23K ZKAS to exactly this after a
+    /// rescan, with nothing anywhere admitting the view was partial.
+    blind_below: u64,
 }
 
 /// How many chain-block→leaf boundaries [`WalletEntry`] keeps. Anchor maturity is
@@ -1154,6 +1169,7 @@ impl WalletEntry {
             last_witness_advance: None,
             witnesses_warm: false,
             force_checkpoint: false,
+            blind_below: 0,
         }
     }
 
@@ -1710,6 +1726,7 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
         // UI show "Preparing wallet for fast sends…" instead of a confusing "syncing 100%".
         // Note-heavy wallets skip the eager warm, so they are never reported as warming.
         warming: e.caught_up && !e.witnesses_warm && (e.db.notes().len() as u64) <= EAGER_WARM_MAX_NOTES,
+        missing_history: e.blind_below > 0,
     }
 }
 
@@ -1735,6 +1752,7 @@ fn fill_status_from_snap(resp: &mut StatusResp, s: &StatusSnap) {
     resp.updated_unix = s.updated_unix;
     resp.error = s.error.clone();
     resp.warming = s.warming;
+    resp.missing_history = s.missing_history;
 }
 
 /// Last-known-good status for a loaded wallet, kept OUTSIDE the wallet mutex so the
@@ -1760,6 +1778,7 @@ struct StatusSnap {
     updated_unix: u64,
     error: Option<String>,
     warming: bool,
+    missing_history: bool,
 }
 
 /// A non-custodial payment proven and awaiting on-device spend-auth signatures.
@@ -1934,7 +1953,7 @@ impl AppState {
     /// after pruning advances past genesis) and every later chain block is
     /// scanned. Used when the wallet may hold funds older than the fast-sync
     /// checkpoint (birthday 0 / early birthday).
-    async fn full_scan_entry(&self, key: WalletKey, recoverable: bool, guard: RpcHash) -> Option<WalletEntry> {
+    async fn full_scan_entry(&self, key: WalletKey, recoverable: bool, guard: RpcHash, birthday: u64) -> Option<WalletEntry> {
         let start = self.client.get_block_dag_info().await.ok()?.pruning_point_hash;
         let ts = self.client.get_shielded_tree_state(Some(start)).await.ok()?;
         if ts.block_hash != start {
@@ -1947,7 +1966,22 @@ impl AppState {
             ommers: ts.ommers.iter().map(|h| h.as_bytes()).collect(),
         };
         let db = key.db_from_frontier(&fs)?;
-        Some(WalletEntry::from_parts(key, recoverable, db, guard, start, ts.daa_score as usize, VecDeque::new(), 0))
+        let mut e = WalletEntry::from_parts(key, recoverable, db, guard, start, ts.daa_score as usize, VecDeque::new(), 0);
+        // The wallet claims history from before the pruning point (birthday below the
+        // frontier's DAA, or 0 = "any height"), but the node cannot serve those blocks:
+        // any note minted below this frontier is INVISIBLE to this view. Record it so
+        // status can say so — a partial balance shown as the whole truth is how the
+        // 2026-07-19 "23K ZKAS missing" report happened.
+        if ts.size > 0 && birthday < ts.daa_score {
+            e.blind_below = ts.size;
+            log::warn!(
+                "wallet rebuilt BLIND below tree position {} (birthday {birthday} predates pruning-point daa {}): \
+                 notes minted before the pruning point cannot be recovered through this node",
+                ts.size,
+                ts.daa_score
+            );
+        }
+        Some(e)
     }
 
     /// Mark a token active so the sync loop keeps it current (idle wallets are parked).
@@ -2019,12 +2053,15 @@ impl AppState {
             None => None,
         };
         let entry = match load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref()) {
-            Some((db, low, scanned, boundaries, sink_blue)) => {
-                WalletEntry::from_parts(key, recoverable_history, db, genesis, low, scanned, boundaries, sink_blue)
+            Some((db, low, scanned, boundaries, sink_blue, blind_below)) => {
+                let mut e =
+                    WalletEntry::from_parts(key, recoverable_history, db, genesis, low, scanned, boundaries, sink_blue);
+                e.blind_below = blind_below;
+                e
             }
             None => match self.fast_sync_entry(key, recoverable_history, genesis, birthday).await {
                 Some(e) => e,
-                None => self.full_scan_entry(key, recoverable_history, genesis).await?,
+                None => self.full_scan_entry(key, recoverable_history, genesis, birthday).await?,
             },
         };
         // Decode the leaf stream to curve points NOW, on a blocking thread, while we still
@@ -2192,7 +2229,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     let force = e.force_checkpoint;
     if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0) || force) {
         if let Err(err) =
-            save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue)
+            save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below)
         {
             eprintln!("checkpoint write failed for {token}: {err}");
         } else {
@@ -2356,6 +2393,13 @@ struct StatusResp {
     /// balance but cannot spend. Sends must go through /prepare + /submit with the
     /// signature produced on the device that holds the seed.
     watch_only: bool,
+    /// True when this wallet's view was rebuilt from a pruning-point frontier while
+    /// its birthday claims older history: notes minted before that point exist on
+    /// chain but CANNOT be discovered through this node (their blocks are pruned).
+    /// The balance shown is a lower bound, and the UI must say so. False on older
+    /// daemons (field absent) and on wallets with a complete view.
+    #[serde(default)]
+    missing_history: bool,
 }
 
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<StatusResp> {
@@ -2393,6 +2437,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         note_count: 0,
         updated_unix: 0,
         error: None,
+        missing_history: false,
         watch_only: false,
     };
 
@@ -2523,7 +2568,7 @@ async fn load_new_wallet(
     let entry = match state.fast_sync_entry(WalletKey::Seed(seed), false, state.genesis, birthday).await {
         Some(e) => e,
         None => state
-            .full_scan_entry(WalletKey::Seed(seed), false, state.genesis)
+            .full_scan_entry(WalletKey::Seed(seed), false, state.genesis, birthday)
             .await
             .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "cannot anchor a full scan (node unreachable or too old)"))?,
     };
@@ -2637,7 +2682,7 @@ async fn wallet_watch(
     let entry = match state.fast_sync_entry(key, false, state.genesis, req.birthday).await {
         Some(e) => e,
         None => state
-            .full_scan_entry(key, false, state.genesis)
+            .full_scan_entry(key, false, state.genesis, req.birthday)
             .await
             .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "cannot anchor a full scan (node unreachable or too old)"))?,
     };
@@ -2830,13 +2875,63 @@ async fn wallet_settings(
 /// scanned), and RECOVER anything the incremental view ever lost (e.g. notes
 /// deleted by the pre-v7 submit-and-forget spend bug — the "my ZKAS vanished"
 /// report). Bounded work: birthday fast-sync + a scan of blocks since birthday.
+#[derive(Deserialize, Default)]
+struct RescanReq {
+    /// Accept losing notes the node can no longer serve. Without it, a rescan that
+    /// would forget anything is refused with the exact damage it would do.
+    #[serde(default)]
+    force: bool,
+}
+
 async fn wallet_rescan(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    body: Option<Json<RescanReq>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let token = token_from(&headers, state.allow_default_token)?;
     if !wallet_exists(&state.wallet_dir, &token) {
         return Err(err(StatusCode::NOT_FOUND, "no such wallet"));
+    }
+    // A rescan rebuilds the view from what the node can still SERVE — and a node
+    // prunes. Any currently-known note minted below the node's pruning point can
+    // never be re-derived: rescanning silently forgets it, and the balance drops
+    // with no explanation (2026-07-19: 318 notes / ~23K ZKAS vanished this way;
+    // recovered only because the retired checkpoint still sat in `.scan.bak`).
+    // So a lossy rescan is REFUSED, stating the exact damage, unless forced.
+    if !body.as_ref().map(|b| b.force).unwrap_or(false) {
+        let w = state.cached_wallet(&token).await.ok_or_else(|| {
+            state.spawn_load(&token);
+            err(
+                StatusCode::CONFLICT,
+                "wallet is not loaded yet, so what a rescan would forget cannot be checked — retry in a few seconds",
+            )
+        })?;
+        // Node state FIRST, then the wallet lock — never hold the lock across RPCs.
+        let dag =
+            state.client.get_block_dag_info().await.map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("node unreachable: {e}")))?;
+        let ts = state
+            .client
+            .get_shielded_tree_state(Some(dag.pruning_point_hash))
+            .await
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("node has no pruning-point tree state: {e}")))?;
+        let (lost_count, lost_value) = {
+            let g = w.lock().await;
+            let lost: Vec<u64> =
+                g.db.notes().iter().filter(|n| n.position < ts.size).map(|n| n.value()).collect();
+            (lost.len(), lost.iter().sum::<u64>())
+        };
+        if lost_count > 0 {
+            return Err(err(
+                StatusCode::CONFLICT,
+                &format!(
+                    "rescan refused: {lost_count} of this wallet's notes ({} ZKAS) were minted in blocks the \
+                     connected node has already pruned — a rescan would permanently hide them from this wallet. \
+                     They are safe in the current view; rescan through an archival node instead, or pass \
+                     {{\"force\":true}} to accept losing sight of them.",
+                    fmt_fc(lost_value as u128)
+                ),
+            ));
+        }
     }
     // Poison any in-flight sync pass first: checkpoint writes are gated on
     // `error.is_none()`, so this stops a concurrent pass from re-persisting the
