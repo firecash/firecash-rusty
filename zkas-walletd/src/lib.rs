@@ -664,11 +664,41 @@ const COLD_WARM_STEP: u64 = 16384;
 /// single wallet monopolises a warm slot and starves the interactive few-note wallets.
 const COLD_WARM_BUDGET: u64 = 32768;
 
-/// Above this many notes a wallet is NOT eagerly witnessed — witnessing them all costs
-/// leaves × notes and would hog the shared loop for minutes. These are pool/treasury/miner
-/// wallets that rarely spend; the few notes a spend selects rebuild on demand instead. The
-/// interactive web wallets (a handful of notes) are the ones that get the warm fast path.
+/// Wall-clock the cold warm may spend per sync tick, running back-to-back steps.
+///
+/// One step is ~5.7 s of work, but the sync loop only reached this branch about once
+/// every 47 s — a ~12 % duty cycle, so a wallet needing ~4.4 min of CPU took the better
+/// part of an hour, and every restart lost ground. The total work is unchanged; this
+/// just stops it being spread so thin that it never finishes. The wallet lock is held
+/// for a step at a time, so that wallet's own status calls wait briefly during its
+/// one-time warm — worth it to have sends stop costing 20 s per note.
+/// Kept short deliberately. The warm holds the wallet lock and a sync slot for its whole
+/// tick, so a long tick starves every other wallet's ordinary sync — a 1-note wallet was
+/// observed stuck at "syncing 97%" while the note-heavy backlog warmed. Short ticks cost
+/// slightly more overhead but interleave, so warming stays a background task instead of
+/// monopolising the box.
+const COLD_WARM_TICK: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Above this many notes a wallet keeps only a *bounded* witness set rather than one per
+/// note — witnessing them all costs leaves × notes and would hog the shared loop for
+/// minutes. These are pool/treasury/miner wallets.
+///
+/// This used to disable witnessing for such a wallet **entirely**, on the reasoning that
+/// they rarely spend and the few notes a send selects could rebuild on demand. That was
+/// wrong in a way that only shows up at scale: the rebuild is a base→matured Sinsemilla
+/// replay whose length is the gap between the wallet's oldest unspent note and the matured
+/// tip, and `advance_base_capped` cannot roll the base past that oldest note — so the gap
+/// grows with the chain, forever. On the live miner wallet it reached ~117 K leaves ≈ 20 s
+/// *per selected note*, making a 6-note send take two minutes and getting worse daily.
+/// Bounding the witness *set* keeps the cost `leaves × budget` (a constant) instead of
+/// `leaves × notes`, so these wallets stay warm like any other.
 const EAGER_WARM_MAX_NOTES: u64 = 32;
+
+/// Witness slots kept for a note-heavy wallet. Enough to cover a full standard
+/// transaction's spends (`max_spends_per_tx()` = 6) with slack, so the value-descending
+/// selection a send makes lands on warm notes — but a small constant, so the one-time
+/// catch-up is bounded regardless of how many thousands of notes the wallet holds.
+const SPENDABLE_WITNESS_BUDGET: usize = 12;
 
 /// Longest witness climb a note-heavy (never-eager-warmed) wallet may do inline at
 /// send time. Each climbed leaf costs one Sinsemilla append per live witness (up to
@@ -704,6 +734,16 @@ const ACTIVE_SYNC_WINDOW: std::time::Duration = std::time::Duration::from_secs(9
 // /health and /api/status time out. Keep it serial until the CPU portion is moved
 // behind spawn_blocking; availability is more important than catch-up throughput.
 const SYNC_CONCURRENCY: usize = 3;
+
+/// How many wallets may be in their one-time COLD WARM at once.
+///
+/// Warming is the only sync work that runs flat out for whole seconds at a time
+/// (`COLD_WARM_TICK`), so without a cap of its own every [`SYNC_CONCURRENCY`] slot can be
+/// occupied by one, pinning a core each. On the live 4-core host that left one core for
+/// the HTTP handlers, the node RPC and Halo 2 proving combined — so one user's first send
+/// visibly slowed everyone else's sync. Ordinary incremental sync is unaffected by this
+/// cap; only the heavy catch-up queues behind it.
+const WARM_CONCURRENCY: usize = 1;
 
 /// Real sleep between wallets in the sync loop, to guarantee CPU headroom for the HTTP
 /// handlers even while scans run. Caps sync throughput; keeps the daemon responsive.
@@ -1135,7 +1175,7 @@ impl WalletEntry {
     /// (own coinbase mint + accepted post-retain bundles, consensus order), and
     /// only once a block is `SYNC_TIP_MARGIN` blue units below the sink (the
     /// append-only tree must not ingest anything a routine reorg could replace).
-    async fn sync_chunk(&mut self, client: &GrpcClient, cache: &Mutex<PageCache>) {
+    async fn sync_chunk(&mut self, client: &GrpcClient, cache: &Mutex<PageCache>, warm_gate: &tokio::sync::Semaphore) {
         for _ in 0..PAGES_PER_CHUNK {
             // HARD TIMEOUT. There is ONE sync loop for every wallet, and it advances them
             // sequentially — so an await here that never returns does not stall one wallet,
@@ -1298,48 +1338,129 @@ impl WalletEntry {
         // correctness never depends on this pre-advance.
         if self.caught_up {
             if let Some(matured) = self.matured_leaves() {
-                if !self.witnesses_warm {
-                    let note_count = self.db.notes().len() as u64;
-                    if note_count > EAGER_WARM_MAX_NOTES {
-                        // A pool/treasury/miner wallet with too many notes: warming (and even
-                        // rolling the base) costs leaves×notes and would hog the shared loop
-                        // for minutes, starving the interactive few-note web wallets (the bug
-                        // that left a 1-note wallet's base at +16 K after 30 min). Skip the
-                        // whole eager prepare — such wallets rarely spend, and the few notes a
-                        // spend selects rebuild on demand. Latch so we never retry.
-                        self.witnesses_warm = true;
-                        log::info!("skipping eager warm for note-heavy wallet (notes={note_count}); on-demand at spend");
-                    } else {
-                        // Roll the base up to our notes first (cheap: cost is leaves, not
-                        // leaves×notes), then warm the witnesses to the matured anchor.
-                        let rolling = tokio::task::block_in_place(|| self.db.advance_base_capped(matured, COLD_WARM_STEP));
-                        if !rolling {
-                            // Bound the step by WORK (≈ leaves×notes ≤ COLD_WARM_BUDGET) so a
-                            // 32-note wallet's step is as cheap as a 1-note wallet's.
-                            let wstep = (COLD_WARM_BUDGET / note_count.max(1)).clamp(WITNESS_MIN_STEP, COLD_WARM_STEP);
-                            let more = tokio::task::block_in_place(|| self.db.advance_witnesses_capped(matured, wstep));
-                            if !more {
-                                self.witnesses_warm = true;
-                                self.force_checkpoint = true;
-                                log::info!(
-                                    "witnesses warmed for wallet (notes={}, base_size={}, witnessed_upto={} == matured {})",
-                                    note_count,
-                                    self.db.base_size(),
-                                    self.db.witnessed_upto(),
-                                    matured,
-                                );
-                            }
+                // How many witnesses this wallet maintains. Every step below costs
+                // `leaves × budget`, so pinning the budget to a constant for a note-heavy
+                // wallet is what keeps its catch-up bounded — see EAGER_WARM_MAX_NOTES.
+                let note_count = self.db.notes().len() as u64;
+                let budget = if note_count > EAGER_WARM_MAX_NOTES {
+                    SPENDABLE_WITNESS_BUDGET
+                } else {
+                    note_count.max(1) as usize
+                };
+                self.db.set_witness_budget(budget);
+                // Take a warm permit, or leave the heavy catch-up to another tick. This is
+                // `try_acquire`, not `acquire`: a wallet that can't warm right now should
+                // fall through and keep doing its cheap incremental sync rather than block
+                // a sync slot waiting. Ordinary sync never touches this gate.
+                let warm_permit = if self.witnesses_warm { None } else { warm_gate.try_acquire().ok() };
+                if !self.witnesses_warm && warm_permit.is_some() {
+                    // Roll the base up to our notes first (cheap: cost is leaves, not
+                    // leaves×budget), then warm the witnesses to the matured anchor.
+                    // Bound each step by WORK (≈ leaves×budget ≤ COLD_WARM_BUDGET) so every
+                    // wallet's step costs the same regardless of its size.
+                    let wstep = (COLD_WARM_BUDGET / budget as u64).clamp(WITNESS_MIN_STEP, COLD_WARM_STEP);
+                    // Run every phase of the warm back-to-back inside one tick, instead of
+                    // one step per sync pass.
+                    //
+                    // Spreading it out was the real cost. The three phases are sequential —
+                    // roll the base, sweep the witnesses to `matured`, then adopt the notes
+                    // the sweep passed — and adoption is the ONLY phase that makes a spend
+                    // fast. On the live miner wallet the sweep had ~46 K leaves to climb
+                    // while opening zero witnesses (every eligible note sits below it), which
+                    // is ~8 s of actual work; at one 2 730-leaf step per pass that became a
+                    // 30-minute prologue, and adoption never ran at all. Meanwhile every
+                    // send paid 6 × 22 s of rebuilds. Same total work, run to completion.
+                    let deadline = std::time::Instant::now() + COLD_WARM_TICK;
+                    let t_tick = std::time::Instant::now();
+                    let mut adopted = 0usize;
+                    loop {
+                        if std::time::Instant::now() >= deadline {
+                            break;
                         }
+                        // Phase 1: roll the base up to our notes (cost is leaves, not
+                        // leaves×budget), which shortens every later replay.
+                        if tokio::task::block_in_place(|| self.db.advance_base_capped(matured, COLD_WARM_STEP)) {
+                            continue;
+                        }
+                        // Phase 2: sweep the witness set forward to the matured anchor.
+                        if tokio::task::block_in_place(|| self.db.advance_witnesses_capped(matured, wstep)) {
+                            continue;
+                        }
+                        // Phase 3: the sweep only opens a witness for a note it PASSES, so
+                        // notes below it — a note-heavy wallet's entire holding — get none
+                        // and would replay on every spend forever. Adopt them: one O(chain)
+                        // replay each, paid here rather than on the send path, kept for good.
+                        let Some(pos) = self.db.next_note_needing_witness() else {
+                            self.witnesses_warm = true;
+                            break;
+                        };
+                        let t = std::time::Instant::now();
+                        let ok = tokio::task::block_in_place(|| self.db.install_witness(pos, matured));
+                        adopted += 1;
+                        log::info!(
+                            "adopted witness for note@{pos} in {:.1?} (ok={ok}, {}/{} slots warm) — this note no longer replays at spend time",
+                            t.elapsed(),
+                            self.db.live_witness_count(),
+                            budget,
+                        );
+                        if !ok {
+                            break;
+                        }
+                    }
+                    // Persist only when this tick achieved something worth a checkpoint.
+                    //
+                    // A checkpoint serialises the whole leaf stream — 15–29 MB on these
+                    // wallets — so forcing one every tick (as this did) meant tens of MB of
+                    // write amplification per wallet per few seconds, on top of the warm's
+                    // own CPU. Adoption is expensive to redo (a full replay each) so it is
+                    // always persisted; raw sweep progress is cheap by comparison and rides
+                    // the ordinary `CHECKPOINT_EVERY` cadence instead.
+                    if adopted > 0 || self.witnesses_warm {
+                        self.force_checkpoint = true;
+                    }
+                    if self.witnesses_warm {
+                        log::info!(
+                            "witnesses warmed for wallet (notes={}, witness_budget={}, warm={}, adopted {} this tick, base_size={}, witnessed_upto={} == matured {})",
+                            note_count,
+                            budget,
+                            self.db.live_witness_count(),
+                            adopted,
+                            self.db.base_size(),
+                            self.db.witnessed_upto(),
+                            matured,
+                        );
+                    } else {
+                        log::info!(
+                            "warming wallet: {:.1?} this tick (notes={}, warm={}/{}, adopted {}, witnessed_upto={} of matured {}, {} leaves to go)",
+                            t_tick.elapsed(),
+                            note_count,
+                            self.db.live_witness_count(),
+                            budget,
+                            adopted,
+                            self.db.witnessed_upto(),
+                            matured,
+                            matured.saturating_sub(self.db.witnessed_upto()),
+                        );
                     }
                 } else {
                     let due = self.last_witness_advance.map(|t| t.elapsed() >= WITNESS_ADVANCE_INTERVAL).unwrap_or(true);
                     if due {
-                        let note_count = self.db.notes().len() as u64;
+                        // Bound the step by WORK, not leaves. `WITNESS_ADVANCE_CAP` is a
+                        // LEAF cap sized when only ≤32-note wallets reached this path; with
+                        // a 12-witness budget it costs 4 000 × 12 ≈ 48 000 Sinsemilla
+                        // appends ≈ 8 s — once per second, per wallet, holding the wallet
+                        // lock. Every note-heavy wallet that loses the race for a warm
+                        // permit lands here, so that alone saturated the box and starved
+                        // ordinary sync (a 1-note wallet stuck at "syncing 97%").
+                        let steady_cap = (COLD_WARM_BUDGET / budget as u64).clamp(WITNESS_MIN_STEP, WITNESS_ADVANCE_CAP);
                         tokio::task::block_in_place(|| {
                             self.db.advance_base_capped(matured, BASE_ADVANCE_STEP);
-                            // Only a few-note wallet keeps its witnesses warm incrementally; a
-                            // note-heavy one stays on the on-demand path (see above).
-                            if note_count <= EAGER_WARM_MAX_NOTES && self.db.advance_witnesses_capped(matured, WITNESS_ADVANCE_CAP) {
+                            // Only a WARM wallet belongs on the incremental step: it is a
+                            // few appends per new leaf (one leaf per block at 1 BPS). A
+                            // wallet still waiting for a warm permit must NOT do its
+                            // catch-up here — that is the warm's job, under the gate that
+                            // bounds how many run at once.
+                            if self.witnesses_warm && self.db.advance_witnesses_capped(matured, steady_cap) {
                                 self.witnesses_warm = false;
                             }
                         });
@@ -1501,12 +1622,24 @@ struct AppState {
     /// runtime worker and starve even `/health` (a live outage). With a small cap, most
     /// workers stay free for HTTP and loads queue briefly instead of melting the box.
     load_gate: tokio::sync::Semaphore,
-    /// Payment preparation is deliberately serialized. Witness reconstruction and
-    /// Halo2 proving are CPU-heavy synchronous work; browser retries used to start
-    /// overlapping copies after the first request timed out, exhausting every runtime
-    /// worker and taking the whole wallet API offline. A caller that races an existing
-    /// preparation gets a fast 429 and can retry after the original finishes.
+    /// Payment preparation is deliberately serialized: witness reconstruction and Halo2
+    /// proving are CPU-heavy synchronous work, and overlapping copies exhaust every
+    /// runtime worker and take the whole wallet API offline.
+    ///
+    /// This bounds *total* proving CPU, so it is shared by every tenant — which means a
+    /// caller must QUEUE on it, not fail on it. It used to be `try_acquire`, so on the
+    /// hosted daemon one user's send made every other user's send fail outright with
+    /// "a shielded payment is already being prepared", and a chunked payment (several
+    /// sequential prepares) held that window open for minutes. Racing retries of the
+    /// *same* wallet — the browser-retry storm this was really written for — are caught
+    /// by `preparing` below, which is the check that should be a fast rejection.
     prepare_gate: tokio::sync::Semaphore,
+    /// Wallets (by FVK) with a preparation already in flight. A second concurrent
+    /// prepare for the SAME wallet is a duplicate — a retry, a double-clicked button —
+    /// and is rejected immediately rather than queued: it would select the same notes.
+    preparing: std::sync::Mutex<HashSet<String>>,
+    /// Permits for the one-time cold warm; see [`WARM_CONCURRENCY`].
+    warm_gate: tokio::sync::Semaphore,
     /// Last known virtual DAA score, refreshed by the sync loop and successful status
     /// calls, so status can answer instantly when the node RPC is momentarily contended.
     node_tip: Mutex<(u64, std::time::Instant)>,
@@ -1635,10 +1768,42 @@ struct PreparedSession {
     amount: u64,
     fee: u64,
     created: std::time::Instant,
+    /// Wallet this payment was prepared against, when the caller presented a token.
+    /// `/submit` needs it to park the spent notes — without it the notes stay in the
+    /// unspent set until the block carrying them clears the reorg holdback (~3 min),
+    /// and a second send in that window re-selects the same note value-descending,
+    /// producing a transaction consensus DROPS as a double-spend. The UI reports that
+    /// send as successful, the payer's balance falls, and the payee never receives it.
+    /// (The custodial `/send` path has always done this; the non-custodial one, which
+    /// is what every shipped wallet actually uses, did not.)
+    token: Option<String>,
+    /// Absolute leaf positions of the notes this payment spends, to park on acceptance.
+    positions: Vec<u64>,
 }
 
 /// How long a prepared (unsigned) non-custodial payment lives before it is swept.
 const PREPARED_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a prepare waits for the shared proving slot before giving up. Generous:
+/// a cold witness rebuild plus proof can run tens of seconds, and waiting behind one
+/// is a far better outcome for the user than being told to retry — which is what
+/// produced the retry storms in the first place.
+const PREPARE_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Releases this wallet's in-flight prepare marker on every exit path, including the
+/// `?` early returns and a panic in the proving task.
+struct PreparingGuard {
+    state: Arc<AppState>,
+    key: String,
+}
+
+impl Drop for PreparingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.state.preparing.lock() {
+            set.remove(&self.key);
+        }
+    }
+}
 
 impl AppState {
     /// The wallet's receive address, taken from its view (works for seed and
@@ -1975,7 +2140,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // Advance one chunk from `low` (also the cheap tip catch-up once already synced).
     let was_caught_up = e.caught_up;
     e.caught_up = false;
-    e.sync_chunk(&state.sync_client, &state.page_cache).await;
+    e.sync_chunk(&state.sync_client, &state.page_cache, &state.warm_gate).await;
     // NB: the eager witness pre-advance and base compaction live in `sync_chunk`'s
     // `caught_up` tail, THROTTLED to one bounded step per `WITNESS_ADVANCE_INTERVAL` per
     // wallet (an unthrottled advance on the 10 ms sync spin pinned every core, observed
@@ -3040,6 +3205,10 @@ struct PrepareReq {
     fee: Option<JsonU64>,
     /// Optional memo (max 512 bytes UTF-8), as in `SendReq`.
     memo: Option<String>,
+    /// Opt in to a partial payment when the amount needs more notes than one standard
+    /// transaction can spend. The response's `remaining_sompi` is what is still owed;
+    /// the caller repeats prepare/submit until it reaches 0.
+    allow_partial: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -3062,6 +3231,11 @@ struct PrepareResp {
     fee_sompi: u64,
     amount_sompi_exact: String,
     fee_sompi_exact: String,
+    /// Sompi of the originally requested amount this payment does NOT cover, because it
+    /// needed more notes than one standard transaction can spend. 0 for a complete
+    /// payment. Only ever non-zero when the caller passed `allow_partial`.
+    remaining_sompi: u64,
+    remaining_sompi_exact: String,
     /// One randomizer per real spend the device must sign.
     spend_auth: Vec<SpendAuthReq>,
     /// The unsigned bundle (hex). The device MUST recompute the sighash from this
@@ -3095,20 +3269,52 @@ async fn wallet_prepare(
 ) -> Result<Json<PrepareResp>, (StatusCode, Json<serde_json::Value>)> {
     use rand::RngCore;
 
-    let _prepare_permit = state.prepare_gate.try_acquire().map_err(|_| {
-        err(StatusCode::TOO_MANY_REQUESTS, "a shielded payment is already being prepared; wait for it to finish before retrying")
-    })?;
+    // A duplicate prepare for THIS wallet is a retry or a double-click — reject it fast,
+    // since it would select the same notes as the run already in flight.
+    let _preparing = {
+        let mut set = state
+            .preparing
+            .lock()
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare tracker poisoned"))?;
+        if !set.insert(req.fvk_hex.clone()) {
+            return Err(err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "a payment from this wallet is already being prepared; wait for it to finish before retrying",
+            ));
+        }
+        PreparingGuard { state: state.clone(), key: req.fvk_hex.clone() }
+    };
+
+    // Then queue for the proving slot shared with every other wallet. Waiting here is
+    // correct: another tenant's send is not this caller's error.
+    let _prepare_permit = tokio::time::timeout(PREPARE_QUEUE_WAIT, state.prepare_gate.acquire())
+        .await
+        .map_err(|_| {
+            err(StatusCode::SERVICE_UNAVAILABLE, "the daemon is still busy preparing other payments; please try again shortly")
+        })?
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare gate closed"))?;
 
     // Watch-only: authenticated by possession of the FVK, not a token/seed.
     let fvk_bytes = unhex(&req.fvk_hex)
         .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex must be 96 bytes of hex"))?;
 
-    let amount = match (req.amount_sompi, req.amount_fc) {
+    let requested = match (req.amount_sompi, req.amount_fc) {
         (Some(s), _) => s.parse("amount_sompi")?,
         (None, Some(fc)) => (fc * SOMPI_PER_ZKAS as f64).round() as u64,
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "specify amount_sompi or amount_fc")),
     };
+    // A standard transaction spends at most `max_spends_per_tx()` notes, so a wallet
+    // whose balance is spread over many small notes (a miner's per-block coinbase, say)
+    // cannot pay a large amount in one transaction. `allow_partial` lets the caller ask
+    // for "as much of this as one transaction can carry", then repeat for the remainder
+    // — which is what the custodial `/send` path has always done internally via
+    // `plan_chunks`. It is OPT-IN precisely because already-shipped wallets do not loop:
+    // silently sending them a partial payment while reporting success would be the same
+    // class of bug as the missing `mark_spent`. Callers that don't ask still get the
+    // explicit "send in smaller chunks" error.
+    let allow_partial = req.allow_partial.unwrap_or(false);
+    let mut amount = requested;
     // The caller's fee (or the flat default) is a FLOOR: the actual fee is raised
     // to the node's byte-proportional minimum once the input count is known
     // (`select_spend_count`), so multi-note payments are never relay-rejected.
@@ -3137,6 +3343,11 @@ async fn wallet_prepare(
     let mut inputs = Vec::new();
     let mut selected = 0u64;
     let mut have_total: Option<u64> = None;
+    // Notes this payment will spend, so `/submit` can park them once the node accepts.
+    // Only the tracked-wallet path below can fill these: the FVK-only slow path has no
+    // wallet to record against.
+    let mut spent_positions: Vec<u64> = Vec::new();
+    let mut session_token: Option<String> = None;
     if let Ok(token) = token_from(&headers, state.allow_default_token) {
         if let Some(w) = state.get_wallet(&token).await {
             let mut e = w.lock().await;
@@ -3176,8 +3387,10 @@ async fn wallet_prepare(
                             .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
                         log::info!("prepare: witness_path_at(note@{}) took {:.1?}", n.position, t_p.elapsed());
                         inputs.push((n.note.clone(), path));
+                        spent_positions.push(n.position);
                         selected += n.value();
                     }
+                    session_token = Some(token.clone());
                 }
             }
         }
@@ -3208,20 +3421,39 @@ async fn wallet_prepare(
     }
     if selected < need {
         let have: u64 = have_total.unwrap_or(0);
-        return Err(if have >= need {
-            err(
-                StatusCode::CONFLICT,
-                format!(
-                    "amount needs more than {max_per_tx} input notes (standard tx size cap): max sendable in one tx is {} sompi; send in smaller chunks",
-                    selected.saturating_sub(fee)
-                ),
-            )
+        // The notes exist, they just don't fit one transaction. Pay what this
+        // transaction can carry and report the rest, if the caller opted in.
+        let capacity = selected.saturating_sub(fee);
+        // Chunking is only safe on the tracked-wallet path. The FVK-only slow path has
+        // no wallet to record the spend against, so `/submit` cannot park the notes —
+        // the caller's next chunk would re-select the very same notes value-descending
+        // and build a transaction consensus drops as a double-spend, silently. Without a
+        // token we refuse to chunk and return the explicit error instead.
+        if allow_partial && session_token.is_some() && have >= need && capacity > 0 {
+            // Change is then exactly zero: the chunk pays out every selected note less
+            // the fee. `need` is not reassigned — past this point only `amount`/`fee`
+            // matter, `prepare_payment` derives the change from the inputs themselves.
+            amount = capacity;
+            log::info!(
+                "prepare: partial chunk — paying {amount} of {requested} sompi with {} note(s); {} sompi remain",
+                inputs.len(),
+                requested - amount,
+            );
         } else {
-            err(
-                StatusCode::CONFLICT,
-                format!("insufficient matured funds: have {have}, need amount+fee={need} (funds must be ~10 min old to spend)"),
-            )
-        });
+            return Err(if have >= need {
+                err(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "amount needs more than {max_per_tx} input notes (standard tx size cap): max sendable in one tx is {capacity} sompi; send in smaller chunks",
+                    ),
+                )
+            } else {
+                err(
+                    StatusCode::CONFLICT,
+                    format!("insufficient matured funds: have {have}, need amount+fee={need} (funds must be ~10 min old to spend)"),
+                )
+            });
+        }
     }
 
     let ctx = payment_tx_context();
@@ -3288,7 +3520,10 @@ async fn wallet_prepare(
         let now = std::time::Instant::now();
         let mut map = state.prepared.lock().await;
         map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL); // bound memory
-        map.insert(session.clone(), PreparedSession { payment, amount, fee, created: now });
+        map.insert(
+            session.clone(),
+            PreparedSession { payment, amount, fee, created: now, token: session_token, positions: spent_positions },
+        );
     }
 
     Ok(Json(PrepareResp {
@@ -3297,6 +3532,8 @@ async fn wallet_prepare(
         value_balance,
         amount_sompi: amount,
         fee_sompi: fee,
+        remaining_sompi: requested - amount,
+        remaining_sompi_exact: (requested - amount).to_string(),
         amount_sompi_exact: amount.to_string(),
         fee_sompi_exact: fee.to_string(),
         spend_auth,
@@ -3333,7 +3570,7 @@ async fn wallet_submit(
         map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL);
         map.remove(&req.session)
     };
-    let PreparedSession { payment, amount, fee, .. } =
+    let PreparedSession { payment, amount, fee, token, positions, .. } =
         session.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such prepared session (expired or already submitted)"))?;
 
     let mut device_sigs: Vec<(usize, [u8; SIG_LEN])> = Vec::with_capacity(req.sigs.len());
@@ -3349,6 +3586,22 @@ async fn wallet_submit(
     let tx: Transaction = payment_tx(bundle.to_bytes());
     match state.client.submit_transaction(RpcTransaction::from(&tx), false).await {
         Ok(accepted) => {
+            // The node has the transaction: park the notes it spends so they leave the
+            // unspent set NOW rather than ~3 minutes from now when the block carrying
+            // them clears the reorg holdback. Parking (not deleting) is what makes this
+            // safe — `reclaim_expired` returns the notes if the transaction never lands.
+            // Skipping this is what let a second send inside that window re-select the
+            // same notes and build a transaction consensus drops as a double-spend.
+            if let Some(token) = token {
+                if let Some(w) = state.get_wallet(&token).await {
+                    let mut e = w.lock().await;
+                    let now_daa = e.scanned as u64;
+                    for p in &positions {
+                        e.db.mark_spent(*p, accepted.as_bytes(), now_daa);
+                    }
+                    log::info!("submit: parked {} spent note(s) for tx {}", positions.len(), accepted);
+                }
+            }
             let txid = accepted.to_string();
             Ok(Json(SendResp {
                 txid: txid.clone(),
@@ -3518,7 +3771,11 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         page_cache: Mutex::new(PageCache::new()),
         last_touch: Mutex::new(HashMap::new()),
         load_gate: tokio::sync::Semaphore::new(2),
-        prepare_gate: tokio::sync::Semaphore::new(1),
+        // Two concurrent preparations: proving is CPU-heavy, but a single global permit
+        // meant one tenant's send serialised every other tenant's on a shared daemon.
+        prepare_gate: tokio::sync::Semaphore::new(2),
+        preparing: std::sync::Mutex::new(HashSet::new()),
+        warm_gate: tokio::sync::Semaphore::new(WARM_CONCURRENCY),
         node_tip: Mutex::new((0, std::time::Instant::now())),
         prepared: Mutex::new(HashMap::new()),
         snapshots: Mutex::new(HashMap::new()),

@@ -227,6 +227,12 @@ pub struct WalletDb {
     /// Halo 2 proof). Advancing these incrementally as the wallet syncs makes a spend's
     /// witness lookup O(1).
     witnesses: Vec<(u64, IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>)>,
+    /// How many notes may hold a live witness, i.e. the `k` in the `leaves × k` cost of
+    /// advancing. Defaults to [`MAX_LIVE_WITNESSES`]. A caller that syncs many wallets on
+    /// one loop lowers it for a note-heavy wallet (miner/pool/treasury), so that wallet
+    /// still keeps a *spendable* set warm without its thousands of notes making every
+    /// leaf cost thousands of appends. See [`Self::set_witness_budget`].
+    witness_budget: usize,
     /// The tree at exactly `witnessed_upto` leaves — the state a newly matured note's
     /// witness is snapshotted from. (`tree` mirrors the *tip*; this one lags.)
     lag_tree: CommitmentTree<MerkleHashOrchard, TREE_DEPTH>,
@@ -298,6 +304,7 @@ impl WalletDb {
             notes: Vec::new(),
             size: 0,
             witnesses: Vec::new(),
+            witness_budget: MAX_LIVE_WITNESSES,
             lag_tree: CommitmentTree::empty(),
             witnessed_upto: 0,
             spent_nullifiers: HashSet::new(),
@@ -336,6 +343,7 @@ impl WalletDb {
             notes: Vec::new(),
             size: 0,
             witnesses: Vec::new(),
+            witness_budget: MAX_LIVE_WITNESSES,
             lag_tree: CommitmentTree::empty(),
             witnessed_upto: 0,
             spent_nullifiers: HashSet::new(),
@@ -810,6 +818,15 @@ impl WalletDb {
         self.advance_witnesses_capped(target_leaves, u64::MAX);
     }
 
+    /// Cap how many notes hold a live witness (see [`Self::witness_budget`]). Advancing
+    /// costs `leaves × budget` Sinsemilla appends, so this is the knob that keeps a
+    /// note-heavy wallet's catch-up bounded by a constant instead of by its note count.
+    /// Lowering it drops the now-ineligible witnesses on the next advance; those notes
+    /// fall back to the on-demand rebuild. Clamped to [`MAX_LIVE_WITNESSES`].
+    pub fn set_witness_budget(&mut self, budget: usize) {
+        self.witness_budget = budget.clamp(1, MAX_LIVE_WITNESSES);
+    }
+
     /// [`Self::advance_witnesses`] but advancing at most `max_leaves` this call, so the
     /// work is bounded and the caller can spread a large catch-up across sync passes
     /// (yielding between them) instead of one multi-second burst that starves the HTTP
@@ -826,13 +843,33 @@ impl WalletDb {
         more
     }
 
+    /// Notes that may hold a live witness: all of them when they fit the budget,
+    /// otherwise the most valuable ones.
+    ///
+    /// Which subset matters. A spend selects notes **value-descending**, so those are
+    /// the ones it will actually reach for. Handing the slots out in *position* order
+    /// instead — as this did — fills them with the oldest notes on a wallet that has
+    /// more notes than slots, which is precisely a miner/pool wallet: the warm set is
+    /// then one no send ever touches, and every send still pays the full on-demand
+    /// rebuild despite the witnesses being maintained. Position breaks ties so the set
+    /// is deterministic across daemons.
+    fn witness_eligible(&self) -> HashSet<u64> {
+        if self.notes.len() <= self.witness_budget {
+            return self.notes.iter().map(|n| n.position).collect();
+        }
+        let mut by_value: Vec<&OwnedNote> = self.notes.iter().collect();
+        by_value.sort_by(|a, b| b.value().cmp(&a.value()).then(a.position.cmp(&b.position)));
+        by_value.iter().take(self.witness_budget).map(|n| n.position).collect()
+    }
+
     fn advance_witnesses_range(&mut self, start: u64, target: u64) {
         if target <= start {
             return;
         }
-        // A spent note's witness is dead weight — drop it before advancing the rest.
-        let live: HashSet<u64> = self.notes.iter().map(|n| n.position).collect();
-        self.witnesses.retain(|(pos, _)| live.contains(pos));
+        // A spent — or no longer spend-relevant — note's witness is dead weight; drop
+        // it before advancing the rest, which also frees the slot for an eligible note.
+        let eligible = self.witness_eligible();
+        self.witnesses.retain(|(pos, _)| eligible.contains(pos));
 
         for abs in start..target {
             let Some(&leaf) = self.decoded_leaves().get((abs - self.base_size) as usize) else { break };
@@ -843,7 +880,7 @@ impl WalletDb {
             // ...and the lagging tree, which is what a newly matured note's witness is
             // snapshotted from (it then witnesses exactly the leaf just appended).
             let _ = self.lag_tree.append(leaf);
-            if live.contains(&abs) && self.witnesses.len() < MAX_LIVE_WITNESSES {
+            if eligible.contains(&abs) && self.witnesses.len() < self.witness_budget {
                 if let Some(w) = IncrementalWitness::from_tree(self.lag_tree.clone()) {
                     self.witnesses.push((abs, w));
                 }
@@ -913,6 +950,92 @@ impl WalletDb {
     }
 
     /// The live witness for `position`, if one is held **at exactly** `matured_leaves`.
+    /// Replay the leaf stream to produce a live witness for `position` rooted at
+    /// `matured_leaves`. This is the expensive path — O(matured − base) Sinsemilla
+    /// appends, ~22 s over a 126 K-leaf gap — and is what every cold spend pays.
+    fn rebuild_witness(&self, position: u64, matured_leaves: u64) -> Option<IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>> {
+        let rel = position.checked_sub(self.base_size)? as usize;
+        let matured_rel = matured_leaves.checked_sub(self.base_size)? as usize;
+        let leaves = self.decoded_leaves();
+        if rel >= matured_rel || matured_rel > leaves.len() {
+            return None;
+        }
+        // Rebuild the tree from the checkpoint frontier up to and including the target
+        // leaf, so `from_tree` witnesses exactly it, then replay the later leaves — but
+        // only up to `matured_rel`, so the witness roots at the matured anchor, not the
+        // tip. For a full-scan wallet the base frontier is empty, so this reduces to
+        // rebuilding from genesis.
+        let mut tree = CommitmentTree::from_frontier(&self.base_frontier);
+        for leaf in &leaves[..=rel] {
+            tree.append(*leaf).ok()?;
+        }
+        let mut witness = IncrementalWitness::<MerkleHashOrchard, TREE_DEPTH>::from_tree(tree)?;
+        for leaf in &leaves[rel + 1..matured_rel] {
+            witness.append(*leaf).ok()?;
+        }
+        Some(witness)
+    }
+
+    /// Build a witness for an eligible note the forward sweep has already passed, and
+    /// **keep** it.
+    ///
+    /// [`advance_witnesses_range`](Self::advance_witnesses_range) can only open a witness
+    /// at the moment its sweep reaches that leaf, so a note sitting below
+    /// `witnessed_upto` can never acquire one — it is condemned to pay the full
+    /// [`rebuild_witness`](Self::rebuild_witness) replay on *every* spend, forever. That
+    /// is the state of a miner/pool wallet: its notes cluster just above the compaction
+    /// base while the matured tip runs ~126 K leaves ahead, and as soon as its warm notes
+    /// are spent the next-eligible ones are all behind the sweep.
+    ///
+    /// This pays that replay once, off the spend path, and installs the result — so the
+    /// next spend of this note is an O(1) [`live_witness_path`](Self::live_witness_path)
+    /// lookup. Returns false if the note is already warm, the budget is full, or the
+    /// witness set is not currently at `target` (installing a witness rooted anywhere
+    /// else would desynchronise the set).
+    pub fn install_witness(&mut self, position: u64, target: u64) -> bool {
+        if self.witnessed_upto != target {
+            return false;
+        }
+        if self.witnesses.iter().any(|(p, _)| *p == position) {
+            return true;
+        }
+        if self.witnesses.len() >= self.witness_budget {
+            return false;
+        }
+        // Never spend a replay on a note the next advance would evict: `witness_eligible`
+        // keeps only the most valuable notes once they outnumber the slots, so adopting
+        // an ineligible one burns ~22 s and is dropped on the following sweep.
+        if !self.witness_eligible().contains(&position) {
+            return false;
+        }
+        match self.rebuild_witness(position, target) {
+            Some(w) => {
+                self.witnesses.push((position, w));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// How many notes currently hold a live witness (i.e. spend in O(1)).
+    pub fn live_witness_count(&self) -> usize {
+        self.witnesses.len()
+    }
+
+    /// An eligible note that has no live witness and sits below the sweep, if any —
+    /// the next candidate for [`install_witness`](Self::install_witness).
+    pub fn next_note_needing_witness(&self) -> Option<u64> {
+        if self.witnesses.len() >= self.witness_budget {
+            return None;
+        }
+        let eligible = self.witness_eligible();
+        self.notes
+            .iter()
+            .filter(|n| eligible.contains(&n.position) && n.position < self.witnessed_upto)
+            .map(|n| n.position)
+            .find(|p| !self.witnesses.iter().any(|(w, _)| w == p))
+    }
+
     fn live_witness_path(&self, position: u64, matured_leaves: u64) -> Option<MerklePath> {
         if self.witnessed_upto != matured_leaves {
             return None;
@@ -999,19 +1122,7 @@ impl WalletDb {
         if rel >= matured_rel || matured_rel > leaves.len() {
             return None;
         }
-        // Rebuild the tree from the checkpoint frontier up to and including the target
-        // leaf, so `from_tree` witnesses exactly it, then replay the later leaves — but
-        // only up to `matured_rel`, so the witness roots at the matured anchor, not the
-        // tip. For a full-scan wallet the base frontier is empty, so this reduces to
-        // rebuilding from genesis.
-        let mut tree = CommitmentTree::from_frontier(&self.base_frontier);
-        for leaf in &leaves[..=rel] {
-            tree.append(*leaf).ok()?;
-        }
-        let mut witness = IncrementalWitness::<MerkleHashOrchard, TREE_DEPTH>::from_tree(tree)?;
-        for leaf in &leaves[rel + 1..matured_rel] {
-            witness.append(*leaf).ok()?;
-        }
+        let witness = self.rebuild_witness(position, matured_leaves)?;
         let path = witness.path()?;
         let auth: [MerkleHashOrchard; TREE_DEPTH as usize] = path.path_elems().try_into().ok()?;
         Some(MerklePath::from_parts(u64::from(path.position()) as u32, auth))
@@ -1806,6 +1917,135 @@ mod tests {
             let live = db.live_witness_path(n.position, matured).expect("still on the live path after compaction");
             let rebuilt = db.witness_path_at(n.position, matured).expect("path");
             assert_eq!(live.root(cm), rebuilt.root(cm), "live root == path root at {}", n.position);
+        }
+    }
+
+    /// A wallet with more notes than witness slots must spend its slots on the notes a
+    /// send will actually select — the most valuable ones — not on whichever notes
+    /// happen to sit earliest in the tree.
+    ///
+    /// This is the miner/pool case. Slots used to be handed out in position order as the
+    /// leaf stream was swept, so a wallet holding thousands of notes warmed its OLDEST
+    /// ones, while `select_spend_count` reached for the largest. The warm set and the
+    /// spent set were disjoint, every send fell back to the O(chain) rebuild, and the
+    /// maintenance was pure cost for no benefit.
+    #[test]
+    fn witness_budget_warms_the_notes_a_spend_selects() {
+        let mine = [61u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        // Ten owned notes, oldest cheapest — so position order and value order disagree.
+        for b in 0..10u8 {
+            let ours = coinbase_for(address_of(mine), &[b, 7, 7, 7], 1_000 + b as u64 * 100);
+            db.ingest_block(&[ours], &[]);
+        }
+        let matured = db.size();
+        assert_eq!(db.notes().len(), 10);
+
+        // Only room for three witnesses.
+        db.set_witness_budget(3);
+        db.advance_witnesses(matured);
+        assert_eq!(db.witnesses.len(), 3, "budget is respected");
+
+        // They are the three most valuable notes — the ones a value-descending
+        // selection spends — and each takes the O(1) live path with a correct root.
+        let mut warm: Vec<u64> = db.witnesses.iter().map(|(p, _)| *p).collect();
+        warm.sort();
+        let mut want: Vec<&OwnedNote> = db.notes().iter().collect();
+        want.sort_by(|a, b| b.value().cmp(&a.value()));
+        let mut want: Vec<u64> = want.iter().take(3).map(|n| n.position).collect();
+        want.sort();
+        assert_eq!(warm, want, "the warm set is the top notes by value");
+
+        for pos in &warm {
+            let n = db.notes().iter().find(|n| n.position == *pos).unwrap();
+            let cm = ExtractedNoteCommitment::from(n.note.commitment());
+            let live = db.live_witness_path(*pos, matured).expect("warm note is on the live path");
+            let rebuilt = db.witness_path_at(*pos, matured).expect("path");
+            assert_eq!(live.root(cm), rebuilt.root(cm), "warm root == rebuilt root at {pos}");
+        }
+    }
+
+    /// A note the sweep already passed can be adopted into the warm set, and the witness
+    /// it gets is identical to the one a full replay produces.
+    ///
+    /// This is the miner/pool endgame. Witnesses are only opened as the forward sweep
+    /// reaches each leaf, so a note sitting BELOW `witnessed_upto` can never acquire one
+    /// — it re-pays the whole O(matured − base) replay on every single spend, forever.
+    /// With the notes clustered just above the compaction base and the matured tip
+    /// ~126 K leaves ahead, that was the 22 s-per-note cost on the live wallet.
+    #[test]
+    fn a_note_below_the_sweep_can_be_adopted_and_matches_a_full_replay() {
+        let mine = [63u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..6u8 {
+            let ours = coinbase_for(address_of(mine), &[b, 8, 8, 8], 5_000 + b as u64);
+            db.ingest_block(&[ours], &[]);
+        }
+        // Then a long run of other people's leaves, so the notes fall far behind the tip.
+        for b in 0..40u8 {
+            let theirs = coinbase_for(address_of([b.wrapping_add(70); 32]), &[b, 2, 2, 2], 77);
+            db.ingest_block(&[theirs], &[]);
+        }
+        let matured = db.size();
+
+        // Drive the sweep to the tip, then strand the notes: witnesses gone while
+        // `witnessed_upto` is already at `matured`. That is precisely the state a
+        // note-heavy wallet's notes are in — the sweep is past them, so it can never
+        // open a slot for them again, however long it runs.
+        db.set_witness_budget(4);
+        db.advance_witnesses(matured);
+        assert_eq!(db.witnessed_upto(), matured);
+        db.witnesses.clear();
+
+        // The most valuable note — the one a value-descending spend reaches for first,
+        // and so the one `witness_eligible` keeps a slot for.
+        let top = db.notes().iter().max_by_key(|n| n.value()).unwrap();
+        let target = top.position;
+        let cm = ExtractedNoteCommitment::from(top.note.commitment());
+        // Ground truth from the expensive path, before adoption.
+        let replayed = db.witness_path_at(target, matured).expect("replay path");
+        assert!(db.live_witness_path(target, matured).is_none(), "not warm yet — this is the bug");
+
+        // Adopt it, then it must answer from the live path with the SAME root.
+        db.set_witness_budget(4);
+        assert!(db.install_witness(target, matured), "adoption succeeds");
+        let live = db.live_witness_path(target, matured).expect("now on the O(1) live path");
+        assert_eq!(live.root(cm), replayed.root(cm), "adopted witness roots identically to a full replay");
+
+        // And it keeps tracking as the chain grows.
+        let theirs = coinbase_for(address_of([200u8; 32]), &[9, 9, 9, 9], 42);
+        db.ingest_block(&[theirs], &[]);
+        let grown = db.size();
+        db.advance_witnesses(grown);
+        let live2 = db.live_witness_path(target, grown).expect("still live after growth");
+        let replayed2 = db.witness_path_at(target, grown).expect("replay after growth");
+        assert_eq!(live2.root(cm), replayed2.root(cm), "adopted witness stays correct as leaves arrive");
+    }
+
+    /// Lowering the budget releases the witnesses it no longer covers, so a wallet that
+    /// accumulates notes cannot grow its per-leaf cost without bound.
+    #[test]
+    fn lowering_the_witness_budget_releases_slots() {
+        let mine = [62u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..8u8 {
+            let ours = coinbase_for(address_of(mine), &[b, 5, 5, 5], 2_000 + b as u64);
+            db.ingest_block(&[ours], &[]);
+        }
+        let matured = db.size();
+        db.advance_witnesses(matured);
+        assert_eq!(db.witnesses.len(), 8, "all notes warm under the default budget");
+
+        db.set_witness_budget(2);
+        // The next advance is what applies the new budget.
+        let ours = coinbase_for(address_of(mine), &[99, 5, 5, 5], 9_999);
+        db.ingest_block(&[ours], &[]);
+        db.advance_witnesses(db.size());
+        assert!(db.witnesses.len() <= 2, "excess witnesses released, got {}", db.witnesses.len());
+        // And a released note still spends — via the on-demand rebuild.
+        let cold = db.notes().iter().find(|n| !db.witnesses.iter().any(|(p, _)| *p == n.position));
+        if let Some(n) = cold {
+            assert!(db.witness_path_at(n.position, matured).is_some(), "released note still has a path");
         }
     }
 
