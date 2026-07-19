@@ -904,8 +904,20 @@ impl WalletDb {
     /// O(leaves-below-target) rebuild bounded so the caller can spread it across sync passes.
     /// Returns `true` if the base can still be rolled further toward `target`.
     pub fn advance_base_capped(&mut self, target: u64, max_leaves: u64) -> bool {
-        // Never roll past a note we still hold, or past what we've ingested.
-        let earliest = self.notes.iter().map(|n| n.position).min().unwrap_or(self.size);
+        // Never roll past a note we still hold, or past what we've ingested. A note
+        // parked in `pending_spends` counts as HELD: it left `notes` when its spend
+        // was submitted, but `reclaim_expired` returns it if the transaction never
+        // lands — and a note re-inserted below the base can never be witnessed
+        // again (its leaves are gone), leaving its value permanently unspendable.
+        // Ignoring pending spends here is exactly how live note@564934 was
+        // stranded: submit → compact past it → tx lost → reclaim → below base.
+        let earliest = self
+            .notes
+            .iter()
+            .map(|n| n.position)
+            .chain(self.pending_spends.iter().map(|p| p.note.position))
+            .min()
+            .unwrap_or(self.size);
         let full_target = target.min(earliest).min(self.size);
         if full_target <= self.base_size {
             return false;
@@ -947,6 +959,44 @@ impl WalletDb {
             self.witnesses.retain(|(p, _)| *p >= self.base_size);
         }
         step_target < full_target
+    }
+
+    /// Repair a wallet whose base compacted past a still-held note (see
+    /// [`Self::stranded_notes`]) by grafting the missing leaf-stream prefix back
+    /// from an **older snapshot of the same wallet** whose base predates the
+    /// stranded positions. Purely additive: the base frontier and base size roll
+    /// BACK to the older snapshot's, the dropped leaves are re-inserted, and
+    /// everything else (notes, witnesses, sweep state) is untouched — after which
+    /// the previously stranded notes rebuild witnesses normally. Refuses to graft
+    /// unless the two states demonstrably describe the same stream (same wallet
+    /// address, older covers the gap, and every overlapping leaf agrees).
+    /// Returns the number of leaves restored.
+    pub fn graft_history(&mut self, older: &Self) -> Result<u64, &'static str> {
+        if older.my_address != self.my_address {
+            return Err("snapshots belong to different wallets");
+        }
+        if older.base_size > self.base_size {
+            return Err("snapshot is not older: its base is ahead of this wallet's");
+        }
+        let gap = (self.base_size - older.base_size) as usize;
+        if gap == 0 {
+            return Ok(0);
+        }
+        if older.leaves.len() < gap {
+            return Err("older snapshot's leaf stream does not reach this wallet's base");
+        }
+        let n = (older.leaves.len() - gap).min(self.leaves.len());
+        if older.leaves[gap..gap + n] != self.leaves[..n] {
+            return Err("snapshots disagree where their leaf streams overlap");
+        }
+        let mut leaves = older.leaves[..gap].to_vec();
+        leaves.extend_from_slice(&self.leaves);
+        self.leaves = leaves;
+        self.base_frontier = older.base_frontier.clone();
+        self.base_size = older.base_size;
+        // The decoded cache mirrors `leaves` index-for-index — rebuild it lazily.
+        self.decoded = OnceCell::new();
+        Ok(gap as u64)
     }
 
     /// The live witness for `position`, if one is held **at exactly** `matured_leaves`.
@@ -1023,7 +1073,11 @@ impl WalletDb {
     }
 
     /// An eligible note that has no live witness and sits below the sweep, if any —
-    /// the next candidate for [`install_witness`](Self::install_witness).
+    /// the next candidate for [`install_witness`](Self::install_witness). Notes
+    /// below the compacted base are excluded: their leaves are gone, so an install
+    /// can never succeed — offering one turns the caller's warm loop into a
+    /// busy-retry of an impossible rebuild (observed live at ~1 attempt/second,
+    /// forever). Those notes are reported by [`Self::stranded_notes`] instead.
     pub fn next_note_needing_witness(&self) -> Option<u64> {
         if self.witnesses.len() >= self.witness_budget {
             return None;
@@ -1031,9 +1085,23 @@ impl WalletDb {
         let eligible = self.witness_eligible();
         self.notes
             .iter()
-            .filter(|n| eligible.contains(&n.position) && n.position < self.witnessed_upto)
+            .filter(|n| eligible.contains(&n.position) && n.position < self.witnessed_upto && n.position >= self.base_size)
             .map(|n| n.position)
             .find(|p| !self.witnesses.iter().any(|(w, _)| w == p))
+    }
+
+    /// Owned unspent notes that can no longer be witnessed from local state: their
+    /// position lies below the compacted base (leaves summarised away) and no live
+    /// witness survives. Such a note's value exists on-chain but cannot be spent
+    /// through this wallet state — a spend planner must exclude these rather than
+    /// fail the whole payment, and a caller should surface their total honestly.
+    /// Recovery requires older wallet state whose leaf stream still covers the
+    /// note (see the walletd graft tooling), or an archival replay of the chain.
+    pub fn stranded_notes(&self) -> Vec<&OwnedNote> {
+        self.notes
+            .iter()
+            .filter(|n| n.position < self.base_size && !self.witnesses.iter().any(|(p, _)| *p == n.position))
+            .collect()
     }
 
     fn live_witness_path(&self, position: u64, matured_leaves: u64) -> Option<MerklePath> {
@@ -1643,6 +1711,20 @@ mod tests {
     use crate::coinbase::derive_coinbase_note_desc;
     use crate::state::{CoinbaseMint, CoinbaseNote, ShieldedState};
 
+    impl WalletDb {
+        /// Replicate the PRE-FIX base compaction — the one that ignored held
+        /// notes — so tests can manufacture the stranded state that exists in
+        /// the wild (note below base, no witness) now that the public API can
+        /// no longer produce it.
+        fn strand_notes_for_test(&mut self, target: u64) {
+            let notes = std::mem::take(&mut self.notes);
+            let pending = std::mem::take(&mut self.pending_spends);
+            while self.advance_base_capped(target, u64::MAX) {}
+            self.notes = notes;
+            self.pending_spends = pending;
+        }
+    }
+
     /// A coinbase note description for `seed` paid to `address`, plus its value —
     /// exactly what a coinbase transaction publishes and what `ingest_block`
     /// consumes.
@@ -1973,6 +2055,112 @@ mod tests {
     /// — it re-pays the whole O(matured − base) replay on every single spend, forever.
     /// With the notes clustered just above the compaction base and the matured tip
     /// ~126 K leaves ahead, that was the 22 s-per-note cost on the live wallet.
+    #[test]
+    /// The live incident (note@564934): a note parked in `pending_spends` is not
+    /// in `notes`, so the old compaction cap ignored it, rolled the base past it,
+    /// and `reclaim_expired` later re-inserted it BELOW the base — permanently
+    /// unwitnessable, failing every send that selected it. A pending spend must
+    /// pin the base exactly like a held note.
+    #[test]
+    fn pending_spend_pins_base_compaction() {
+        let mine = [51u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        let ours = coinbase_for(address_of(mine), b"pin-0", 5_000);
+        db.ingest_block(&[ours], &[]);
+        for b in 0..20u8 {
+            let theirs = coinbase_for(address_of([b.wrapping_add(90); 32]), &[b, 3, 3, 3], 77);
+            db.ingest_block(&[theirs], &[]);
+        }
+        let pos = db.notes()[0].position;
+
+        // Submit a spend of our only note, then try to compact past it while the
+        // transaction is in flight.
+        db.mark_spent(pos, [9; 32], 1_000);
+        while db.advance_base_capped(db.size(), u64::MAX) {}
+        assert!(db.base_size() <= pos, "compaction must not pass a pending-spend note (base {} vs note {pos})", db.base_size());
+
+        // The transaction is lost; the note comes back — and must still be spendable.
+        let reclaimed = db.reclaim_expired(100_000, 1_000);
+        assert_eq!(reclaimed.len(), 1);
+        let matured = db.size();
+        assert!(db.witness_path_at(pos, matured).is_some(), "reclaimed note must still have a witness path");
+        assert!(db.stranded_notes().is_empty());
+    }
+
+    /// A wallet that already carries the damage (stranded state from the wild):
+    /// the stranded note is reported, excluded from the warm-loop candidates
+    /// (no more one-retry-per-second live-lock), and unspendable — while every
+    /// other note still witnesses fine.
+    #[test]
+    fn stranded_note_is_reported_and_never_offered_to_the_warm_loop() {
+        let mine = [52u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        let ours0 = coinbase_for(address_of(mine), b"str-0", 9_000);
+        db.ingest_block(&[ours0], &[]);
+        for b in 0..15u8 {
+            let theirs = coinbase_for(address_of([b.wrapping_add(120); 32]), &[b, 4, 4, 4], 77);
+            db.ingest_block(&[theirs], &[]);
+        }
+        let ours1 = coinbase_for(address_of(mine), b"str-1", 4_000);
+        db.ingest_block(&[ours1], &[]);
+        let (p0, p1) = (db.notes()[0].position, db.notes()[1].position);
+
+        // Manufacture the pre-fix damage: base rolled past note p0.
+        db.strand_notes_for_test(p0 + 3);
+        assert!(db.base_size() > p0);
+
+        let matured = db.size();
+        db.advance_witnesses(matured);
+        let stranded: Vec<u64> = db.stranded_notes().iter().map(|n| n.position).collect();
+        assert_eq!(stranded, vec![p0], "the compacted-past note is reported as stranded");
+        assert!(db.witness_path_at(p0, matured).is_none(), "a stranded note has no witness path");
+        assert!(db.witness_path_at(p1, matured).is_some(), "the healthy note is unaffected");
+        // Even with free slots, the warm loop must never be handed the impossible note.
+        db.witnesses.clear();
+        assert_ne!(db.next_note_needing_witness(), Some(p0), "warm loop must not busy-retry an impossible install");
+    }
+
+    /// Grafting an older snapshot's leaf stream un-strands the note: the base
+    /// rolls back, the witness rebuilds, and its root matches a wallet that was
+    /// never compacted at all.
+    #[test]
+    fn graft_history_restores_a_stranded_note() {
+        let mine = [53u8; 32];
+        let mut pristine = WalletDb::from_seed(mine).unwrap();
+        let ours = coinbase_for(address_of(mine), b"graft-0", 9_000);
+        pristine.ingest_block(&[ours], &[]);
+        for b in 0..15u8 {
+            let theirs = coinbase_for(address_of([b.wrapping_add(140); 32]), &[b, 5, 5, 5], 77);
+            pristine.ingest_block(&[theirs], &[]);
+        }
+        let pos = pristine.notes()[0].position;
+        // The "old backup": full state before the damage.
+        let old = WalletDb::from_checkpoint(mine, &pristine.to_checkpoint()).unwrap();
+
+        // The live wallet: continued, then (pre-fix) compacted past the note.
+        let mut db = WalletDb::from_checkpoint(mine, &pristine.to_checkpoint()).unwrap();
+        for b in 0..10u8 {
+            let theirs = coinbase_for(address_of([b.wrapping_add(160); 32]), &[b, 6, 6, 6], 77);
+            db.ingest_block(&[theirs.clone()], &[]);
+            pristine.ingest_block(&[theirs], &[]);
+        }
+        db.strand_notes_for_test(pos + 3);
+        let matured = db.size();
+        assert!(db.witness_path_at(pos, matured).is_none(), "stranded before the graft");
+
+        let restored = db.graft_history(&old).expect("graft applies");
+        assert!(restored > 0);
+        assert!(db.stranded_notes().is_empty(), "graft un-strands the note");
+        let cm = ExtractedNoteCommitment::from(db.notes()[0].note.commitment());
+        let repaired = db.witness_path_at(pos, matured).expect("witness rebuilds after graft");
+        let truth = pristine.witness_path_at(pos, matured).expect("pristine witness");
+        assert_eq!(repaired.root(cm), truth.root(cm), "grafted history reproduces the exact tree");
+
+        // A snapshot from a DIFFERENT wallet must be refused.
+        let stranger = WalletDb::from_seed([54u8; 32]).unwrap();
+        assert!(db.graft_history(&stranger).is_err());
+    }
+
     #[test]
     fn a_note_below_the_sweep_can_be_adopted_and_matches_a_full_replay() {
         let mine = [63u8; 32];

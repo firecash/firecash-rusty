@@ -41,6 +41,15 @@ struct Cli {
     /// plaintext (0600 on unix) and a warning is logged at startup.
     #[arg(long)]
     wallet_secret: Option<String>,
+    /// Offline admin: print each wallet's note/base/STRANDED-note report and exit.
+    /// Run with the daemon stopped.
+    #[arg(long, default_value_t = false)]
+    diagnose: bool,
+    /// Offline admin: repair a stranded wallet by grafting the leaf stream from an
+    /// older snapshot of the same wallet (format: `TOKEN:/path/to/older.scan`).
+    /// Run with the daemon stopped.
+    #[arg(long)]
+    graft: Option<String>,
 }
 
 // Oversubscribe worker threads (2x cores). The background sync loop does CPU-bound
@@ -54,6 +63,33 @@ struct Cli {
 async fn main() {
     kaspa_core::log::try_init_logger("info");
     let cli = Cli::parse();
+
+    // Offline admin modes: operate on the wallet files directly and exit.
+    let admin_secret = cli
+        .wallet_secret
+        .clone()
+        .or_else(|| std::env::var("ZKAS_WALLET_SECRET").ok())
+        .or_else(|| std::env::var("FIRECASH_WALLET_SECRET").ok());
+    if cli.diagnose || cli.graft.is_some() {
+        let dir = cli.wallet_dir.clone().unwrap_or_else(default_wallet_dir);
+        if let Some(spec) = &cli.graft {
+            let Some((token, older)) = spec.split_once(':') else {
+                eprintln!("--graft wants TOKEN:/path/to/older.scan");
+                std::process::exit(2);
+            };
+            match zkas_walletd::graft_wallet(&dir, token, older, admin_secret.as_deref()) {
+                Ok(report) => println!("{token}: {report}"),
+                Err(e) => {
+                    eprintln!("{token}: graft refused: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        if cli.diagnose {
+            print!("{}", zkas_walletd::diagnose_wallets(&dir, admin_secret.as_deref()));
+        }
+        return;
+    }
 
     let listen: SocketAddr = cli.listen.parse().unwrap_or_else(|e| {
         log::error!("bad --listen {:?}: {e}", cli.listen);

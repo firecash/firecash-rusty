@@ -48,7 +48,7 @@ use kaspa_shielded_core::orchard_recipient_bytes;
 use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::wallet::build::{PreparedPayment, build_wallet_payment, finalize_payment, prepare_payment, proving_key};
-use kaspa_shielded_core::walletdb::{BlockMeta, HistoryKind, Preview, WalletDb};
+use kaspa_shielded_core::walletdb::{BlockMeta, HistoryKind, OwnedNote, Preview, WalletDb};
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -842,13 +842,27 @@ fn load_checkpoint(
     tip: Option<&kaspa_shielded_core::tree::FrontierState>,
 ) -> Option<(WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64, u64)> {
     let buf = std::fs::read(scan_path(dir, token)).ok()?;
+    let (saved_genesis, rest) = parse_scan_bytes(&buf, key, tip)?;
+    if saved_genesis != *current_genesis {
+        return None; // chain relaunched → rescan
+    }
+    Some(rest)
+}
+
+/// Parse one scan-file blob into `(genesis, (db, low, scanned, boundaries,
+/// sink_blue, blind_below))`. Factored out of [`load_checkpoint`] so the offline
+/// admin tooling (`--diagnose`, `--graft`) can read snapshots at arbitrary paths
+/// with exactly the daemon's own parser.
+#[allow(clippy::type_complexity)]
+fn parse_scan_bytes(
+    buf: &[u8],
+    key: WalletKey,
+    tip: Option<&kaspa_shielded_core::tree::FrontierState>,
+) -> Option<(RpcHash, (WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64, u64))> {
     if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || !matches!(buf[4], SCAN_VERSION | SCAN_VERSION_PREV) {
         return None;
     }
     let saved_genesis = RpcHash::from_bytes(buf[5..37].try_into().ok()?);
-    if saved_genesis != *current_genesis {
-        return None; // chain relaunched → rescan
-    }
     let low = RpcHash::from_bytes(buf[37..69].try_into().ok()?);
     let scanned = u64::from_le_bytes(buf[69..77].try_into().ok()?) as usize;
     let mut pos = SCAN_HEADER_LEN;
@@ -878,7 +892,84 @@ fn load_checkpoint(
     if pos != buf.len() {
         return None;
     }
-    Some((db, low, scanned, boundaries, sink_blue, blind_below))
+    Some((saved_genesis, (db, low, scanned, boundaries, sink_blue, blind_below)))
+}
+
+// ---------------------------------------------------------------------------
+// Offline admin tooling (`--diagnose` / `--graft`). Run with the daemon STOPPED:
+// both operate on the same scan files the sync loop rewrites.
+
+/// Report every wallet in `dir`: note count, compaction base, and — the reason
+/// this exists — **stranded** notes (below the base with no witness; the
+/// note@564934 incident). One line per wallet.
+pub fn diagnose_wallets(dir: &str, secret: Option<&str>) -> String {
+    let mut out = String::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return format!("cannot read wallet dir {dir}\n");
+    };
+    let mut tokens: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|n| n.strip_suffix(".scan").map(str::to_owned))
+        .collect();
+    tokens.sort();
+    for token in tokens {
+        let Some((key, ..)) = load_wallet_meta(dir, &token, secret) else {
+            out.push_str(&format!("{token}: wallet file missing/undecryptable (need --wallet-secret?)\n"));
+            continue;
+        };
+        let Ok(buf) = std::fs::read(scan_path(dir, &token)) else {
+            out.push_str(&format!("{token}: scan file unreadable\n"));
+            continue;
+        };
+        let Some((_, (db, _, scanned, ..))) = parse_scan_bytes(&buf, key, None) else {
+            out.push_str(&format!("{token}: scan checkpoint does not parse\n"));
+            continue;
+        };
+        let stranded = db.stranded_notes();
+        let stranded_value: u64 = stranded.iter().map(|n| n.value()).sum();
+        out.push_str(&format!(
+            "{token}: notes={} balance={} scanned={} base={} size={} stranded={} stranded_value={}{}\n",
+            db.notes().len(),
+            fmt_fc(db.balance()),
+            scanned,
+            db.base_size(),
+            db.size(),
+            stranded.len(),
+            fmt_fc(stranded_value as u128),
+            if stranded.is_empty() {
+                String::new()
+            } else {
+                format!(" positions={:?}", stranded.iter().map(|n| n.position).collect::<Vec<_>>())
+            },
+        ));
+    }
+    out
+}
+
+/// Repair a stranded wallet (see [`WalletDb::graft_history`]) by re-inserting the
+/// leaf prefix from `older_scan` — an older snapshot of the SAME wallet (its
+/// `.scan.bak`, a `wallets-PRESERVE` copy, …). Verifies the streams agree before
+/// touching anything, then rewrites the wallet's scan checkpoint in place.
+pub fn graft_wallet(dir: &str, token: &str, older_scan: &str, secret: Option<&str>) -> Result<String, String> {
+    let (key, ..) = load_wallet_meta(dir, token, secret).ok_or("wallet file missing/undecryptable (need --wallet-secret?)")?;
+    let buf = std::fs::read(scan_path(dir, token)).map_err(|e| format!("read current scan: {e}"))?;
+    let (genesis, (mut db, low, scanned, boundaries, sink_blue, blind_below)) =
+        parse_scan_bytes(&buf, key, None).ok_or("current scan checkpoint does not parse")?;
+    let old_buf = std::fs::read(older_scan).map_err(|e| format!("read older snapshot: {e}"))?;
+    let (old_genesis, (old_db, ..)) = parse_scan_bytes(&old_buf, key, None).ok_or("older snapshot does not parse")?;
+    if old_genesis != genesis {
+        return Err("older snapshot is from a different chain (genesis mismatch)".into());
+    }
+    let before = db.stranded_notes().len();
+    let restored = db.graft_history(&old_db).map_err(|e| e.to_string())?;
+    let after = db.stranded_notes().len();
+    save_checkpoint(dir, token, &genesis, &low, scanned as u64, &db, &boundaries, sink_blue, blind_below)
+        .map_err(|e| format!("write repaired checkpoint: {e}"))?;
+    Ok(format!(
+        "grafted {restored} leaves back (base now {}); stranded notes {before} -> {after}",
+        db.base_size()
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2966,6 +3057,43 @@ fn memo_bytes(m: Option<&str>) -> Result<[u8; 512], (StatusCode, Json<serde_json
     Ok(out)
 }
 
+/// Matured spend candidates for a wallet, EXCLUDING stranded notes — notes whose
+/// leaves were compacted away with no surviving witness (the note@564934
+/// incident: pending-spend → base compaction → reclaim left a note below the
+/// base). A stranded note can never produce a witness path from local state, so
+/// including it fails the entire payment with "matured note has no witness path"
+/// even though every other note is spendable. Selection skips them; their value
+/// is returned so error messages can be honest about funds that exist on-chain
+/// but need a state graft (`--graft`) to spend. Unsorted — callers order.
+fn matured_candidates(db: &WalletDb, matured: u64) -> (Vec<&OwnedNote>, u64) {
+    let stranded = db.stranded_notes();
+    let stranded_value: u64 = stranded.iter().map(|n| n.value()).sum();
+    if stranded_value > 0 {
+        log::warn!(
+            "spend selection: skipping {} stranded note(s) worth {} sompi (below base {}, no witness) — recoverable only by grafting older wallet state",
+            stranded.len(),
+            stranded_value,
+            db.base_size(),
+        );
+    }
+    let skip: HashSet<u64> = stranded.iter().map(|n| n.position).collect();
+    let candidates = db.notes().iter().filter(|n| n.position < matured && !skip.contains(&n.position)).collect();
+    (candidates, stranded_value)
+}
+
+/// One line of honesty appended to "insufficient funds" errors when part of the
+/// wallet's balance is stranded (see [`matured_candidates`]).
+fn stranded_hint(stranded_value: u64) -> String {
+    if stranded_value == 0 {
+        String::new()
+    } else {
+        format!(
+            "; note: {} ZKAS of this wallet is temporarily unspendable (stranded by an old state bug — contact support to recover it)",
+            fmt_fc(stranded_value as u128)
+        )
+    }
+}
+
 async fn wallet_send(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -3004,11 +3132,12 @@ async fn wallet_send(
         return Err(err(StatusCode::BAD_REQUEST, "amount must be positive"));
     }
     let max_per_tx = max_spends_per_tx();
-    let insufficient = |have: u64| {
+    let insufficient = |have: u64, stranded: u64| {
         err(
             StatusCode::CONFLICT,
             format!(
-                "insufficient matured funds: have {have}, need {need}+ (amount {amount} + a {fee} fee per tx; funds must be ~10 min old to spend)"
+                "insufficient matured funds: have {have}, need {need}+ (amount {amount} + a {fee} fee per tx; funds must be ~10 min old to spend){}",
+                stranded_hint(stranded)
             ),
         )
     };
@@ -3025,7 +3154,7 @@ async fn wallet_send(
     // slack` blue units below the sink — a matured, canonical chain-block root
     // consensus accepts (`is_shielded_anchor_final`; maturity is measured in blue
     // score). The entry lock is held only for selection + witness building.
-    let mut planned: Option<(Vec<(Vec<_>, u64, Vec<u64>, u64)>, u64, bool)> = None;
+    let mut planned: Option<(Vec<(Vec<_>, u64, Vec<u64>, u64)>, u64, bool, u64)> = None;
     {
         let mut e = w.lock().await;
         // Top up the live witnesses to the current matured anchor (a no-op unless a
@@ -3035,7 +3164,7 @@ async fn wallet_send(
         tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded());
         let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
-            let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
+            let (mut candidates, stranded_value) = matured_candidates(&e.db, matured);
             candidates.sort_by(|a, b| b.value().cmp(&a.value()));
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
             let have: u64 = values.iter().sum();
@@ -3057,19 +3186,19 @@ async fn wallet_send(
                         idx += n_notes;
                         chunks.push((inputs, pay, positions, cfee));
                     }
-                    planned = Some((chunks, have, e.caught_up));
+                    planned = Some((chunks, have, e.caught_up, stranded_value));
                 }
-                None => planned = Some((Vec::new(), have, e.caught_up)),
+                None => planned = Some((Vec::new(), have, e.caught_up, stranded_value)),
             }
         }
     }
 
     let chunks = match planned {
         // A complete plan at the wallet's own anchor — the fast, no-rescan path.
-        Some((chunks, _, _)) if !chunks.is_empty() => chunks,
+        Some((chunks, _, _, _)) if !chunks.is_empty() => chunks,
         // Planning failed but the wallet is caught up to the tip, so a full replay
         // would see the exact same matured notes: authoritative insufficient.
-        Some((_, have, true)) => return Err(insufficient(have)),
+        Some((_, have, true, stranded)) => return Err(insufficient(have, stranded)),
         // Ring not filled yet (cold start) or wallet behind the tip: one-off matured
         // replay — correct, just slow, and transient until the sync loop catches up.
         _ => {
@@ -3080,7 +3209,7 @@ async fn wallet_send(
             candidates.sort_by(|a, b| b.value().cmp(&a.value()));
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
             let have: u64 = values.iter().sum();
-            let plan = plan_chunks(&values, amount, fee, max_per_tx).ok_or_else(|| insufficient(have))?;
+            let plan = plan_chunks(&values, amount, fee, max_per_tx).ok_or_else(|| insufficient(have, 0))?;
             let mut chunks = Vec::with_capacity(plan.len());
             let mut idx = 0usize;
             for (n_notes, pay, cfee) in plan {
@@ -3209,7 +3338,7 @@ async fn wallet_consolidate(
         let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) else {
             return Err(err(StatusCode::CONFLICT, "wallet is still syncing the maturity window; try again shortly"));
         };
-        let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
+        let (mut candidates, _stranded) = matured_candidates(&e.db, matured);
         candidates.sort_by_key(|n| n.value());
         candidates.truncate(max_spends_per_tx());
         let sum: u64 = candidates.iter().map(|n| n.value()).sum();
@@ -3470,7 +3599,7 @@ async fn wallet_prepare(
                 );
                 let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
-                    let mut candidates: Vec<_> = e.db.notes().iter().filter(|n| n.position < matured).collect();
+                    let (mut candidates, _stranded) = matured_candidates(&e.db, matured);
                     candidates.sort_by(|a, b| b.value().cmp(&a.value()));
                     have_total = Some(candidates.iter().map(|n| n.value()).sum());
                     let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
