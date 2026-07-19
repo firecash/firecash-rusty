@@ -1,19 +1,12 @@
-# `@zkas/sdk`
+# @zkas/sdk (TypeScript)
 
-TypeScript orchestration for the ZKas hosted non-custodial flow. Cryptographic
-verification and signing remain in the Rust/WASM `zkas-signer`; this package
-coordinates typed prepare, local authorization, submit, errors, and progress.
+The TypeScript SDK moved to its own repository so integrators get a clean
+package without the node workspace:
 
-All payment amounts are `bigint`. The package intentionally has no API accepting
-floating-point ZKAS amounts.
+    https://github.com/firecash/zkas-sdk
 
-```ts
-const signer = wasmPaymentSigner({ seedHex, fvkHex, verifyAndSignPayment });
-const client = new ZKasClient({ baseUrl, walletToken, network: "mainnet" });
-const sent = await client.send(signer, {
-  to: recipient,
-  amountSompi: 100_000_000n,
-  feeSompi: 3_000_000n,
-});
-```
-
+It has no Rust build dependency (it talks to `zkas-walletd` over HTTP and takes
+the WASM signer by injection), so nothing here needs it at build time. The wire
+contract it consumes — `PreparedPaymentEnvelope` version 2 — is pinned by the
+golden-vector test in `sdk/core/src/prepared.rs`; changing that format means
+updating `src/types.ts` in the SDK repo in the same breath.
