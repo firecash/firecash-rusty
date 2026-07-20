@@ -45,7 +45,7 @@ use kaspa_shielded_core::coinbase::CoinbaseNoteDesc;
 use kaspa_shielded_core::coinbase::derive_coinbase_note_desc;
 use kaspa_shielded_core::message::{FVK_LEN, SIG_LEN, sign_message, verify_message};
 use kaspa_shielded_core::orchard_recipient_bytes;
-use kaspa_shielded_core::tree::FrontierState;
+use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::wallet::build::{PreparedPayment, build_wallet_payment, finalize_payment, prepare_payment, proving_key};
 use kaspa_shielded_core::walletdb::{BlockMeta, HistoryKind, OwnedNote, Preview, WalletDb};
@@ -887,6 +887,23 @@ fn parse_scan_bytes(
         Some(fs) => key.db_from_checkpoint_with_tip(blob, fs)?,
         None => key.db_from_checkpoint(blob)?,
     };
+    // A syntactically valid checkpoint is not necessarily a canonical one. Older
+    // walletd versions could ingest ordinary-accepted shielded bundles whose state
+    // transition was actually dropped, leaving a plausible but divergent tree.
+    // Bind every restored checkpoint to the node's frontier at its exact cursor.
+    if let Some(fs) = tip {
+        let expected = GlobalTree::from_state(fs).ok()?.anchor().to_bytes();
+        if db.size() != fs.size || db.anchor() != expected {
+            log::warn!(
+                "rejecting divergent wallet checkpoint at cursor {low}: wallet size/root {}/{}, node size/root {}/{}",
+                db.size(),
+                hex(&db.anchor()),
+                fs.size,
+                hex(&expected),
+            );
+            return None;
+        }
+    }
     let ring_len = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?) as usize;
     let mut boundaries = VecDeque::with_capacity(ring_len.min(MATURED_RING));
     for _ in 0..ring_len {
@@ -2224,6 +2241,15 @@ impl AppState {
     /// clone the freshest same-key checkpoint another token already scanned. Runs
     /// the donor verification (argon2 decrypts included) off the async workers.
     async fn adopt_twin(&self, token: &str, fvk: &[u8; 96], birthday: u64) -> Option<(String, u64)> {
+        // DISABLED 2026-07-20: cloning a donor token's checkpoint propagated stale /
+        // phantom-note trees between same-seed devices, which is exactly the
+        // divergent-anchor state `ensure_canonical_checkpoint` now rejects at send
+        // time. A fresh registration must scan the canonical stream itself; re-enable
+        // only behind a proof that the donor checkpoint equals the node frontier at
+        // its cursor. Body kept for that future gated version.
+        let _ = (token, fvk, birthday);
+        return None;
+        #[allow(unreachable_code)]
         let candidates: Vec<String> =
             self.fvk_index.lock().await.get(fvk).map(|s| s.iter().cloned().collect()).unwrap_or_default();
         if candidates.is_empty() {
@@ -2305,14 +2331,27 @@ impl AppState {
                     leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
                     ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
                 }),
+                // Never load an unverified checkpoint. A transient node failure is
+                // retried on the next request; treating it as permission to trust the
+                // local file is how stale twin state previously propagated.
                 Err(e) => {
-                    log::debug!("no tree state for checkpoint cursor ({e}); restoring from the leaf stream");
-                    None
+                    log::warn!("cannot verify checkpoint cursor against selected chain ({e}); keeping checkpoint and retrying");
+                    return None;
                 }
             },
             None => None,
         };
-        let entry = match load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref()) {
+        let restored = load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref());
+        // Preserve a rejected checkpoint for forensic recovery/grafting. Never let
+        // the subsequent clean scan overwrite the only copy of older owned notes.
+        if restored.is_none() && tip.is_some() && checkpoint_cursor(&self.wallet_dir, token, &genesis).is_some() {
+            let scan = scan_path(&self.wallet_dir, token);
+            let quarantine = format!("{scan}.divergent-{}", now_unix());
+            if std::fs::copy(&scan, &quarantine).is_ok() {
+                log::warn!("preserved rejected checkpoint as {quarantine}");
+            }
+        }
+        let entry = match restored {
             Some((db, low, scanned, boundaries, sink_blue, blind_below)) => {
                 let mut e =
                     WalletEntry::from_parts(key, recoverable_history, db, genesis, low, scanned, boundaries, sink_blue);
@@ -3276,6 +3315,49 @@ fn stranded_hint(stranded_value: u64) -> String {
     }
 }
 
+/// Prove that a loaded wallet's commitment tree is exactly the node's canonical
+/// tree at the wallet cursor. Height/freshness alone cannot establish this: a
+/// legacy checkpoint may be near-tip yet contain bundles consensus dropped.
+async fn ensure_canonical_checkpoint(
+    state: &Arc<AppState>,
+    w: &Wallet,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let (cursor, wallet_size, wallet_anchor) = {
+        let e = w.lock().await;
+        (e.low, e.db.size(), e.db.anchor())
+    };
+    let ts = tokio::time::timeout(SYNC_RPC_TIMEOUT, state.client.get_shielded_tree_state(Some(cursor)))
+        .await
+        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "node timed out while validating the wallet checkpoint; retry"))?
+        .map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("cannot validate wallet checkpoint: {e}")))?;
+    let fs = FrontierState {
+        size: ts.size,
+        leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+        ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
+    };
+    let node_anchor = GlobalTree::from_state(&fs)
+        .map_err(|_| err(StatusCode::BAD_GATEWAY, "node returned an invalid shielded frontier"))?
+        .anchor()
+        .to_bytes();
+    if wallet_size != fs.size || wallet_anchor != node_anchor {
+        let mut e = w.lock().await;
+        e.reorged_strikes = REORG_STRIKES;
+        e.error = Some("wallet checkpoint diverged from canonical shielded state; repairing from chain".into());
+        log::error!(
+            "wallet checkpoint divergence at {cursor}: wallet size/root {}/{}, node size/root {}/{}; marked for repair",
+            wallet_size,
+            hex(&wallet_anchor),
+            fs.size,
+            hex(&node_anchor),
+        );
+        return Err(err(
+            StatusCode::CONFLICT,
+            "wallet checkpoint was created by an older broken sync path and differs from canonical chain state; automatic repair started—wait for sync before sending",
+        ));
+    }
+    Ok(())
+}
+
 async fn wallet_send(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -3283,8 +3365,27 @@ async fn wallet_send(
 ) -> Result<Json<SendResp>, (StatusCode, Json<serde_json::Value>)> {
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
+    ensure_canonical_checkpoint(&state, &w).await?;
+    let node_tip = state.node_tip.lock().await.0;
     let (seed, recoverable) = {
         let e = w.lock().await;
+        // `scanned` intentionally trails the live tip by SYNC_TIP_MARGIN: blocks
+        // newer than that are previewed but not committed to the append-only tree.
+        // Treat that normal settlement lag (plus two poll margins) as current.
+        // `sink_blue` is a blue score while `node_tip` is DAA score, so comparing
+        // those counters directly is invalid and used to reject healthy wallets.
+        if node_tip == 0
+            || (e.scanned as u64).saturating_add(SYNC_TIP_MARGIN + 2 * SYNC_MARGIN) < node_tip
+            || e.reorged_strikes > 0
+        {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!(
+                    "wallet is still updating its canonical chain view (wallet DAA {}, node DAA {}); wait for sync before sending",
+                    e.scanned, node_tip
+                ),
+            ));
+        }
         (e.key.seed()?, e.recoverable_history)
     };
     let memo = memo_bytes(req.memo.as_deref())?;
@@ -3757,10 +3858,25 @@ async fn wallet_prepare(
     // wallet to record against.
     let mut spent_positions: Vec<u64> = Vec::new();
     let mut session_token: Option<String> = None;
+    let current_node_tip = state.node_tip.lock().await.0;
     if let Ok(token) = token_from(&headers, state.allow_default_token) {
         if let Some(w) = state.get_wallet(&token).await {
+            ensure_canonical_checkpoint(&state, &w).await?;
             let mut e = w.lock().await;
             if e.db.fvk().to_bytes() == fvk_bytes {
+                let node_tip = current_node_tip;
+                if node_tip == 0
+                    || (e.scanned as u64).saturating_add(SYNC_TIP_MARGIN + 2 * SYNC_MARGIN) < node_tip
+                    || e.reorged_strikes > 0
+                {
+                    return Err(err(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "wallet is still updating its canonical chain view (wallet DAA {}, node DAA {}); wait for sync before sending",
+                            e.scanned, node_tip
+                        ),
+                    ));
+                }
                 let matured_leaves = e.matured_leaves().unwrap_or(0);
                 let warm_before = e.db.witnessed_upto();
                 let climb = matured_leaves.saturating_sub(warm_before);
