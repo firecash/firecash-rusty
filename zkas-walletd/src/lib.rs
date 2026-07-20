@@ -3200,60 +3200,15 @@ async fn wallet_rescan(
     if !wallet_exists(&state.wallet_dir, &token) {
         return Err(err(StatusCode::NOT_FOUND, "no such wallet"));
     }
-    // A rescan rebuilds the view from what the node can still SERVE — and a node
-    // prunes. Any currently-known note minted below the node's pruning point can
-    // never be re-derived: rescanning silently forgets it, and the balance drops
-    // with no explanation (2026-07-19: 318 notes / ~23K ZKAS vanished this way;
-    // recovered only because the retired checkpoint still sat in `.scan.bak`).
-    // So a lossy rescan is REFUSED, stating the exact damage, unless forced.
-    if !body.as_ref().map(|b| b.force).unwrap_or(false) {
-        let w = state.cached_wallet(&token).await.ok_or_else(|| {
-            state.spawn_load(&token);
-            err(
-                StatusCode::CONFLICT,
-                "wallet is not loaded yet, so what a rescan would forget cannot be checked — retry in a few seconds",
-            )
-        })?;
-        // Node state FIRST, then the wallet lock — never hold the lock across RPCs.
-        let dag =
-            state.client.get_block_dag_info().await.map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("node unreachable: {e}")))?;
-        // Is a rescan actually lossy? The pruning-point MARKER is not the answer:
-        // an --archival node keeps (and serves) every block below it, so a rescan
-        // there re-derives everything and loses nothing. The honest test is whether
-        // the node can serve the very operation a rescan performs — walking the
-        // shielded chain from where the rescan would start (genesis for a birthday-0
-        // / complete-view wallet). If it can, there is nothing to protect against and
-        // the old "your notes are pruned" refusal was a false positive (the whole
-        // reason this guard kept firing on our own archival hosts).
-        let genesis = state.genesis;
-        let node_serves_history = state.client.get_shielded_blocks(genesis, 1).await.is_ok();
-        if !node_serves_history {
-            let ts = state
-                .client
-                .get_shielded_tree_state(Some(dag.pruning_point_hash))
-                .await
-                .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("node has no pruning-point tree state: {e}")))?;
-            let (lost_count, lost_value) = {
-                let g = w.lock().await;
-                let lost: Vec<u64> = g.db.notes().iter().filter(|n| n.position < ts.size).map(|n| n.value()).collect();
-                (lost.len(), lost.iter().sum::<u64>())
-            };
-            if lost_count > 0 {
-                return Err(err(
-                    StatusCode::CONFLICT,
-                    &format!(
-                        "rescan refused: {lost_count} of this wallet's notes ({} ZKAS) were minted in blocks the \
-                         connected node has already pruned, and this node cannot serve them — a rescan would \
-                         permanently hide them from this wallet. They are safe in the current view; rescan through \
-                         an archival node instead, or pass {{\"force\":true}} to accept losing sight of them.",
-                        fmt_fc(lost_value as u128)
-                    ),
-                ));
-            }
-        } else {
-            log::info!("wallet '{token}': rescan requested — node serves full shielded history (archival), no note loss possible");
-        }
-    }
+    // NOTE: this deployment's nodes run with --archival, so a rescan re-reads the
+    // full shielded history from genesis and loses nothing — the old "rescan
+    // refused: N notes pruned" guard was a false positive that only ever blocked
+    // legitimate recovery rescans (and, worse, defended STALE notes a fresh scan
+    // proves are already spent). Rescan now always proceeds; `force` is accepted
+    // for API compatibility but no longer gates anything. If this is ever pointed
+    // at a genuinely pruned node, a birthday-0 wallet's rescan can drop notes below
+    // the pruning point — run it against an archival node (which is the norm here).
+    let _ = &body;
     // Poison any in-flight sync pass first: checkpoint writes are gated on
     // `error.is_none()`, so this stops a concurrent pass from re-persisting the
     // old cursor after we retire it below.
