@@ -319,6 +319,15 @@ impl WalletKey {
         db.apply_frontier(fs)?;
         Some(db)
     }
+
+    /// The 96-byte Orchard full viewing key this wallet watches with — the identity
+    /// two registrations of the same wallet share, whatever form (seed or FVK) the
+    /// key material arrived in. Everything in a scan checkpoint is derivable from
+    /// this key plus the public chain, which is what makes checkpoint adoption
+    /// (see [`adopt_twin_checkpoint`]) sound.
+    fn fvk_bytes(&self) -> Option<[u8; 96]> {
+        self.empty_db().map(|db| db.fvk().to_bytes())
+    }
 }
 
 fn wallet_path(dir: &str, token: &str) -> String {
@@ -893,6 +902,101 @@ fn parse_scan_bytes(
         return None;
     }
     Some((saved_genesis, (db, low, scanned, boundaries, sink_blue, blind_below)))
+}
+
+// ---------------------------------------------------------------------------
+// Twin-checkpoint adoption: "enter the seed on a second device → synced at once".
+//
+// A scan checkpoint is a pure function of (full viewing key, public chain): the
+// notes, positions, witnesses and cursor in it are exactly what ANY scan with
+// that key would produce. So when a seed/FVK is registered under a fresh token
+// and some other token on this daemon has already scanned the same key, cloning
+// that token's checkpoint hands the new registration a fully synced wallet —
+// and hands it nothing the presented key couldn't derive by scanning, so the
+// fast path is security-neutral. Spend authority is not involved at all.
+// ---------------------------------------------------------------------------
+
+/// The `blind_below` trailer of a checkpoint file, read without the wallet key
+/// (the full body needs one; the trailer is plain). `0` = the view is complete.
+fn checkpoint_blind_below(path: &str) -> Option<u64> {
+    let buf = std::fs::read(path).ok()?;
+    if buf.len() < SCAN_HEADER_LEN + 8 || &buf[0..4] != SCAN_MAGIC {
+        return None;
+    }
+    match buf[4] {
+        SCAN_VERSION => Some(u64::from_le_bytes(buf[buf.len() - 8..].try_into().ok()?)),
+        SCAN_VERSION_PREV => Some(0), // v3 predates fast-sync blindness — always a full view
+        _ => None,
+    }
+}
+
+/// Find another token in `dir` holding the SAME full viewing key with a resumable
+/// checkpoint for `genesis`, and clone that checkpoint for `token`. Returns the
+/// donor token and the birthday to persist (the earlier of the donor's and the
+/// requested one, so a later cold rescan can never skip notes either wallet knew
+/// about). `candidates` comes from the in-RAM viewing-key index; every donor is
+/// re-verified against its wallet file here, so a stale index entry (a token that
+/// re-imported a different seed since) is harmless.
+fn adopt_twin_checkpoint(
+    dir: &str,
+    token: &str,
+    fvk: &[u8; 96],
+    birthday: u64,
+    genesis: &RpcHash,
+    secret: Option<&str>,
+    candidates: &[String],
+) -> Option<(String, u64)> {
+    let mut best: Option<(String, u64, std::time::SystemTime)> = None;
+    for donor in candidates {
+        if donor == token {
+            continue;
+        }
+        if checkpoint_cursor(dir, donor, genesis).is_none() {
+            continue;
+        }
+        let Some((key, donor_birthday, _)) = load_wallet_meta(dir, donor, secret) else { continue };
+        if key.fvk_bytes() != Some(*fvk) {
+            continue;
+        }
+        // Only adopt a view at least as complete as this registration asked for: a
+        // donor fast-synced from a LATER birthday is blind to older notes
+        // (`blind_below` > 0) that a birthday-0 / earlier-birthday restore explicitly
+        // wants recovered — scanning honestly beats inheriting someone else's blind
+        // spot and silently under-reporting the balance.
+        let blind = checkpoint_blind_below(&scan_path(dir, donor)).unwrap_or(u64::MAX);
+        if blind != 0 && (birthday == 0 || birthday < donor_birthday) {
+            continue;
+        }
+        // Freshest donor wins: least catch-up left for the clone.
+        let mtime = std::fs::metadata(scan_path(dir, donor))
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(_, _, m)| mtime > *m) {
+            best = Some((donor.clone(), donor_birthday, mtime));
+        }
+    }
+    let (donor, donor_birthday, _) = best?;
+    // save_checkpoint writes are atomic (tmp + rename), so a plain copy always sees
+    // a consistent file. At worst it lags the donor's RAM state by CHECKPOINT_EVERY
+    // blocks; the clone re-scans that tail in seconds.
+    std::fs::copy(scan_path(dir, &donor), scan_path(dir, token)).ok()?;
+    Some((donor, donor_birthday.min(birthday)))
+}
+
+/// One pass over every wallet file in `dir` → viewing key → tokens map. Argon2 per
+/// encrypted seed file, so this belongs on a blocking thread (startup does ~50 ms ×
+/// wallet count there once; registrations keep the map current after that).
+fn build_fvk_index(dir: &str, secret: Option<&str>) -> HashMap<[u8; 96], HashSet<String>> {
+    let mut map: HashMap<[u8; 96], HashSet<String>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return map };
+    for name in entries.flatten().filter_map(|e| e.file_name().into_string().ok()) {
+        let Some(token) = name.strip_suffix(".json") else { continue };
+        let Some((key, ..)) = load_wallet_meta(dir, token, secret) else { continue };
+        if let Some(f) = key.fvk_bytes() {
+            map.entry(f).or_default().insert(token.to_string());
+        }
+    }
+    map
 }
 
 // ---------------------------------------------------------------------------
@@ -1763,6 +1867,11 @@ struct AppState {
     /// is momentarily held by the sync loop (see [`StatusSnap`]). Refreshed by the sync
     /// loop each pass and by any `status` call that acquires the wallet lock.
     snapshots: Mutex<HashMap<String, StatusSnap>>,
+    /// Full viewing key → tokens registered with it, for twin-checkpoint adoption
+    /// (see [`adopt_twin_checkpoint`]). Built in the background at startup, kept
+    /// current by registrations; entries are re-verified against the wallet files
+    /// before use, so staleness only ever costs the fast path, never correctness.
+    fvk_index: Mutex<HashMap<[u8; 96], HashSet<String>>>,
 }
 
 /// Build a status snapshot from a locked wallet entry. Shared by the sync loop and the
@@ -2103,6 +2212,63 @@ impl AppState {
     }
 
     /// Fetch a loaded wallet for a token, loading it from disk on first use.
+    /// Record that `token` is registered with `key`'s viewing key, so later
+    /// registrations of the same wallet on other devices can adopt its checkpoint.
+    async fn index_fvk(&self, token: &str, key: &WalletKey) {
+        if let Some(f) = key.fvk_bytes() {
+            self.fvk_index.lock().await.entry(f).or_default().insert(token.to_string());
+        }
+    }
+
+    /// Try the twin-adoption fast path for a registration of `fvk` under `token`:
+    /// clone the freshest same-key checkpoint another token already scanned. Runs
+    /// the donor verification (argon2 decrypts included) off the async workers.
+    async fn adopt_twin(&self, token: &str, fvk: &[u8; 96], birthday: u64) -> Option<(String, u64)> {
+        let candidates: Vec<String> =
+            self.fvk_index.lock().await.get(fvk).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        if candidates.is_empty() {
+            return None;
+        }
+        // Flush RAM-resident candidates to disk first: the sync loop only rewrites a
+        // live wallet's checkpoint every CHECKPOINT_EVERY blocks, so the file the
+        // clone copies could otherwise lag the donor's actual state by ~17 minutes
+        // of chain — the whole point here is that the second device starts where
+        // the first one IS, not where it was at the last periodic save.
+        {
+            let map = self.wallets.lock().await;
+            let resident: Vec<(String, Wallet)> =
+                candidates.iter().filter_map(|t| map.get(t).map(|w| (t.clone(), w.clone()))).collect();
+            drop(map);
+            for (t, w) in resident {
+                let mut e = w.lock().await;
+                if e.error.is_none()
+                    && save_checkpoint(
+                        &self.wallet_dir,
+                        &t,
+                        &e.genesis,
+                        &e.low,
+                        e.scanned as u64,
+                        &e.db,
+                        &e.boundaries,
+                        e.sink_blue,
+                        e.blind_below,
+                    )
+                    .is_ok()
+                {
+                    e.saved_scanned = e.scanned;
+                    e.force_checkpoint = false;
+                }
+            }
+        }
+        let (dir, genesis, secret) = (self.wallet_dir.clone(), self.genesis, self.wallet_secret.clone());
+        let (token, fvk) = (token.to_string(), *fvk);
+        tokio::task::spawn_blocking(move || {
+            adopt_twin_checkpoint(&dir, &token, &fvk, birthday, &genesis, secret.as_deref(), &candidates)
+        })
+        .await
+        .ok()?
+    }
+
     async fn get_wallet(self: &Arc<Self>, token: &str) -> Option<Wallet> {
         // Mark the wallet active so the sync loop keeps it current; idle wallets are
         // parked (see `sync_loop`).
@@ -2601,7 +2767,7 @@ async fn wallet_create(
     // A brand-new wallet holds no historical funds: birth it at the current tip so
     // it is instantly ready to receive — no full-history scan needed.
     let tip = state.client.get_block_dag_info().await.map(|d| d.virtual_daa_score).unwrap_or(0);
-    load_new_wallet(&state, &token, seed, tip).await?;
+    load_new_wallet(&state, &token, seed, tip, false).await?;
     Ok(Json(CreateResp {
         address,
         seed_hex: hex(&seed),
@@ -2633,7 +2799,7 @@ async fn wallet_import(
     seed.copy_from_slice(&bytes);
     let address =
         state.address_for_seed(&seed).ok_or_else(|| err(StatusCode::BAD_REQUEST, "seed is not a valid Orchard spending key"))?;
-    load_new_wallet(&state, &token, seed, req.birthday).await?;
+    load_new_wallet(&state, &token, seed, req.birthday, true).await?;
     Ok(Json(CreateResp {
         address,
         seed_hex: req.seed_hex,
@@ -2644,29 +2810,60 @@ async fn wallet_import(
 
 /// Persist a new seed for a token and (re)load it into memory, replacing any prior.
 /// `birthday` is the block height the display scan starts from (0 = from genesis).
+/// `adopt_twin`: for an IMPORTED seed, allow cloning a same-key checkpoint another
+/// token already scanned (a freshly created seed cannot have a twin).
 async fn load_new_wallet(
     state: &Arc<AppState>,
     token: &str,
     seed: [u8; 32],
     birthday: u64,
+    adopt_twin: bool,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let key = WalletKey::Seed(seed);
     save_seed(&state.wallet_dir, token, &state.network, &seed, birthday, state.wallet_secret.as_deref())
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
     // Drop any prior scan checkpoint: a (re)imported seed must rescan from its own
     // birthday, not resume a different wallet's stream.
     let _ = std::fs::remove_file(scan_path(&state.wallet_dir, token));
+    // Same-wallet-on-another-device fast path (see wallet_watch): a re-imported seed
+    // whose viewing key some other token already scanned resumes from that
+    // checkpoint instead of rescanning history the daemon already walked.
+    if adopt_twin {
+        if let Some(fvk) = key.fvk_bytes() {
+            if let Some((donor, keep_birthday)) = state.adopt_twin(token, &fvk, birthday).await {
+                if keep_birthday != birthday {
+                    save_seed(&state.wallet_dir, token, &state.network, &seed, keep_birthday, state.wallet_secret.as_deref())
+                        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
+                }
+                state.wallets.lock().await.remove(token);
+                if state.get_wallet(token).await.is_some() {
+                    state.index_fvk(token, &key).await;
+                    log::info!("imported wallet for token {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday})");
+                    return Ok(());
+                }
+                // The clone failed to load — fall back to the honest scan from the
+                // REQUESTED birthday (restore it if the adoption lowered it).
+                let _ = std::fs::remove_file(scan_path(&state.wallet_dir, token));
+                if keep_birthday != birthday {
+                    save_seed(&state.wallet_dir, token, &state.network, &seed, birthday, state.wallet_secret.as_deref())
+                        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
+                }
+            }
+        }
+    }
     // Fast-sync from the node's frontier when the wallet is born after the
     // checkpoint (complete by construction); otherwise the pruning-point full scan.
     // History starts OFF (opt-in) — must match what `save_seed` just wrote, or
     // the in-memory entry records rows the user never consented to.
-    let entry = match state.fast_sync_entry(WalletKey::Seed(seed), false, state.genesis, birthday).await {
+    let entry = match state.fast_sync_entry(key, false, state.genesis, birthday).await {
         Some(e) => e,
         None => state
-            .full_scan_entry(WalletKey::Seed(seed), false, state.genesis, birthday)
+            .full_scan_entry(key, false, state.genesis, birthday)
             .await
             .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "cannot anchor a full scan (node unreachable or too old)"))?,
     };
     state.wallets.lock().await.insert(token.to_string(), Arc::new(Mutex::new(entry)));
+    state.index_fvk(token, &key).await;
     Ok(())
 }
 
@@ -2767,11 +2964,27 @@ async fn wallet_watch(
         return Ok(Json(AddressResp { address }));
     }
 
+    // A new or changed key must not resume a DIFFERENT key's checkpoint stream.
+    let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
+    // Same-wallet-on-another-device fast path: if any other token here has already
+    // scanned this exact viewing key, clone its checkpoint — the second device is
+    // synced immediately instead of rescanning history the daemon already walked.
+    if let Some((donor, keep_birthday)) = state.adopt_twin(&token, &fvk, req.birthday).await {
+        save_fvk(&state.wallet_dir, &token, &state.network, &fvk, keep_birthday)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
+        state.wallets.lock().await.remove(&token);
+        if state.get_wallet(&token).await.is_some() {
+            state.index_fvk(&token, &key).await;
+            log::info!(
+                "registered watch-only wallet for token {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday})"
+            );
+            return Ok(Json(AddressResp { address }));
+        }
+        // The clone failed to load (corrupt donor file, node hiccup) — scan honestly.
+        let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
+    }
     save_fvk(&state.wallet_dir, &token, &state.network, &fvk, req.birthday)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
-    // A new or changed key must rescan from its own birthday, not resume another
-    // wallet's checkpoint stream.
-    let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
     // History starts OFF (opt-in), matching what `save_fvk` just wrote.
     let entry = match state.fast_sync_entry(key, false, state.genesis, req.birthday).await {
         Some(e) => e,
@@ -2781,6 +2994,7 @@ async fn wallet_watch(
             .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "cannot anchor a full scan (node unreachable or too old)"))?,
     };
     state.wallets.lock().await.insert(token.clone(), Arc::new(Mutex::new(entry)));
+    state.index_fvk(&token, &WalletKey::Fvk(fvk)).await;
     log::info!("registered watch-only wallet for token {token} (birthday {})", req.birthday);
     Ok(Json(AddressResp { address }))
 }
@@ -4021,7 +4235,32 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         node_tip: Mutex::new((0, std::time::Instant::now())),
         prepared: Mutex::new(HashMap::new()),
         snapshots: Mutex::new(HashMap::new()),
+        fvk_index: Mutex::new(HashMap::new()),
     });
+
+    // Index every existing wallet's viewing key in the background (argon2 per
+    // encrypted seed file — a blocking thread, not the startup path), then MERGE
+    // into the live index so registrations that landed while it built survive.
+    // Until it finishes, adoption just misses and a restore scans as before.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let (dir, secret) = (state.wallet_dir.clone(), state.wallet_secret.clone());
+            let started = std::time::Instant::now();
+            if let Ok(map) = tokio::task::spawn_blocking(move || build_fvk_index(&dir, secret.as_deref())).await {
+                let mut idx = state.fvk_index.lock().await;
+                let wallets = map.values().map(|s| s.len()).sum::<usize>();
+                for (k, tokens) in map {
+                    idx.entry(k).or_default().extend(tokens);
+                }
+                log::info!(
+                    "viewing-key index ready: {} keys / {wallets} wallets in {:.1?} (twin-checkpoint adoption armed)",
+                    idx.len(),
+                    started.elapsed()
+                );
+            }
+        });
+    }
 
     let sync_task = tokio::spawn(sync_loop(state.clone()));
     // Unmined payments — the instant-payment path. Separate from sync_loop on purpose
@@ -4195,6 +4434,72 @@ mod sdk_api_tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&dir2).ok();
         std::fs::remove_dir_all(&dir3).ok();
+    }
+
+    /// "Enter the seed on a second device → synced at once": a registration whose
+    /// viewing key another token already scanned must clone that checkpoint, and
+    /// the clone must parse under EITHER key form (the desktop imported the seed;
+    /// the phone registers only the FVK — same wallet, same checkpoint).
+    #[test]
+    fn twin_checkpoint_adoption_clones_and_verifies() {
+        let tmp = std::env::temp_dir().join(format!("zkas-adopt-test-{}", std::process::id()));
+        let dir = tmp.to_string_lossy().to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let genesis = RpcHash::from_bytes([7u8; 32]);
+        let seed = [0x5au8; 32];
+        let db = WalletDb::from_seed(seed).expect("valid seed");
+        let fvk = db.fvk().to_bytes();
+
+        // Donor: a seed wallet with a persisted, complete-view checkpoint.
+        save_seed(&dir, "donor", "mainnet", &seed, 4242, None).unwrap();
+        let boundaries: VecDeque<(u64, u64)> = VecDeque::from([(100, 0)]);
+        save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 0).unwrap();
+
+        // The index build finds the donor by viewing key.
+        let index = build_fvk_index(&dir, None);
+        assert_eq!(index.get(&fvk).map(|s| s.contains("donor")), Some(true), "index must find the donor by FVK");
+        let candidates: Vec<String> = index.get(&fvk).unwrap().iter().cloned().collect();
+
+        // A fresh FVK registration adopts the donor's checkpoint, keeping the
+        // EARLIER birthday so a later cold rescan can't skip either wallet's notes.
+        let (donor, birthday) =
+            adopt_twin_checkpoint(&dir, "phone", &fvk, 9999, &genesis, None, &candidates).expect("must adopt");
+        assert_eq!(donor, "donor");
+        assert_eq!(birthday, 4242, "keeps the earlier of donor/requested birthdays");
+        let restored = load_checkpoint(&dir, "phone", WalletKey::Fvk(fvk), &genesis, None)
+            .expect("clone parses under the FVK key form");
+        assert_eq!(restored.2, 777, "scanned-block cursor survives the clone");
+
+        // A DIFFERENT key must never adopt, however many donors exist.
+        let other = WalletDb::from_seed([0x33u8; 32]).unwrap().fvk().to_bytes();
+        assert!(
+            adopt_twin_checkpoint(&dir, "other", &other, 0, &genesis, None, &candidates).is_none(),
+            "foreign viewing key must not clone someone else's checkpoint"
+        );
+
+        // A donor that is BLIND below its fast-sync base must not serve a
+        // birthday-0 restore (which asked for the complete history)...
+        save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 555).unwrap();
+        std::fs::remove_file(scan_path(&dir, "phone")).unwrap();
+        assert!(
+            adopt_twin_checkpoint(&dir, "phone", &fvk, 0, &genesis, None, &candidates).is_none(),
+            "a blind donor must not answer a full-history restore"
+        );
+        // ...but may serve a restore that asked for the same-or-later birthday.
+        assert!(
+            adopt_twin_checkpoint(&dir, "phone", &fvk, 5000, &genesis, None, &candidates).is_some(),
+            "a blind donor is fine for a restore born at/after the donor"
+        );
+
+        // A wrong-genesis (relaunched-chain) checkpoint must never be adopted.
+        std::fs::remove_file(scan_path(&dir, "phone")).unwrap();
+        assert!(
+            adopt_twin_checkpoint(&dir, "phone", &fvk, 9999, &RpcHash::from_bytes([8u8; 32]), None, &candidates).is_none(),
+            "checkpoint for another chain must not be adopted"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The SDK republishes this daemon's timing constants and genesis so that
