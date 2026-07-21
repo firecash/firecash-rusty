@@ -9,4 +9,5 @@ used by privacy-coin gateways, adapted to Orchard and Kaspa BlockDAG finality.
 - `service/` — runnable HTTP API, checkout, wallet observer, persistence, and webhooks.
 - `integrations/woocommerce/` — WooCommerce payment method.
 - `integrations/web/` — generic browser checkout launcher.
+- `docs/INTEGRATION.md` — short merchant integration guide and API flow.
 - `docs/STATUS.md` — implemented scope and hosted-production hardening work.

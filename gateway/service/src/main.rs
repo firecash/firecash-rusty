@@ -111,7 +111,10 @@ async fn checkout(State(state): State<AppState>, AxumPath(id): AxumPath<String>)
     let invoice = state.gateway.lock().ok().and_then(|gateway| gateway.invoice(&id).cloned());
     let Some(invoice) = invoice else { return (StatusCode::NOT_FOUND, Html(String::from("invoice not found"))).into_response() };
     let amount = format_units(invoice.amount_sompi);
-    let payment_uri = format!("{}?amount={}", invoice.address, invoice.amount_sompi);
+    // The wallet parses `?amount=` as a DECIMAL ZKAS coin value (e.g. `1.5`), not
+    // sompi — encoding raw sompi here made the payer's wallet prefill a
+    // 100,000,000x overpayment. Use the same decimal string we display.
+    let payment_uri = format!("{}?amount={}", invoice.address, amount);
     let qr = QrCode::new(payment_uri.as_bytes())
         .map(|code| code.render::<svg::Color>().min_dimensions(220, 220).build())
         .unwrap_or_default();
@@ -172,7 +175,32 @@ async fn observer(state: AppState) {
     }
 }
 
+/// The node's current virtual DAA score, via walletd `/api/status`. This is the
+/// confirmation reference: an invoice is `Confirmed` only once the tip is
+/// `required_blue_score` DAA beyond the paying transaction. Walletd's history
+/// exposes each payment's DAA score (not its blue score), so confirmations are
+/// measured in selected-chain DAA depth — monotonic and reorg-safe.
+async fn node_tip_daa(state: &AppState) -> Result<u64, String> {
+    let response = state
+        .http
+        .get(format!("{}/api/status", state.config.walletd_url.trim_end_matches('/')))
+        .header("x-wallet-token", &state.config.wallet_token)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("walletd status returned {}", response.status()));
+    }
+    let body: Value = response.json().await.map_err(|error| error.to_string())?;
+    body.get("daa_score").and_then(Value::as_u64).ok_or_else(|| "walletd status missing daa_score".to_string())
+}
+
 async fn poll_wallet(state: &AppState) -> Result<(), String> {
+    // Fetch the tip first: without a real reference every payment would confirm
+    // instantly (the old code fabricated `daa + 10_000` / `u64::MAX` as the
+    // sink), so a merchant would treat a 0-conf payment as final. On a failed
+    // fetch we skip this cycle rather than over-confirm.
+    let tip_daa = node_tip_daa(state).await?;
     let response = state
         .http
         .get(format!("{}/api/wallet/history?limit=5000", state.config.walletd_url.trim_end_matches('/')))
@@ -205,11 +233,13 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
                 .or_else(|| row.get("amountSompi").and_then(Value::as_u64))
                 .unwrap_or(0);
             let daa = row.get("daaScore").and_then(Value::as_u64).unwrap_or(0);
-            if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, daa.saturating_add(10_000), now()) {
+            if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, now()) {
                 events.push(event);
             }
         }
-        for event in gateway.advance(now(), u64::MAX) {
+        // Re-evaluate open invoices against the current tip so Paid -> Confirmed
+        // fires as depth accrues, and unpaid invoices expire.
+        for event in gateway.advance(now(), tip_daa) {
             events.push(event);
         }
         persist(&state.config.state_file, &gateway.snapshot())?;

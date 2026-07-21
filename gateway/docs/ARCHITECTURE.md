@@ -33,9 +33,12 @@ new -> partial -> paid -> confirmed
 ```
 
 `paid` means sufficient value was detected. `confirmed` means each contributing
-payment is the configured blue-score distance behind the BlockDAG sink. Hosted
-walletd already reports settled history behind its safety margin, so its observer
-can confirm immediately after reconciliation.
+payment is at least the configured confirmation distance behind the current tip.
+The observer reads the node's virtual DAA score from walletd `/api/status` and
+each payment's DAA score from history, so confirmation depth is measured in
+selected-chain DAA (walletd exposes DAA, not blue score) — an invoice reaches
+`confirmed` only once the tip advances `requiredBlueScore` beyond the paying
+transaction, never instantly on first sight.
 
 ## API
 

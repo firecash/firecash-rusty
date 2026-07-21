@@ -7,7 +7,9 @@
 - Watch-only FVK operation; no spending keys.
 - Exact integer amounts, invoice expiry, partial payments, overpayments,
   idempotent creation, and duplicate-payment protection.
-- BlockDAG blue-score confirmation policy.
+- Confirmation policy by selected-chain depth: an invoice confirms only once the
+  node's virtual DAA score (from walletd `/api/status`) is `requiredBlueScore`
+  beyond each paying transaction's DAA score — never instantly on first sight.
 - Persistent snapshots with restart-safe invoice/address/payment indexes.
 - Timestamped HMAC webhook signing and verification.
 - Runnable hosted/self-hosted HTTP service.
