@@ -815,6 +815,33 @@ async fn sanity_test() {
                     rpc_client.stop_notify(id, PruningPointUtxoSetOverrideScope {}.into()).await.unwrap();
                 })
             }
+
+            KaspadPayloadOps::GetShieldedTreeState => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    // Default checkpoint (finality point). This simnet harness is
+                    // transparent-coinbase, so no notes are ever minted and the
+                    // frontier is the empty tree.
+                    let response =
+                        rpc_client.get_shielded_tree_state_call(None, GetShieldedTreeStateRequest { block_hash: None }).await.unwrap();
+                    assert_eq!(response.size, 0, "transparent-coinbase simnet must have an empty shielded tree");
+                })
+            }
+
+            KaspadPayloadOps::GetShieldedBlocks => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    // Resume from genesis (a known, canonical chain block): the call
+                    // succeeds and reports the cursor as on-chain (not reorged). Block
+                    // count depends on how many blocks the harness has mined, so only
+                    // the reorg flag is asserted.
+                    let response = rpc_client
+                        .get_shielded_blocks_call(None, GetShieldedBlocksRequest { start_hash: SIMNET_GENESIS.hash, limit: 0 })
+                        .await
+                        .unwrap();
+                    assert!(!response.reorged, "genesis cursor must not be reported as reorged");
+                })
+            }
         };
         tasks.push(task);
     }
