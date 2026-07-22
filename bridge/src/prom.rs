@@ -1577,14 +1577,14 @@ mod tests {
         std::fs::write(
             &config_path,
             r#"
-kaspad_address: "127.0.0.1:16110"
+kaspad_address: "127.0.0.1:16810"
 stratum_port: ":5555"
 min_share_diff: 8192
 "#,
         )
         .unwrap();
 
-        set_web_status_config("127.0.0.1:16110".to_string(), 2);
+        set_web_status_config("127.0.0.1:16810".to_string(), 2);
 
         let mode = HttpMode::Instance { instance_id: "0".to_string(), web_bind: "127.0.0.1:0".to_string() };
 

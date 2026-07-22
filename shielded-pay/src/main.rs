@@ -34,13 +34,14 @@ use kaspa_addresses::{Address, Prefix, Version};
 use kaspa_consensus_core::tx::{Transaction, TX_VERSION_SHIELDED};
 use kaspa_grpc_client::GrpcClient;
 use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode, RpcHash, RpcShieldedChainBlock, RpcTransaction};
-use kaspa_shielded_core::bundle::{expected_wire_len, ShieldedBundle};
+use kaspa_shielded_core::bundle::expected_wire_len;
 use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::coinbase::derive_coinbase_note_desc;
 use kaspa_shielded_core::message::{sign_message, verify_message, FVK_LEN, SIG_LEN};
 use kaspa_shielded_core::orchard_recipient_bytes;
 use kaspa_shielded_core::wallet::build::{build_singleleaf_coinbase_spend, build_wallet_payment};
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
+use kaspa_shielded_core::wallet::CompactActionRecord;
 use kaspa_shielded_core::walletdb::WalletDb;
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 
@@ -87,7 +88,7 @@ enum Cmd {
     /// note having matured past `shielded_anchor_depth` (~10 min at 10 BPS).
     Info {
         /// kaspad gRPC endpoint (host:port).
-        #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
+        #[arg(short = 's', long, default_value = "127.0.0.1:16810")]
         rpc_server: String,
     },
     /// List the transaction ids currently in the node's mempool (transaction pool).
@@ -95,7 +96,7 @@ enum Cmd {
     /// the mempool).
     Mempool {
         /// kaspad gRPC endpoint (host:port).
-        #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
+        #[arg(short = 's', long, default_value = "127.0.0.1:16810")]
         rpc_server: String,
     },
     /// Scan the whole accepted chain, discover every note owned by the wallet seed,
@@ -105,7 +106,7 @@ enum Cmd {
     /// just the first coinbase.
     Balance {
         /// kaspad gRPC endpoint (host:port).
-        #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
+        #[arg(short = 's', long, default_value = "127.0.0.1:16810")]
         rpc_server: String,
         /// Real 32-byte wallet seed as 64 hex chars.
         #[arg(long)]
@@ -120,7 +121,7 @@ enum Cmd {
     /// deep, so the note must be at least that old.
     Send {
         /// kaspad gRPC endpoint (host:port).
-        #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
+        #[arg(short = 's', long, default_value = "127.0.0.1:16810")]
         rpc_server: String,
         /// Real 32-byte sender seed as 64 hex chars.
         #[arg(long)]
@@ -177,7 +178,7 @@ enum Cmd {
     /// and pay it to `--to`, submitting the shielded transaction over gRPC.
     Pay {
         /// kaspad gRPC endpoint (host:port).
-        #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
+        #[arg(short = 's', long, default_value = "127.0.0.1:16810")]
         rpc_server: String,
         /// Real 32-byte owner seed as 64 hex chars.
         #[arg(long)]
@@ -461,9 +462,19 @@ fn ingest_shielded_chain_block(db: &mut WalletDb, blk: &RpcShieldedChainBlock) {
             coinbase_notes.push((derive_coinbase_note_desc(recipient, &note_seed), out.value));
         }
     }
-    let bundles: Vec<ShieldedBundle> = blk.accepted_bundles.iter().filter_map(|p| ShieldedBundle::from_bytes(p).ok()).collect();
-    let bundle_refs: Vec<&ShieldedBundle> = bundles.iter().collect();
-    db.ingest_block(&coinbase_notes, &bundle_refs);
+    // The node serves the compact scan archive (`accepted_actions`): concatenated
+    // 148-byte records per accepted tx. Chunk each and ingest via the compact path.
+    let compact: Vec<Vec<CompactActionRecord>> = blk
+        .accepted_actions
+        .iter()
+        .filter_map(|b| {
+            if b.len() % CompactActionRecord::SERIALIZED_LEN != 0 {
+                return None;
+            }
+            b.chunks_exact(CompactActionRecord::SERIALIZED_LEN).map(CompactActionRecord::from_bytes).collect()
+        })
+        .collect();
+    db.ingest_block_compact_with_meta(&coinbase_notes, &compact, None);
 }
 
 /// The shielded sighash **network domain**: the chain's genesis hash — what

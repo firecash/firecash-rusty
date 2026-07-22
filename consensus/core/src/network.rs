@@ -39,30 +39,35 @@ pub enum NetworkType {
 }
 
 impl NetworkType {
+    // ZKas port scheme: distinct from Kaspa's (16110-16611 / 17110-17610 / 18110-18610)
+    // so a ZKas node and a real Kaspa node (the merged-mining parent) can run on the
+    // same host with no flag overrides and never contend for a port. We use the "8"
+    // block (168xx rpc / 178xx borsh / 188xx json), which Kaspa uses on no network,
+    // keeping the familiar kaspad 16xxx family while being unambiguously ZKas.
     pub fn default_rpc_port(&self) -> u16 {
         match self {
-            NetworkType::Mainnet => 16110,
-            NetworkType::Testnet => 16210,
-            NetworkType::Simnet => 16510,
-            NetworkType::Devnet => 16610,
+            NetworkType::Mainnet => 16810,
+            NetworkType::Testnet => 16820,
+            NetworkType::Simnet => 16850,
+            NetworkType::Devnet => 16860,
         }
     }
 
     pub fn default_borsh_rpc_port(&self) -> u16 {
         match self {
-            NetworkType::Mainnet => 17110,
-            NetworkType::Testnet => 17210,
-            NetworkType::Simnet => 17510,
-            NetworkType::Devnet => 17610,
+            NetworkType::Mainnet => 17810,
+            NetworkType::Testnet => 17820,
+            NetworkType::Simnet => 17850,
+            NetworkType::Devnet => 17860,
         }
     }
 
     pub fn default_json_rpc_port(&self) -> u16 {
         match self {
-            NetworkType::Mainnet => 18110,
-            NetworkType::Testnet => 18210,
-            NetworkType::Simnet => 18510,
-            NetworkType::Devnet => 18610,
+            NetworkType::Mainnet => 18810,
+            NetworkType::Testnet => 18820,
+            NetworkType::Simnet => 18850,
+            NetworkType::Devnet => 18860,
         }
     }
 
@@ -243,15 +248,16 @@ impl NetworkId {
         // hence avoiding repeatedly failing P2P handshakes between nodes on different networks. RPC does not have
         // this reasoning so we keep it on the same port in order to simplify RPC client management (hence [`default_rpc_port`]
         // is defined on the [`NetworkType`] struct
+        // ZKas P2P = rpc + 1, in the distinct "8" block (see `default_rpc_port`).
         match self.network_type {
-            NetworkType::Mainnet => 16111,
+            NetworkType::Mainnet => 16811,
             NetworkType::Testnet => match self.suffix {
-                Some(10) => 16211,
-                Some(12) => 16311,
-                None | Some(_) => 16411,
+                Some(10) => 16821,
+                Some(12) => 16831,
+                None | Some(_) => 16841,
             },
-            NetworkType::Simnet => 16511,
-            NetworkType::Devnet => 16611,
+            NetworkType::Simnet => 16851,
+            NetworkType::Devnet => 16861,
         }
     }
 

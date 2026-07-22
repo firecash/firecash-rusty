@@ -28,7 +28,7 @@ use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode};
 #[command(name = "zkas-miner", about = "Standalone CPU miner for the ZKas network (kHeavyHash PoW)")]
 struct Args {
     /// kaspad gRPC endpoint (host:port).
-    #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
+    #[arg(short = 's', long, default_value = "127.0.0.1:16810")]
     rpc_server: String,
 
     /// The `zkas:` shielded address the block reward is paid to.

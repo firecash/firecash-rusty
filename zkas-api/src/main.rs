@@ -55,7 +55,7 @@ const TX_INDEX_CAP: usize = 1_000_000;
 #[command(name = "zkas-api", about = "ZKas explorer backend (gRPC → REST)")]
 struct Cli {
     /// kaspad (ZKas) gRPC endpoint.
-    #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
+    #[arg(short = 's', long, default_value = "127.0.0.1:16810")]
     rpc_server: String,
     /// Address to serve the HTTP API on.
     #[arg(short = 'l', long, default_value = "127.0.0.1:8500")]

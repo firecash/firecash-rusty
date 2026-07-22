@@ -10,7 +10,7 @@ use zkas_walletd::{Config, default_wallet_dir, serve};
 #[command(name = "zkas-walletd", about = "ZKas shielded wallet daemon (self-hosted or hosted)")]
 struct Cli {
     /// ZKas node gRPC endpoint (host:port). In hosted mode, a public node.
-    #[arg(short = 's', long, default_value = "127.0.0.1:16110")]
+    #[arg(short = 's', long, default_value = "127.0.0.1:16810")]
     rpc_server: String,
     /// Address:port to serve the wallet REST API on. Loopback by default.
     #[arg(short = 'l', long, default_value = "127.0.0.1:8501")]
