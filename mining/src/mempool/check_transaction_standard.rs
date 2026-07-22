@@ -40,7 +40,24 @@ impl Mempool {
     /// MAXIMUM_STANDARD_TRANSACTION_MASS_PRE_TOCCATA, STANDARD_MASS_RELAXATION_WINDOW_SECONDS and the
     /// cap checks in `check_transaction_standard_in_isolation`/`_in_context`. The block-fit limits in
     /// check_transaction_limits then remain the only per-tx mass ceiling.
-    fn standard_transaction_mass_cap(&self, virtual_daa_score: u64) -> Option<u64> {
+    fn standard_transaction_mass_cap(&self, transaction: &MutableTransaction, virtual_daa_score: u64) -> Option<u64> {
+        // Shielded transactions are our intentionally heavy class: an Orchard bundle
+        // carries ~3.2 KB/action (mostly the Halo2 proof), so the 100 KB pre-Toccata
+        // standard cap limits a shielded spend to just 6 notes — a hard value ceiling of
+        // ~6 × block-subsidy that shattered ordinary payments into many sequential
+        // proofs. That cap exists only to stop updated nodes relaying txs un-updated
+        // peers would drop; on a fresh-genesis network every node ships this binary, so
+        // for shielded txs we drop the artificial sub-block cap and let the block-fit
+        // limits (enforced below and by the block selector) be the only per-tx ceiling
+        // — raising a shielded spend from 6 to ~38 notes. Transparent txs keep the
+        // unchanged pre-Toccata cap so the upstream standardness/relaxation mechanic and
+        // its tests are untouched.
+        if transaction.tx.is_shielded() {
+            // The block mass limit at this score (pre-Toccata: the shared prior limit).
+            // A shielded tx over this could never be mined, so it must still be bounded.
+            let limits = self.config.mempool_block_mass_limits.get(virtual_daa_score);
+            return Some(limits.compute.min(limits.transient).min(limits.storage));
+        }
         let window = STANDARD_MASS_RELAXATION_WINDOW_SECONDS.saturating_mul(self.config.network_blocks_per_second);
         let relaxation = self.toccata_activation.early_by(window);
         (!relaxation.is_active(virtual_daa_score)).then_some(MAXIMUM_STANDARD_TRANSACTION_MASS_PRE_TOCCATA)
@@ -55,7 +72,7 @@ impl Mempool {
 
         // Until shortly before Toccata activates, keep the legacy per-tx standard mass cap on the
         // non-contextual dimensions so updated nodes don't relay transactions that peers still reject.
-        if let Some(cap) = self.standard_transaction_mass_cap(virtual_daa_score) {
+        if let Some(cap) = self.standard_transaction_mass_cap(transaction, virtual_daa_score) {
             let masses = transaction.calculated_non_contextual_masses.unwrap();
             if masses.compute_mass > cap {
                 return Err(NonStandardError::RejectComputeMass(transaction_id, masses.compute_mass, cap));
@@ -95,7 +112,7 @@ impl Mempool {
         let transaction_id = transaction.id();
 
         // Storage mass is only known after contextual population, so the standard mass cap is applied to it here.
-        if let Some(cap) = self.standard_transaction_mass_cap(virtual_daa_score) {
+        if let Some(cap) = self.standard_transaction_mass_cap(transaction, virtual_daa_score) {
             let storage_mass = transaction.tx.storage_mass();
             if storage_mass > cap {
                 return Err(NonStandardError::RejectStorageMass(transaction_id, storage_mass, cap));

@@ -3,8 +3,14 @@
 use kaspa_shielded_core::bundle::expected_wire_len;
 use serde::{Deserialize, Serialize};
 
-/// Mempool standard transaction mass limit, per mass dimension.
-pub const STANDARD_TX_MASS_CAP: u64 = 100_000;
+/// Per-dimension mass ceiling a shielded transaction must fit under to be relayed
+/// and mined. This mirrors the node's shielded standardness cap
+/// (`check_transaction_standard.rs`): shielded transactions are exempt from the
+/// 100 KB pre-Toccata standard cap and bounded only by the block mass limit, so a
+/// single payment can spend up to ~38 notes instead of 6. MUST stay equal to the
+/// node's block mass limit — if that param changes, this must follow, or the wallet
+/// plans transactions the node rejects (too high) or under-packs them (too low).
+pub const STANDARD_TX_MASS_CAP: u64 = 500_000;
 /// Transient mass charged per serialized byte.
 pub const TRANSIENT_BYTE_TO_MASS_FACTOR: u64 = 4;
 /// Conservative transaction envelope allowance for the standard-mass limit.
@@ -152,8 +158,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mass_limit_currently_allows_six_spends() {
-        assert_eq!(max_spends_per_tx(), 6);
+    fn block_limit_allows_thirty_eight_spends() {
+        // With the shielded cap raised to the block mass limit (500 KB), a single
+        // payment spends up to 38 notes instead of 6 — a 6x lift in value-per-tx that
+        // stops ordinary payments from shattering into many sequential-proof chunks.
+        assert_eq!(max_spends_per_tx(), 38);
+        // Sanity: a 38-spend bundle's transient mass stays within the 500 KB block
+        // limit (the physical ceiling), so the wallet never plans an unmineable tx.
+        let transient = (expected_wire_len(38) as u64 + 94) * TRANSIENT_BYTE_TO_MASS_FACTOR;
+        assert!(transient <= STANDARD_TX_MASS_CAP, "38-spend transient {transient} exceeds cap {STANDARD_TX_MASS_CAP}");
     }
 
     #[test]
