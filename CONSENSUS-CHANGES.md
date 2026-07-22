@@ -1,8 +1,40 @@
 # ZKas — Consensus Changes & Pre-Mainnet Reset Plan
 
 _Last updated: 2026-07-22_
-_Working branch: `ibd-shielded-import` @ `db41527` (origin/zkas-rusty)_
+_Working branch: `ibd-shielded-import` @ `1650f35` (origin/zkas-rusty; repo renamed from firecash-rusty)_
 _Live node currently runs the rollback build `fca5229` (VPS1) / `fb64afe` (VPS2) — **NOT** the reset bundle._
+
+---
+
+## ⭐ STATUS AT A GLANCE — what's done, what's left
+
+**The plan:** bundle every consensus-breaking change into ONE new-genesis reset, prove it, lock genesis, relaunch. All heavy builds on VPS3; nothing deployed to the live node yet.
+
+### ✅ DONE + tested (in the reset bundle)
+| Item | What | Verified |
+|------|------|----------|
+| **#1** | Pruning/IBD shielded-state import (the biggest blocker) | ✅ two-node e2e test green on VPS3 |
+| **#4** | Shielded permanent-state pricing (per-action mass) | ✅ mass tests green |
+| **#4b** | Spend cap 6 → 38 notes/tx (fixes "can't send a few thousand zkas") | ✅ engine+mempool tests green |
+| **#9a** | Emission tail floor 3 → 0.6 zkas/block (~2.2% infl. at onset, decaying) | ✅ coinbase tests green |
+| **F-10** | AuxPoW pruning-proof level (already aux-aware everywhere) | ✅ verified |
+| **#3** | merged_mining_activation = `always()` (launch value, decided) | ✅ no code change |
+| **Rename** | Full firecash→zkas incl. WIRE IDENTITY (16B personals, FCMM→ZKMM, genesis re-cut + all 8 hashes recomputed) | ✅ genesis+auxpow+shielded(90) green |
+| _prior_ | F-01 inflation fix, #24 state commitment, #29/#31 anchor finality, nullifier MuHash, turnstile, 512-action cap, circuit guard, replay protection | ✅ |
+
+### 🔨 REMAINING before genesis lock (priority order)
+1. **Compact shielded scan-archive** (subsumes #7 + smart pruning + the **launch-fatal receive-bug fix**). Foundation DONE + Halo2-tested (`CompactActionRecord`, `scan_compact`, commit `3ef75a9`). Left: consensus store + persist-at-commit + serve from `GetShieldedBlocks` + wallet compact-ingest + pruning-processor retention. See `shielded-pruning-compact-archive`.
+2. **#9 Finalize the genesis-block subsidy** — the pre-existing `WrongSubsidy` failure in `body_validation_in_context` (genesis subsidy value, separate from the tail #9a). Must set + update the test.
+3. **#6 Genesis difficulty retune** — genesis `bits = 0x1e7fffff` (diff 65,536) is ~1.1e9× too easy vs the live merged-mining equilibrium (~7.5e13); the CPU low-difficulty ramp is wrong for a merge-mined-from-genesis launch. Recommendation: set `bits` to the live equilibrium + `low_difficulty_start_blocks = 0`.
+4. **Reset execution** — regen genesis with the full bundle, cut the binary, relaunch order **node → wallets/walletd → pool/bridge**.
+
+### ↪️ OUT of the reset (ship as ordinary patches, not fork-gated)
+- **#5 reorg crash-consistency** — not consensus-breaking; the compact-archive store (written in the commit batch) gives it for free on scan data.
+- **Receive bug** — root cause identified (RPC re-derives the applied set → drifts once source blocks prune); the fix IS the compact scan-archive store (#1 remaining above).
+
+### 🔑 Two decisions still needed from the operator
+- **#9 emission:** final genesis-block subsidy value (tail is settled at 0.6/block).
+- **#11 audit:** independent circuit/integration audit — launch with it, or accept the risk in writing.
 
 ---
 
@@ -153,6 +185,23 @@ which is wallet-engine-only, ships anytime, NOT reset-gated (follow-up, not done
 standardness + the untouched `toccata_transient_mass_activation_tests`, mining build — all
 EXIT 0. Note: this is mempool/relay policy (not block validity), but it must ship uniformly
 → belongs in the reset binary. Consensus-adjacent, reset-bundle.
+
+### Rebrand — full firecash → zkas incl. wire identity ✅ DONE + tested (this session, `1650f35`)
+
+The 2026-07-14 rebrand left wire-identity strings as `firecash-` because the chain was live;
+the reset re-cuts genesis, so they are now free to change and were changed:
+- **5 fixed-size (16B) blake2b personals** (byte-exact): sighash, state-root, coinbase-rho,
+  coinbase-seed, msg-sig → `zkas_*`.
+- **Merged-mining magic `FCMM` → `ZKMM`** (`auxpow.rs`; the pool bridge inherits it via the
+  consensus-core git dep — repointed to `firecash/zkas-rusty`).
+- **Genesis coinbase tags** `firecash-*` → `zkas-*` on all 4 networks; **all 8 hashes
+  (merkle_root + block hash) recomputed** (2-pass) — `test_genesis_hashes` green. _(These
+  hashes are interim — genesis is recut again at reset with final emission/difficulty.)_
+- Network id emits `zkas-`; legacy `firecash-` still decodes.
+- **Deliberately kept** (invisible infra / legacy compat): `firecash:` address decode +
+  `FIRECASH_*` env fallbacks; the `firecash_signer` WASM module name (deploy-coupled rename).
+- **Verified VPS3:** genesis ✅, auxpow/ZKMM ✅, shielded-core **90 passed / 0 failed** (personals
+  recompute consistent). GitHub repos all renamed `zkas-*` (auto-redirects). See `zkas-full-rename`.
 
 ### #3 — Merged-mining activation (decided, no code change)
 
