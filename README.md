@@ -1,4 +1,4 @@
-# ZKas — `zkas-rusty` (rebranded from ZKas 2026-07-14)
+# ZKas — `zkas-rusty`
 
 > **⚠️ TESTNET — this is a live test network. Coins have no value, the chain may be
 > reset without notice, and consensus parameters can still change. Do not treat ZKAS
