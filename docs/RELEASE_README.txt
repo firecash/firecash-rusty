@@ -38,9 +38,9 @@ low-difficulty mining, not competitive hashrate.
 -------------------------------------------------------------------------------
   - CLI:    shielded-pay  (in this archive)
   - Web:    https://wallet.zkas.info   (also has on-device "Local" tools)
-  - Paper:  https://firecash.github.io/firecash-paper-wallet/  — an OFFLINE,
+  - Paper:  https://zkas.info/paper-wallet.html  — an OFFLINE,
             single-file cold-storage wallet. Save it, go offline, generate.
-            Source: github.com/firecash/firecash-paper-wallet
+            Source: github.com/firecash/zkas-paper-wallet
 
 Quick start:
   ./kaspad --utxoindex
