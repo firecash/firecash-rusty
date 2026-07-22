@@ -1,4 +1,4 @@
-# ZKas — `firecash-rusty` (rebranded from ZKas 2026-07-14)
+# ZKas — `zkas-rusty` (rebranded from ZKas 2026-07-14)
 
 > **⚠️ TESTNET — this is a live test network. Coins have no value, the chain may be
 > reset without notice, and consensus parameters can still change. Do not treat ZKAS
@@ -44,7 +44,7 @@ the wallet daemon, and the explorer API.
 | `zkas-api` | `zkas-api` | explorer REST backend (gRPC → REST) |
 
 Companion repos: **firecash-pool** (stratum bridge — ASIC mining), **firecash-explorer**
-(SPA), **firecash-wallet** (web wallet SPA), **firecash-website**.
+(SPA), **zkas-wallet** (web wallet SPA), **firecash-website**.
 
 ## Requirements
 
@@ -73,8 +73,8 @@ source "$HOME/.cargo/env"
 
 **3. Clone & compile** (release profile — optimized binaries land in `target/release/`)
 ```bash
-git clone https://github.com/firecash/firecash-rusty.git
-cd firecash-rusty
+git clone https://github.com/firecash/zkas-rusty.git
+cd zkas-rusty
 # all node-side binaries at once:
 cargo build --release -p kaspad -p miner -p zkas-walletd -p zkas-api
 # or the whole workspace:
@@ -85,7 +85,7 @@ First build downloads and compiles all dependencies (RocksDB, Halo 2, etc.) and 
 
 ## Run a node & join the network
 
-Grab the binaries from the latest [Release](https://github.com/firecash/firecash-rusty/releases)
+Grab the binaries from the latest [Release](https://github.com/firecash/zkas-rusty/releases)
 (or build from source, below), then run a node that syncs from the ZKas seed nodes:
 
 ```bash
@@ -111,7 +111,7 @@ Everything is on the **shielded (Orchard) pool** — balances and amounts are pr
 
 - **Web & mobile wallet (easiest):** https://wallet.zkas.info — no install; also
   packaged as a native iOS/Android app (Capacitor). See
-  [firecash-wallet](https://github.com/firecash/firecash-wallet) / its `MOBILE.md`.
+  [zkas-wallet](https://github.com/firecash/zkas-wallet) / its `MOBILE.md`.
 
   > **Custody:** in the default hosted mode the daemon holds the seed and *can* spend.
   > Orchard splits a spend into **prove** (viewing key only) and **sign** (spend key only),
