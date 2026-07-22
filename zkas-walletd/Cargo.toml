@@ -48,3 +48,13 @@ rand.workspace = true
 # Seed-file encryption at rest (XChaCha20-Poly1305 with an Argon2-derived key).
 argon2.workspace = true
 chacha20poly1305.workspace = true
+
+# Self-hosting mode (`--serve-public` / node-embedded): auto-generate a self-signed
+# TLS cert, serve HTTPS directly (no reverse proxy), and print a pairing QR so a
+# mobile wallet can pin the cert. Keeps the FVK off the wire in the clear.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls.workspace = true
+rcgen = "0.13"
+qrcode = { version = "0.14", default-features = false }
+sha2.workspace = true
+hex.workspace = true

@@ -99,6 +99,15 @@ pub struct Args {
     pub rocksdb_preset: Option<String>,
     pub rocksdb_wal_dir: Option<String>,
     pub rocksdb_cache_size: Option<usize>,
+
+    /// Serve the embedded shielded wallet API on this `addr:port` (self-hosting mode):
+    /// the node becomes the whole backend for a mobile wallet, with auto-TLS + a pairing
+    /// QR, no reverse proxy. `None` = off.
+    pub wallet_api: Option<String>,
+    /// With `--wallet-api`, serve plaintext HTTP instead of TLS (VPN/Tailscale only).
+    pub wallet_api_insecure: bool,
+    /// With `--wallet-api`, the public IP/host baked into the printed pairing URI.
+    pub wallet_api_host: Option<String>,
 }
 
 impl Default for Args {
@@ -155,6 +164,9 @@ impl Default for Args {
             rocksdb_preset: None,
             rocksdb_wal_dir: None,
             rocksdb_cache_size: None,
+            wallet_api: None,
+            wallet_api_insecure: false,
+            wallet_api_host: None,
         }
     }
 }
@@ -411,6 +423,21 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
         .arg(arg!(--"nodnsseed" "Disable DNS seeding for peers").env("KASPAD_NODNSSEED"))
         .arg(arg!(--"nogrpc" "Disable gRPC server").env("KASPAD_NOGRPC"))
         .arg(
+            Arg::new("wallet-api")
+                .long("wallet-api")
+                .value_name("ADDR:PORT")
+                .env("KASPAD_WALLET_API")
+                .help("Serve the embedded shielded wallet API here (self-hosting mode): the node becomes the whole backend for a mobile wallet, with auto-TLS and a pairing QR printed at startup — no reverse proxy, no domain, no certbot. Example: --wallet-api=0.0.0.0:8443"),
+        )
+        .arg(arg!(--"wallet-api-insecure" "With --wallet-api, serve plaintext HTTP instead of TLS. Only safe behind a VPN/Tailscale — your viewing key and balances would otherwise cross the wire unencrypted").env("KASPAD_WALLET_API_INSECURE"))
+        .arg(
+            Arg::new("wallet-api-host")
+                .long("wallet-api-host")
+                .value_name("HOST")
+                .env("KASPAD_WALLET_API_HOST")
+                .help("With --wallet-api, the public IP or hostname baked into the printed pairing URI (and the TLS cert SAN). If omitted, the URI carries a <YOUR-PUBLIC-IP> placeholder to fill in."),
+        )
+        .arg(
             Arg::new("ram-scale")
                 .long("ram-scale")
                 .env("KASPAD_RAM_SCALE")
@@ -539,6 +566,9 @@ impl Args {
             disable_upnp: arg_match_unwrap_or::<bool>(&m, "disable-upnp", defaults.disable_upnp),
             disable_dns_seeding: arg_match_unwrap_or::<bool>(&m, "nodnsseed", defaults.disable_dns_seeding),
             disable_grpc: arg_match_unwrap_or::<bool>(&m, "nogrpc", defaults.disable_grpc),
+            wallet_api: m.get_one::<String>("wallet-api").cloned().or(defaults.wallet_api),
+            wallet_api_insecure: arg_match_unwrap_or::<bool>(&m, "wallet-api-insecure", defaults.wallet_api_insecure),
+            wallet_api_host: m.get_one::<String>("wallet-api-host").cloned().or(defaults.wallet_api_host),
             ram_scale: arg_match_unwrap_or::<f64>(&m, "ram-scale", defaults.ram_scale),
             retention_period_days: m.get_one::<f64>("retention-period-days").cloned().or(defaults.retention_period_days),
 

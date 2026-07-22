@@ -9,7 +9,7 @@ use kaspa_consensus_core::{
     mining_rules::MiningRules,
 };
 use kaspa_consensus_notify::{root::ConsensusNotificationRoot, service::NotifyService};
-use kaspa_core::{core::Core, debug, info};
+use kaspa_core::{core::Core, debug, info, warn};
 use kaspa_core::{kaspad_env::version, task::tick::TickService};
 use kaspa_database::{
     prelude::{CachePolicy, DbWriter, DirectDbWriter, RocksDbPreset},
@@ -565,6 +565,63 @@ Do you confirm? (y/n)";
     let dns_seeders = if connect_peers.is_empty() && !args.disable_dns_seeding { config.dns_seeders } else { &[] };
 
     let grpc_server_addr = args.rpclisten.unwrap_or(ContextualNetAddress::loopback()).normalize(config.default_rpc_port());
+
+    // Self-hosting wallet API: spawn the embedded shielded wallet daemon (TLS + pairing
+    // QR) on its own runtime thread. It drives THIS node's gRPC over loopback and retries
+    // until the node is serving, so ordering vs. core startup doesn't matter. Off unless
+    // `--wallet-api` is given, so the live node is unaffected.
+    #[cfg(feature = "wallet-api")]
+    if let Some(api_addr) = args.wallet_api.clone() {
+        if args.disable_grpc {
+            warn!("--wallet-api requested but gRPC is disabled (--nogrpc); the wallet API cannot reach the node. Skipping.");
+        } else {
+            match api_addr.parse::<std::net::SocketAddr>() {
+                Err(e) => warn!("--wallet-api {api_addr:?} is not a valid addr:port ({e}); skipping wallet API"),
+                Ok(listen) => {
+                    let net_str =
+                        if args.testnet { "testnet" } else if args.devnet { "devnet" } else if args.simnet { "simnet" } else { "mainnet" }.to_string();
+                    let prefixed = network.to_prefixed();
+                    let state_dir = app_dir.join(&prefixed).join("wallet-api");
+                    let wallet_dir = app_dir.join(&prefixed).join("wallets").to_string_lossy().into_owned();
+                    let rpc_server = format!("127.0.0.1:{}", grpc_server_addr.port);
+                    let insecure = args.wallet_api_insecure;
+                    let public_host = args.wallet_api_host.clone();
+                    let wallet_secret =
+                        std::env::var("ZKAS_WALLET_SECRET").ok().or_else(|| std::env::var("FIRECASH_WALLET_SECRET").ok());
+                    info!("starting embedded wallet API on {listen} (node gRPC {rpc_server})");
+                    std::thread::Builder::new()
+                        .name("wallet-api".to_string())
+                        .spawn(move || {
+                            let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build() {
+                                Ok(rt) => rt,
+                                Err(e) => {
+                                    warn!("wallet API runtime failed to start: {e}");
+                                    return;
+                                }
+                            };
+                            // Held forever so the daemon runs for the life of the process.
+                            let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+                            let cfg = zkas_walletd::SelfHostConfig {
+                                rpc_server,
+                                listen,
+                                wallet_dir,
+                                state_dir,
+                                network: net_str,
+                                insecure,
+                                token: None,
+                                public_host,
+                                wallet_secret,
+                                allow_default_token: true,
+                            };
+                            if let Err(e) = rt.block_on(zkas_walletd::run_selfhost(cfg, rx)) {
+                                warn!("wallet API exited: {e}");
+                            }
+                        })
+                        .expect("spawn wallet-api thread");
+                }
+            }
+        }
+    }
 
     let core = Arc::new(Core::new());
 

@@ -50,6 +50,25 @@ struct Cli {
     /// Run with the daemon stopped.
     #[arg(long)]
     graft: Option<String>,
+    /// Self-hosting mode: serve the wallet API on `<addr:port>` over auto-provisioned
+    /// TLS (self-signed, cert minted under --wallet-dir/../api) and print a pairing QR a
+    /// mobile wallet scans to connect — no reverse proxy, no domain, no certbot. Implies
+    /// a required bearer token. Example: `--serve-public 0.0.0.0:8443`.
+    #[arg(long, value_name = "ADDR:PORT")]
+    serve_public: Option<String>,
+    /// With --serve-public, serve plaintext HTTP instead of TLS. Only safe behind a
+    /// VPN/Tailscale — your viewing key and balances would otherwise cross the wire in
+    /// the clear.
+    #[arg(long, default_value_t = false)]
+    insecure: bool,
+    /// With --serve-public, the public IP/host baked into the printed pairing URI (and
+    /// TLS cert SAN). If omitted the URI carries a `<YOUR-PUBLIC-IP>` placeholder.
+    #[arg(long)]
+    public_host: Option<String>,
+    /// With --serve-public, override the generated bearer token (otherwise one is minted
+    /// and persisted next to the cert).
+    #[arg(long)]
+    api_token: Option<String>,
 }
 
 // Oversubscribe worker threads (2x cores). The background sync loop does CPU-bound
@@ -91,32 +110,66 @@ async fn main() {
         return;
     }
 
+    let wallet_dir = cli.wallet_dir.clone().unwrap_or_else(default_wallet_dir);
+    // Seed-file encryption secret: CLI flag, ZKAS_WALLET_SECRET, or the legacy
+    // FIRECASH_WALLET_SECRET env (still honored so pre-rebrand service files work).
+    let wallet_secret = cli
+        .wallet_secret
+        .or_else(|| std::env::var("ZKAS_WALLET_SECRET").ok())
+        .or_else(|| std::env::var("FIRECASH_WALLET_SECRET").ok());
+
+    // The sender is held (never fired) so the daemon runs until the process dies.
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Self-hosting mode: one flag gives TLS + bearer + a pairing QR, no proxy.
+    if let Some(addr) = cli.serve_public {
+        let listen: SocketAddr = addr.parse().unwrap_or_else(|e| {
+            log::error!("bad --serve-public {addr:?}: {e}");
+            std::process::exit(1);
+        });
+        // Cert/token live next to the wallets, in a sibling `api` dir.
+        let state_dir = std::path::Path::new(&wallet_dir).parent().unwrap_or_else(|| std::path::Path::new(".")).join("api");
+        let sh = zkas_walletd::SelfHostConfig {
+            rpc_server: cli.rpc_server,
+            listen,
+            wallet_dir,
+            state_dir,
+            network: cli.network,
+            insecure: cli.insecure,
+            token: cli.api_token,
+            public_host: cli.public_host,
+            wallet_secret,
+            allow_default_token: cli.allow_default_token,
+        };
+        if let Err(e) = zkas_walletd::run_selfhost(sh, shutdown_rx).await {
+            log::error!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let listen: SocketAddr = cli.listen.parse().unwrap_or_else(|e| {
         log::error!("bad --listen {:?}: {e}", cli.listen);
         std::process::exit(1);
     });
     if !listen.ip().is_loopback() && !cli.allow_remote {
-        log::error!("refusing to bind non-loopback {} without --allow-remote (put a TLS proxy in front instead)", listen);
+        log::error!("refusing to bind non-loopback {} without --allow-remote (put a TLS proxy in front, or use --serve-public for built-in TLS)", listen);
         std::process::exit(1);
     }
 
     let cfg = Config {
         rpc_server: cli.rpc_server,
         listen,
-        wallet_dir: cli.wallet_dir.unwrap_or_else(default_wallet_dir),
+        wallet_dir,
         network: cli.network,
         allow_origin: cli.allow_origin,
         allow_default_token: cli.allow_default_token,
-        // Seed-file encryption secret: CLI flag, ZKAS_WALLET_SECRET, or the legacy
-        // FIRECASH_WALLET_SECRET env (still honored so pre-rebrand service files work).
-        wallet_secret: cli
-            .wallet_secret
-            .or_else(|| std::env::var("ZKAS_WALLET_SECRET").ok())
-            .or_else(|| std::env::var("FIRECASH_WALLET_SECRET").ok()),
+        wallet_secret,
+        // Loopback / proxied deployment: no built-in TLS, no bearer gate.
+        tls: None,
+        require_bearer: None,
     };
 
-    // The sender is held (never fired) so the daemon runs until the process dies.
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     if let Err(e) = serve(cfg, shutdown_rx).await {
         log::error!("{e}");
         std::process::exit(1);

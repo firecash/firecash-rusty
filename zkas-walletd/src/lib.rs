@@ -29,10 +29,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+pub mod selfhost;
+pub use selfhost::{run_selfhost, SelfHostConfig};
+
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Query, State, Request},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
+    middleware::{from_fn_with_state, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
@@ -168,6 +173,14 @@ pub struct Config {
     pub allow_default_token: bool,
     /// Secret encrypting wallet seed files at rest; None = plaintext (0600) + warning.
     pub wallet_secret: Option<String>,
+    /// TLS identity to serve HTTPS with. `None` = plaintext HTTP (loopback / proxied /
+    /// VPN only). Set by self-hosting mode ([`run_selfhost`]) so a phone can connect to a
+    /// raw public IP without a reverse proxy.
+    pub tls: Option<selfhost::TlsIdentity>,
+    /// When set, every request (except `/health`) must carry `Authorization: Bearer
+    /// <token>`. The transport gate for a publicly-bound daemon; the phone gets the token
+    /// from the pairing QR. `None` = no bearer gate (loopback-only deployments).
+    pub require_bearer: Option<String>,
 }
 
 /// Map the `--network` string to the consensus [`NetworkType`] the compile-time
@@ -4245,6 +4258,37 @@ pub fn default_wallet_dir() -> String {
     format!("{home}/.zkas/wallets")
 }
 
+/// Length-then-value compare that doesn't early-exit on the first differing byte, so a
+/// bearer token can't be recovered by timing. Token length is fixed and not secret.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Transport auth for a publicly-bound daemon: every request except `/health` must carry
+/// `Authorization: Bearer <token>` matching the paired token. Without this, anyone who
+/// can reach the port could read/drain wallets.
+async fn bearer_guard(State(expected): State<std::sync::Arc<String>>, req: Request, next: Next) -> Response {
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+    match presented {
+        Some(tok) if ct_eq(tok.as_bytes(), expected.as_bytes()) => next.run(req).await,
+        _ => (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response(),
+    }
+}
+
 /// Run the daemon until `shutdown` resolves (hold the sender forever to run
 /// forever). Returns once the HTTP server has stopped and the background loops are
 /// aborted, so an embedding process (the desktop app) can call `serve` again with a
@@ -4290,6 +4334,9 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     log::info!("connected to node at {} (2 connections: request + sync)", cfg.rpc_server);
 
     let wallet_secret = cfg.wallet_secret;
+    // Pulled out before `cfg` is partially moved into AppState below.
+    let tls = cfg.tls;
+    let require_bearer = cfg.require_bearer;
     if wallet_secret.is_none() {
         log::warn!("no wallet secret set: seed files are stored in PLAINTEXT (0600 on unix)");
     }
@@ -4425,14 +4472,44 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .layer(cors)
         .with_state(state);
 
-    log::info!("zkas-walletd listening on http://{listen}");
-    let listener = tokio::net::TcpListener::bind(listen).await.map_err(|e| format!("failed to bind {listen}: {e}"))?;
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.await;
-        })
-        .await
-        .map_err(|e| format!("server error: {e}"));
+    // Transport auth: gate every route behind the bearer token when one is configured
+    // (self-hosting / public bind). Loopback deployments pass `None` and skip it.
+    let app = match require_bearer {
+        Some(token) => app.layer(from_fn_with_state(std::sync::Arc::new(token), bearer_guard)),
+        None => app,
+    };
+
+    let result = match tls {
+        // HTTPS directly — no reverse proxy. The client pins the cert fingerprint from the
+        // pairing QR, so the self-signed cert is trusted for exactly this node.
+        Some(id) => {
+            log::info!("zkas-walletd listening on https://{listen} (self-signed, fingerprint {})", id.fingerprint);
+            let tls_cfg = axum_server::tls_rustls::RustlsConfig::from_pem(id.cert_pem, id.key_pem)
+                .await
+                .map_err(|e| format!("load TLS identity: {e}"))?;
+            let handle = axum_server::Handle::new();
+            let h = handle.clone();
+            tokio::spawn(async move {
+                let _ = shutdown.await;
+                h.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
+            });
+            axum_server::bind_rustls(listen, tls_cfg)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await
+                .map_err(|e| format!("server error: {e}"))
+        }
+        None => {
+            log::info!("zkas-walletd listening on http://{listen}");
+            let listener = tokio::net::TcpListener::bind(listen).await.map_err(|e| format!("failed to bind {listen}: {e}"))?;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown.await;
+                })
+                .await
+                .map_err(|e| format!("server error: {e}"))
+        }
+    };
     // The loops hold node connections and wallet state; kill them so a re-`serve`
     // starts clean instead of double-scanning the same wallet files.
     sync_task.abort();

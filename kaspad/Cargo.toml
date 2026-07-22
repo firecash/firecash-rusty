@@ -66,7 +66,14 @@ serde_json.workspace = true
 toml = "0.8.10"
 serde_with = "3.7.0"
 
+# Embedded self-hosting wallet API (`--wallet-api`): lets one node be the whole wallet
+# backend for a phone — TLS + pairing QR, no reverse proxy. Optional so a minimal node
+# build can drop the wallet engine (Halo2 prover) it pulls in.
+zkas-walletd = { path = "../zkas-walletd", optional = true }
+
 [features]
+default = ["wallet-api"]
+wallet-api = ["dep:zkas-walletd"]
 heap = ["dhat", "kaspa-alloc/heap"]
 devnet-prealloc = ["kaspa-consensus/devnet-prealloc"]
 semaphore-trace = ["kaspa-utils/semaphore-trace"]
