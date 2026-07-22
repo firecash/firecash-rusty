@@ -19,18 +19,20 @@ _Live node currently runs the rollback build `fca5229` (VPS1) / `fb64afe` (VPS2)
 | **#9a** | Emission tail floor 3 → 0.6 zkas/block (~2.2% infl. at onset, decaying) | ✅ coinbase tests green |
 | **F-10** | AuxPoW pruning-proof level (already aux-aware everywhere) | ✅ verified |
 | **#3** | merged_mining_activation = `always()` (launch value, decided) | ✅ no code change |
+| **Compact scan-archive** | Persist block-time applied set (compact 148B/action) + serve `GetShieldedBlocks` from it → **fixes the launch-fatal receive bug** + smart pruning (4.7% of body) + reorg crash-consistency (#5) free | ✅ store+equivalence(Halo2) green; consensus+rpc+walletd build (`8e6b222`) |
 | **Rename** | Full firecash→zkas incl. WIRE IDENTITY (16B personals, FCMM→ZKMM, genesis re-cut + all 8 hashes recomputed) | ✅ genesis+auxpow+shielded(90) green |
 | _prior_ | F-01 inflation fix, #24 state commitment, #29/#31 anchor finality, nullifier MuHash, turnstile, 512-action cap, circuit guard, replay protection | ✅ |
 
 ### 🔨 REMAINING before genesis lock (priority order)
-1. **Compact shielded scan-archive** (subsumes #7 + smart pruning + the **launch-fatal receive-bug fix**). Foundation DONE + Halo2-tested (`CompactActionRecord`, `scan_compact`, commit `3ef75a9`). Left: consensus store + persist-at-commit + serve from `GetShieldedBlocks` + wallet compact-ingest + pruning-processor retention. See `shielded-pruning-compact-archive`.
-2. **#9 Finalize the genesis-block subsidy** — the pre-existing `WrongSubsidy` failure in `body_validation_in_context` (genesis subsidy value, separate from the tail #9a). Must set + update the test.
-3. **#6 Genesis difficulty retune** — genesis `bits = 0x1e7fffff` (diff 65,536) is ~1.1e9× too easy vs the live merged-mining equilibrium (~7.5e13); the CPU low-difficulty ramp is wrong for a merge-mined-from-genesis launch. Recommendation: set `bits` to the live equilibrium + `low_difficulty_start_blocks = 0`.
-4. **Reset execution** — regen genesis with the full bundle, cut the binary, relaunch order **node → wallets/walletd → pool/bridge**.
+1. **#9 Finalize the genesis-block subsidy** — the pre-existing `WrongSubsidy` failure in `body_validation_in_context` (genesis subsidy value, separate from the tail #9a). Must set + update the test.
+2. **#6 Genesis difficulty retune** — genesis `bits = 0x1e7fffff` (diff 65,536) is ~1.1e9× too easy vs the live merged-mining equilibrium (~7.5e13); the CPU low-difficulty ramp is wrong for a merge-mined-from-genesis launch. Recommendation: set `bits` to the live equilibrium + `low_difficulty_start_blocks = 0`.
+3. **Reset execution** — regen genesis with the full bundle, cut the binary, relaunch order **node → wallets/walletd → pool/bridge**.
+4. _(nice-to-have)_ two-node test that a **pruned** syncee serves identical `GetShieldedBlocks` from the archive; optional `--retention-period-days` archive trim for constrained nodes.
 
-### ↪️ OUT of the reset (ship as ordinary patches, not fork-gated)
-- **#5 reorg crash-consistency** — not consensus-breaking; the compact-archive store (written in the commit batch) gives it for free on scan data.
-- **Receive bug** — root cause identified (RPC re-derives the applied set → drifts once source blocks prune); the fix IS the compact scan-archive store (#1 remaining above).
+### ✅ NOW SOLVED by the compact scan-archive (were open)
+- **Receive bug** ("sends don't credit") — root cause was the RPC re-deriving the applied set (`is_shielded_anchor_final` flips dropped→accepted once source blocks prune → phantom leaves). **Fixed:** serve the persisted block-time applied set, no re-derivation.
+- **#5 reorg crash-consistency** — the scan archive is written in the block-commit `WriteBatch`, so its data is crash-consistent for free. (The separate standalone-`db.write` nullifier revert/apply in reorg walks remains an ordinary durability patch, not fork-gated.)
+- **#7 node-side accepted-bundle persistence** — this archive IS it.
 
 ### 🔑 Two decisions still needed from the operator
 - **#9 emission:** final genesis-block subsidy value (tail is settled at 0.6/block).
