@@ -45,5 +45,5 @@ low-difficulty mining, not competitive hashrate.
 Quick start:
   ./kaspad --utxoindex
   ./shielded-pay address --seed-byte 1 --network mainnet
-  ./zkas-miner -s 127.0.0.1:16110 -a zkas:<your-address> -t 4
+  ./zkas-miner -s 127.0.0.1:16810 -a zkas:<your-address> -t 4
 ===============================================================================

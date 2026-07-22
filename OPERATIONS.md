@@ -17,10 +17,16 @@ Two servers, each running its own full `kaspad` (own datadir), peered over P2P.
 | Binaries | `/root/work/kaspad-run`, `zkas-miner-run`; pool `zkas-pool/bin/stratum-bridge` | `/root/zkas/bin/{kaspad,zkas-walletd,zkas-api}` |
 | Ports | node gRPC 16110, P2P 16111, pool stratum (see bridge yaml) | node gRPC 16110, walletd 8501, api 8500 |
 
+> **Port migration (reset):** these are the **current live** ports. The reset binary
+> defaults ZKas to its own port block — gRPC **16810**, P2P **16811**, wRPC borsh **17810**,
+> json **18810** — so a ZKas node and the merged-mining Kaspa parent stop clashing. At the
+> coordinated reset, migrate every explicit `:16110`/`:16111`/`:17110` here and in the pool
+> `*-bridge.yaml`, nginx upstreams, and the VPS2 tunnel. Until then everything stays on 161xx.
+
 VPS1 nginx reaches VPS2's walletd/api over an `autossh -L 8500 -L 8501 root@VPS2`
 tunnel. wallet.zkas.info → walletd (8501); explorer → api (8500).
 
-Chain facts: kHeavyHash PoW (byte-identical to Kaspa), 10 BPS, 44 ZKAS/block,
+Chain facts: kHeavyHash PoW (byte-identical to Kaspa), ~1 BPS, 60 ZKAS/block,
 addresses `zkas:...`, network id `zkas-mainnet`. AuxPoW merged-mining
 activation lives in `params.rs` (`merged_mining_activation`).
 
@@ -146,6 +152,6 @@ restores the old single-user fallback), and seeds encrypt at rest when
 
 ## Repos
 
-- Node/consensus/wallet: `github.com/zkas/zkas-rusty`
-- Mining pool: `github.com/zkas/zkas-pool` (see its `help.txt` for pool
+- Node/consensus/wallet: `github.com/firecash/zkas-rusty`
+- Mining pool: `github.com/firecash/zkas-pool` (see its `help.txt` for pool
   operators + AuxPoW merged-mining details)

@@ -18,10 +18,10 @@ the wallet daemon, and the explorer API.
 | | ZKas | Kaspa |
 |---|---|---|
 | Privacy | **Shielded by default** (Orchard) | Transparent |
-| Consensus | GHOSTDAG BlockDAG, 10 blocks/s | same |
+| Consensus | GHOSTDAG BlockDAG, ~1 block/s | 10 blocks/s |
 | PoW | **kHeavyHash** (byte-identical to Kaspa) | kHeavyHash |
 | Merged mining | **Yes** — AuxPoW dual-acceptance with Kaspa | — |
-| Emission | 6 ZKAS start, 3-month halving, two-step perpetual tail | fixed cap |
+| Emission | 60 ZKAS start, 3-month halving, two-step perpetual tail (6 → 0.6 ZKAS/block) | fixed cap |
 
 - **Shielded state:** coinbase rewards and transfers enter a mandatory Orchard pool;
   the only public quantity is the fee a spender exposes to the miner. A shielded
@@ -31,14 +31,16 @@ the wallet daemon, and the explorer API.
   kHeavyHash block (e.g. a Kaspa block) whose coinbase commits to the ZKas block
   hash. Native mining stays the backbone; merged mining adds security at zero marginal
   cost to Kaspa miners. See `consensus/core/src/auxpow.rs` and `consensus/pow/src/auxpow.rs`.
-- **Tokenomics:** 6 ZKAS initial reward, halving every 3 months, settling on a two-step
-  perpetual tail (0.6 ZKAS/block → 0.3 ZKAS/block at month 24). No fixed supply cap.
+- **Tokenomics:** 60 ZKAS initial reward (at 1 BPS), halving every 3 months, settling on a
+  two-step perpetual tail: 6 ZKAS/block from ~month 10 through month 24, then a permanent
+  0.6 ZKAS/block floor (~18.9M ZKAS/year, ~2.2% at onset decaying toward ~1%). No fixed
+  supply cap.
 
 ## Binaries in this repo
 
 | Crate | Binary | Role |
 |---|---|---|
-| `kaspad` | `kaspad` | the node (gRPC :16110, p2p :16111) |
+| `kaspad` | `kaspad` | the node (gRPC :16810, p2p :16811) |
 | `miner` | `zkas-miner` | standalone CPU miner (native + `--merged` AuxPoW) |
 | `zkas-walletd` | `zkas-walletd` | shielded wallet daemon (token-scoped, local) |
 | `zkas-api` | `zkas-api` | explorer REST backend (gRPC → REST) |
@@ -73,7 +75,7 @@ source "$HOME/.cargo/env"
 
 **3. Clone & compile** (release profile — optimized binaries land in `target/release/`)
 ```bash
-git clone https://github.com/zkas/zkas-rusty.git
+git clone https://github.com/firecash/zkas-rusty.git
 cd zkas-rusty
 # all node-side binaries at once:
 cargo build --release -p kaspad -p miner -p zkas-walletd -p zkas-api
@@ -85,15 +87,21 @@ First build downloads and compiles all dependencies (RocksDB, Halo 2, etc.) and 
 
 ## Run a node & join the network
 
-Grab the binaries from the latest [Release](https://github.com/zkas/zkas-rusty/releases)
+Grab the binaries from the latest [Release](https://github.com/firecash/zkas-rusty/releases)
 (or build from source, below), then run a node that syncs from the ZKas seed nodes:
 
 ```bash
-./kaspad --appdir=./fc-node --rpclisten=127.0.0.1:16110 --utxoindex \
-  --connect=185.147.157.125:16111 --connect=160.187.211.153:16111
+./kaspad --appdir=./fc-node --rpclisten=127.0.0.1:16810 --utxoindex \
+  --connect=185.147.157.125:16811 --connect=160.187.211.153:16811
 ```
 Your node does an initial block download from the network and then follows the tip. It only
-needs outbound access to the seed nodes' **p2p port 16111**; its own RPC (16110) stays local.
+needs outbound access to the seed nodes' **p2p port 16811**; its own RPC (16810) stays local.
+
+> **Port note:** ZKas defaults to its own port block — gRPC **16810**, p2p **16811**, wRPC
+> borsh **17810**, json **18810** — distinct from Kaspa's 161xx so a ZKas node and the
+> merged-mining Kaspa parent coexist on one host with no overrides. The live network
+> completes this migration from the old 161xx ports at the coordinated genesis reset; until
+> then a live seed may still answer on 16111.
 
 ## Mine
 
@@ -101,7 +109,7 @@ needs outbound access to the seed nodes' **p2p port 16111**; its own RPC (16110)
   ZKas stratum pool at **mining-pool.zkas.info**. No node required.
 - **Solo:** with your synced node running, mine to your `zkas:` shielded address:
   ```bash
-  ./zkas-miner -s 127.0.0.1:16110 -a zkas:<your-address> -t 4
+  ./zkas-miner -s 127.0.0.1:16810 -a zkas:<your-address> -t 4
   ```
 
 ## Wallet
@@ -111,7 +119,7 @@ Everything is on the **shielded (Orchard) pool** — balances and amounts are pr
 
 - **Web & mobile wallet (easiest):** https://wallet.zkas.info — no install; also
   packaged as a native iOS/Android app (Capacitor). See
-  [zkas-wallet](https://github.com/zkas/zkas-wallet) / its `MOBILE.md`.
+  [zkas-wallet](https://github.com/firecash/zkas-wallet) / its `MOBILE.md`.
 
   > **Custody:** in the default hosted mode the daemon holds the seed and *can* spend.
   > Orchard splits a spend into **prove** (viewing key only) and **sign** (spend key only),
@@ -130,10 +138,10 @@ reference tool; use the daemon or web wallet for real random-seed wallets.)
 # -> zkas:pyfjy228l6gukj2vwztyq6q88eeyggjhvcuzf2jx8u4lvla42d6x0y3dsgp0w...
 
 # Check spendable balance + owned notes (scans the chain via the node RPC)
-./shielded-pay balance -s 127.0.0.1:16110 --seed-byte 1
+./shielded-pay balance -s 127.0.0.1:16810 --seed-byte 1
 
 # Send a private payment (amount/fee in sompi; change returns to you)
-./shielded-pay send -s 127.0.0.1:16110 --owner-seed-byte 1 \
+./shielded-pay send -s 127.0.0.1:16810 --owner-seed-byte 1 \
   --to zkas:<recipient-address> --amount 500000000 --fee 3000000
 
 # Prove you control an address without spending (offline; discloses viewing key)
@@ -146,7 +154,7 @@ reference tool; use the daemon or web wallet for real random-seed wallets.)
 Run it locally for a non-custodial wallet with a REST API on `:8501`:
 
 ```bash
-./zkas-walletd --network mainnet --rpc-server 127.0.0.1:16110 \
+./zkas-walletd --network mainnet --rpc-server 127.0.0.1:16810 \
   --wallet-dir ./fc-wallets --listen 127.0.0.1:8501 \
   --allow-origin http://localhost:5173   # your web-wallet origin (omit for same-origin)
 ```

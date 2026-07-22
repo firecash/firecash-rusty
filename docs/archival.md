@@ -69,8 +69,8 @@ kaspad --archival --rocksdb-preset=hdd
 ```bash
 # Default preset, suitable for SSD
 kaspad --archival \
-  --rpclisten-borsh=0.0.0.0:17110 \
-  --rpclisten-json=0.0.0.0:18110
+  --rpclisten-borsh=0.0.0.0:17810 \
+  --rpclisten-json=0.0.0.0:18810
 ```
 
 ### HDD-Optimized Archive Node
@@ -79,8 +79,8 @@ kaspad --archival \
 kaspad --archival \
   --rocksdb-preset=hdd \
   --ram-scale=1.0 \
-  --rpclisten-borsh=0.0.0.0:17110 \
-  --rpclisten-json=0.0.0.0:18110
+  --rpclisten-borsh=0.0.0.0:17810 \
+  --rpclisten-json=0.0.0.0:18810
 ```
 
 ## Performance Tuning
@@ -201,15 +201,15 @@ services:
       - --archival
       - --rocksdb-preset=hdd
       - --ram-scale=1.0
-      - --rpclisten-borsh=0.0.0.0:17110
-      - --rpclisten-json=0.0.0.0:18110
+      - --rpclisten-borsh=0.0.0.0:17810
+      - --rpclisten-json=0.0.0.0:18810
       - --utxoindex
     volumes:
       - /mnt/hdd/kaspa-archive:/app/data
     ports:
-      - "16111:16111"  # P2P
-      - "17110:17110"  # RPC Borsh
-      - "18110:18110"  # RPC JSON
+      - "16811:16811"  # P2P
+      - "17810:17810"  # RPC Borsh
+      - "18810:18810"  # RPC JSON
     environment:
       - KASPAD_APPDIR=/app/data
 ```
@@ -237,15 +237,15 @@ docker run -d \
   --name kaspad-archive \
   --restart unless-stopped \
   -v /mnt/hdd/kaspa-archive:/app/data \
-  -p 16111:16111 \
-  -p 17110:17110 \
-  -p 18110:18110 \
+  -p 16811:16811 \
+  -p 17810:17810 \
+  -p 18810:18810 \
   kaspanet/kaspad:latest \
     --archival \
     --rocksdb-preset=hdd \
     --ram-scale=1.0 \
-    --rpclisten-borsh=0.0.0.0:17110 \
-    --rpclisten-json=0.0.0.0:18110 \
+    --rpclisten-borsh=0.0.0.0:17810 \
+    --rpclisten-json=0.0.0.0:18810 \
     --appdir=/app/data
 ```
 
@@ -268,8 +268,8 @@ ExecStart=/usr/local/bin/kaspad \
   --rocksdb-preset=hdd \
   --ram-scale=1.0 \
   --appdir=/mnt/hdd/kaspa-archive \
-  --rpclisten-borsh=0.0.0.0:17110 \
-  --rpclisten-json=0.0.0.0:18110 \
+  --rpclisten-borsh=0.0.0.0:17810 \
+  --rpclisten-json=0.0.0.0:18810 \
   --utxoindex
 Restart=always
 RestartSec=10

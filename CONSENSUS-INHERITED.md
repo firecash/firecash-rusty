@@ -1,5 +1,11 @@
 # Inherited Kaspa parameters that bind harder on ZKas
 
+> **Status (2026-07-22):** this is the original analysis. Two of its headline items are now
+> **resolved in the reset bundle** — the per-tx spend cap was raised **6 → 38** (shielded txs
+> bounded by the block mass limit, not the 100k standard cap), and shielded permanent-state
+> is now **priced via per-action compute mass**. See `CONSENSUS-CHANGES.md` (#4b, #4) for the
+> authoritative current state; the "today = 6" figures below are the pre-reset baseline.
+
 ZKas is a Kaspa fork whose transactions do not look like Kaspa transactions. Kaspa's
 economic parameters were calibrated for ~300-byte transparent transactions that spend
 UTXOs and cost microseconds to verify. A ZKas shielded transaction is ~22 KB, spends
