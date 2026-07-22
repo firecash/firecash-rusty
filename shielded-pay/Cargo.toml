@@ -1,6 +1,6 @@
 [package]
 name = "kaspa-shielded-pay"
-description = "firecash live shielded-payment client: reconstruct a coinbase note, build a real Orchard spend, and submit it as a version-2 shielded transaction over gRPC (blocker #2)"
+description = "zkas live shielded-payment client: reconstruct a coinbase note, build a real Orchard spend, and submit it as a version-2 shielded transaction over gRPC (blocker #2)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -16,7 +16,7 @@ workspace = true
 
 [dependencies]
 # Address parsing/formatting for the recipient and for deriving a wallet's own
-# firecash: shielded address (to hand to the miner as the reward address).
+# zkas: shielded address (to hand to the miner as the reward address).
 kaspa-addresses.workspace = true
 # The version-2 shielded transaction shape (payment_tx wraps a bundle payload).
 kaspa-consensus-core.workspace = true

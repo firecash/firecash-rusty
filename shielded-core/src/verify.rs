@@ -45,7 +45,7 @@ use blake2b_simd::Params;
 use crate::bundle::ShieldedBundle;
 
 /// Personalization for the shielded-transaction sighash (must be 16 bytes).
-const SIGHASH_PERSONALIZATION: &[u8; 16] = b"firecash_sighash";
+const SIGHASH_PERSONALIZATION: &[u8; 16] = b"zkas_tx_sighash0";
 
 /// Why a shielded bundle failed cryptographic verification. Any of these makes
 /// the carrying transaction invalid.
@@ -345,7 +345,7 @@ mod e2e {
     #[test]
     fn real_bundle_verifies_and_rejects_tampering() {
         let mut rng = rand::rngs::OsRng;
-        let ctx = b"firecash-e2e-tx-context";
+        let ctx = b"zkas-e2e-tx-context";
 
         // 1. Keys + an output-only bundle (dummy spends are auto-signed), anchored
         //    at the empty tree (no real spend, so no Merkle path needed).

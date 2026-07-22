@@ -1,4 +1,4 @@
-# ZKas — `firecash-rusty` (rebranded from ZKas 2026-07-14)
+# ZKas — `zkas-rusty` (rebranded from ZKas 2026-07-14)
 
 > **⚠️ TESTNET — this is a live test network. Coins have no value, the chain may be
 > reset without notice, and consensus parameters can still change. Do not treat ZKAS
@@ -43,8 +43,8 @@ the wallet daemon, and the explorer API.
 | `zkas-walletd` | `zkas-walletd` | shielded wallet daemon (token-scoped, local) |
 | `zkas-api` | `zkas-api` | explorer REST backend (gRPC → REST) |
 
-Companion repos: **firecash-pool** (stratum bridge — ASIC mining), **firecash-explorer**
-(SPA), **firecash-wallet** (web wallet SPA), **firecash-website**.
+Companion repos: **zkas-pool** (stratum bridge — ASIC mining), **zkas-explorer**
+(SPA), **zkas-wallet** (web wallet SPA), **zkas-website**.
 
 ## Requirements
 
@@ -73,8 +73,8 @@ source "$HOME/.cargo/env"
 
 **3. Clone & compile** (release profile — optimized binaries land in `target/release/`)
 ```bash
-git clone https://github.com/firecash/firecash-rusty.git
-cd firecash-rusty
+git clone https://github.com/zkas/zkas-rusty.git
+cd zkas-rusty
 # all node-side binaries at once:
 cargo build --release -p kaspad -p miner -p zkas-walletd -p zkas-api
 # or the whole workspace:
@@ -85,7 +85,7 @@ First build downloads and compiles all dependencies (RocksDB, Halo 2, etc.) and 
 
 ## Run a node & join the network
 
-Grab the binaries from the latest [Release](https://github.com/firecash/firecash-rusty/releases)
+Grab the binaries from the latest [Release](https://github.com/zkas/zkas-rusty/releases)
 (or build from source, below), then run a node that syncs from the ZKas seed nodes:
 
 ```bash
@@ -99,9 +99,9 @@ needs outbound access to the seed nodes' **p2p port 16111**; its own RPC (16110)
 
 - **Pool (recommended — works with ASICs):** point your miner or KS-series ASIC at the
   ZKas stratum pool at **mining-pool.zkas.info**. No node required.
-- **Solo:** with your synced node running, mine to your `firecash:` shielded address:
+- **Solo:** with your synced node running, mine to your `zkas:` shielded address:
   ```bash
-  ./zkas-miner -s 127.0.0.1:16110 -a firecash:<your-address> -t 4
+  ./zkas-miner -s 127.0.0.1:16110 -a zkas:<your-address> -t 4
   ```
 
 ## Wallet
@@ -111,7 +111,7 @@ Everything is on the **shielded (Orchard) pool** — balances and amounts are pr
 
 - **Web & mobile wallet (easiest):** https://wallet.zkas.info — no install; also
   packaged as a native iOS/Android app (Capacitor). See
-  [firecash-wallet](https://github.com/firecash/firecash-wallet) / its `MOBILE.md`.
+  [zkas-wallet](https://github.com/zkas/zkas-wallet) / its `MOBILE.md`.
 
   > **Custody:** in the default hosted mode the daemon holds the seed and *can* spend.
   > Orchard splits a spend into **prove** (viewing key only) and **sign** (spend key only),
@@ -127,18 +127,18 @@ reference tool; use the daemon or web wallet for real random-seed wallets.)
 ```bash
 # Obtain your shielded address (this is what you give a sender or the miner's -a)
 ./shielded-pay address --seed-byte 1 --network mainnet
-# -> firecash:pyfjy228l6gukj2vwztyq6q88eeyggjhvcuzf2jx8u4lvla42d6x0y3dsgp0w...
+# -> zkas:pyfjy228l6gukj2vwztyq6q88eeyggjhvcuzf2jx8u4lvla42d6x0y3dsgp0w...
 
 # Check spendable balance + owned notes (scans the chain via the node RPC)
 ./shielded-pay balance -s 127.0.0.1:16110 --seed-byte 1
 
 # Send a private payment (amount/fee in sompi; change returns to you)
 ./shielded-pay send -s 127.0.0.1:16110 --owner-seed-byte 1 \
-  --to firecash:<recipient-address> --amount 500000000 --fee 3000000
+  --to zkas:<recipient-address> --amount 500000000 --fee 3000000
 
 # Prove you control an address without spending (offline; discloses viewing key)
 ./shielded-pay sign   --seed-byte 1 --network mainnet --message "gm"
-./shielded-pay verify --address firecash:<addr> --message "gm" --signature <hex>
+./shielded-pay verify --address zkas:<addr> --message "gm" --signature <hex>
 ```
 
 ### `zkas-walletd` — wallet daemon (REST, powers the web wallet)
@@ -168,11 +168,11 @@ curl -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/wallet/balance
 
 # Send (amount_fc or amount_sompi; fee optional, default 3000000 sompi)
 curl -X POST -H "X-Wallet-Token: $TOK" -H "Content-Type: application/json" \
-  -d '{"to":"firecash:<recipient>","amount_fc":5.0}' \
+  -d '{"to":"zkas:<recipient>","amount_fc":5.0}' \
   http://127.0.0.1:8501/api/wallet/send
 ```
 
-Flags: `--wallet-secret <s>` (or `FIRECASH_WALLET_SECRET`) encrypts seed files at
+Flags: `--wallet-secret <s>` (or `ZKAS_WALLET_SECRET`) encrypts seed files at
 rest; `--allow-default-token` permits tokenless requests for single-user localhost.
 
 ## Explorer
@@ -183,7 +183,7 @@ https://explorer.zkas.info
 
 - `merged_mining_activation` (DAA score at which AuxPoW acceptance turns on) and all
   tokenomics constants live in `consensus/core/src/config/params.rs`.
-- Genesis, network prefixes (`firecash:` / `firecashtest:`), and BPS are compiled in;
+- Genesis, network prefixes (`zkas:` / `zkastest:`), and BPS are compiled in;
   changing consensus parameters requires a rebuild and a fresh chain.
 
 ## License

@@ -1,6 +1,6 @@
 [package]
 name = "kaspa-shielded-wallet"
-description = "firecash shielded wallet glue: accepted-block -> note effects extraction and version-2 shielded transaction assembly"
+description = "zkas shielded wallet glue: accepted-block -> note effects extraction and version-2 shielded transaction assembly"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

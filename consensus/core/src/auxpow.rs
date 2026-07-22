@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 
 /// The 4-byte tag that marks the 32-byte ZKas block commitment inside a parent
 /// coinbase payload. "ZKas Merged Mining".
-pub const MERGE_MINE_MAGIC: [u8; 4] = *b"FCMM";
+pub const MERGE_MINE_MAGIC: [u8; 4] = *b"ZKMM";
 
 /// Hard cap on [`AuxPow::coinbase_merkle_branch`] length. The branch has one entry
 /// per level of the parent's transaction Merkle tree, so a parent with `n`

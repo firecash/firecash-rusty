@@ -7,7 +7,7 @@
 //! A ZKas block is accepted if it satisfies **either** PoW path against its own
 //! target (`header.bits`):
 //! - **native** — `kHeavyHash(header)` clears the target (the mode a solo
-//!   `firecash-miner` produces); or
+//!   `zkas-miner` produces); or
 //! - **aux** — it carries an [`AuxPow`] whose parent header's kHeavyHash clears the
 //!   target and is bound to this block's hash.
 //!

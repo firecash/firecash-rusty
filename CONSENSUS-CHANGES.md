@@ -1,7 +1,7 @@
 # ZKas — Consensus Changes & Pre-Mainnet Reset Plan
 
 _Last updated: 2026-07-22_
-_Working branch: `ibd-shielded-import` @ `db41527` (origin/firecash-rusty)_
+_Working branch: `ibd-shielded-import` @ `db41527` (origin/zkas-rusty)_
 _Live node currently runs the rollback build `fca5229` (VPS1) / `fb64afe` (VPS2) — **NOT** the reset bundle._
 
 ---

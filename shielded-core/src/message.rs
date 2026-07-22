@@ -39,7 +39,7 @@ use rand::{CryptoRng, RngCore};
 
 /// BLAKE2b personalization for the message-signing digest. The trailing `1` is a
 /// scheme version, so a future change gets a distinct domain.
-const MSG_PERSONAL: &[u8; 16] = b"firecash_sigmsg1";
+const MSG_PERSONAL: &[u8; 16] = b"zkas_msg_sig_v01";
 
 /// Raw Orchard address length (11-byte diversifier + 32-byte `pk_d`).
 pub const ADDRESS_LEN: usize = 43;
@@ -169,24 +169,24 @@ mod tests {
 
     #[test]
     fn sign_then_verify_roundtrips() {
-        let signed = sign_message(seed(7), b"firecash-mainnet", b"i own this address", OsRng).unwrap();
-        assert_eq!(verify_message(&signed.address, b"firecash-mainnet", b"i own this address", &signed.fvk, &signed.sig), Ok(()));
+        let signed = sign_message(seed(7), b"zkas-mainnet", b"i own this address", OsRng).unwrap();
+        assert_eq!(verify_message(&signed.address, b"zkas-mainnet", b"i own this address", &signed.fvk, &signed.sig), Ok(()));
     }
 
     #[test]
     fn wrong_message_fails() {
-        let signed = sign_message(seed(7), b"firecash-mainnet", b"i own this address", OsRng).unwrap();
+        let signed = sign_message(seed(7), b"zkas-mainnet", b"i own this address", OsRng).unwrap();
         assert_eq!(
-            verify_message(&signed.address, b"firecash-mainnet", b"a different message", &signed.fvk, &signed.sig),
+            verify_message(&signed.address, b"zkas-mainnet", b"a different message", &signed.fvk, &signed.sig),
             Err(VerifyError::BadSignature)
         );
     }
 
     #[test]
     fn wrong_network_fails() {
-        let signed = sign_message(seed(7), b"firecash-mainnet", b"msg", OsRng).unwrap();
+        let signed = sign_message(seed(7), b"zkas-mainnet", b"msg", OsRng).unwrap();
         assert_eq!(
-            verify_message(&signed.address, b"firecash-devnet", b"msg", &signed.fvk, &signed.sig),
+            verify_message(&signed.address, b"zkas-devnet", b"msg", &signed.fvk, &signed.sig),
             Err(VerifyError::BadSignature)
         );
     }

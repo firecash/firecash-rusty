@@ -63,15 +63,15 @@ mod tests {
         assert_eq!(ctx, finished.shielded_sighash_context());
     }
 
-    /// The on-device signer (`firecash-signer`, compiled to WASM) cannot depend on
+    /// The on-device signer (`zkas-signer`, compiled to WASM) cannot depend on
     /// consensus, so it PINS this context as a byte constant to recompute the sighash
     /// itself and refuse a malicious prover. If the shielded tx envelope ever changes,
-    /// this fails — and `PAYMENT_TX_CONTEXT` in firecash-signer/src/lib.rs must be
+    /// this fails — and `PAYMENT_TX_CONTEXT` in zkas-signer/src/lib.rs must be
     /// updated in lockstep, or on-device verification silently breaks every send.
     #[test]
     fn context_matches_the_pinned_signer_constant() {
         let mut pinned = [0u8; 38];
         pinned[0] = 2; // shielded tx version, LE u16; the rest of the envelope is zero
-        assert_eq!(payment_tx_context(), pinned.to_vec(), "update PAYMENT_TX_CONTEXT in firecash-signer");
+        assert_eq!(payment_tx_context(), pinned.to_vec(), "update PAYMENT_TX_CONTEXT in zkas-signer");
     }
 }

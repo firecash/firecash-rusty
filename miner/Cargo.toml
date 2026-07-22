@@ -1,6 +1,6 @@
 [package]
 name = "kaspa-miner"
-description = "firecash standalone CPU miner (FishHashPlus / KarlsenHashV2 proof-of-work)"
+description = "zkas standalone CPU miner (FishHashPlus / KarlsenHashV2 proof-of-work)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -15,7 +15,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-# The mining address (firecash: shielded Orchard address) the reward is paid to.
+# The mining address (zkas: shielded Orchard address) the reward is paid to.
 kaspa-addresses.workspace = true
 # The consensus block/header shape the template converts into and PoW runs over.
 kaspa-consensus-core.workspace = true

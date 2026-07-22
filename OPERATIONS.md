@@ -12,7 +12,7 @@ Two servers, each running its own full `kaspad` (own datadir), peered over P2P.
 | | VPS1 `185.147.157.125` | VPS2 `160.187.211.153` |
 |---|---|---|
 | Role | node + miner + mining pool + nginx | node + walletd + explorer API |
-| Process mgr | **systemd** | `setsid nohup` (from `/root/zkas/` → symlink to /root/firecash) |
+| Process mgr | **systemd** | `setsid nohup` (from `/root/zkas/` → symlink to /root/zkas) |
 | Node datadir | `/root/work/fc-mainnet` | `/root/zkas/fc-node` |
 | Binaries | `/root/work/kaspad-run`, `zkas-miner-run`; pool `zkas-pool/bin/stratum-bridge` | `/root/zkas/bin/{kaspad,zkas-walletd,zkas-api}` |
 | Ports | node gRPC 16110, P2P 16111, pool stratum (see bridge yaml) | node gRPC 16110, walletd 8501, api 8500 |
@@ -21,7 +21,7 @@ VPS1 nginx reaches VPS2's walletd/api over an `autossh -L 8500 -L 8501 root@VPS2
 tunnel. wallet.zkas.info → walletd (8501); explorer → api (8500).
 
 Chain facts: kHeavyHash PoW (byte-identical to Kaspa), 10 BPS, 44 ZKAS/block,
-addresses `firecash:...`, network id `firecash-mainnet`. AuxPoW merged-mining
+addresses `zkas:...`, network id `zkas-mainnet`. AuxPoW merged-mining
 activation lives in `params.rs` (`merged_mining_activation`).
 
 ## Golden rules (the hard-won ones)
@@ -76,23 +76,23 @@ journalctl -u zkas-node -f               # follow logs
 ```
 
 Unit files: `/etc/systemd/system/zkas-{node,miner,pool,kaspa-node,grpc-public,pool-redactor,tunnel}.service`; the pool uses a
-drop-in `/etc/systemd/system/firecash-pool.service.d/override.conf` pointing at
+drop-in `/etc/systemd/system/zkas-pool.service.d/override.conf` pointing at
 the **release** `bin/stratum-bridge` (the debug build used ~3 GB RSS and caused
-OOMs; release is ~60 MB). `firecash-pool.service` env: `BRIDGE_ALLOW_UNSYNCED=1`
+OOMs; release is ~60 MB). `zkas-pool.service` env: `BRIDGE_ALLOW_UNSYNCED=1`
 (a peerless solo node reports `is_synced=false` forever even while mining with
 `--enable-unsynced-mining`).
 
 ## Recover "node is down"
 
 1. Check RAM/OOM: `free -h` (is swap on?), `dmesg | grep -i oom`.
-2. VPS1: `systemctl start firecash-node zkas-miner firecash-pool`.
-3. VPS2 (from `/root/firecash`):
+2. VPS1: `systemctl start zkas-node zkas-miner zkas-pool`.
+3. VPS2 (from `/root/zkas`):
    ```
    setsid nohup bin/kaspad --appdir=/root/zkas/fc-node --utxoindex \
      --rpclisten=127.0.0.1:16110 --addpeer=185.147.157.125:16111 \
      </dev/null >node.log 2>&1 &
    setsid nohup bin/zkas-walletd --network mainnet --rpc-server 127.0.0.1:16110 \
-     --listen 127.0.0.1:8501 --wallet-dir /root/firecash/wallets \
+     --listen 127.0.0.1:8501 --wallet-dir /root/zkas/wallets \
      --allow-origin https://wallet.zkas.info </dev/null >walletd.log 2>&1 &
    setsid nohup bin/zkas-api -s 127.0.0.1:16110 -l 127.0.0.1:8500 \
      </dev/null >api.log 2>&1 &
@@ -107,7 +107,7 @@ Order matters — both empty before either mines.
 # 0. Build + copy the new binary to run-paths on BOTH boxes first.
 
 # 1. VPS1: stop everything, wipe.
-systemctl stop zkas-miner firecash-node firecash-pool
+systemctl stop zkas-miner zkas-node zkas-pool
 rm -rf /root/work/fc-mainnet
 
 # 2. VPS2: stop everything (kill by PID), wipe.
@@ -115,7 +115,7 @@ rm -rf /root/work/fc-mainnet
 rm -rf /root/zkas/fc-node
 
 # 3. VPS1 first (has the miner): start node, then miner, then pool.
-systemctl start firecash-node && sleep 15 && systemctl start zkas-miner firecash-pool
+systemctl start zkas-node && sleep 15 && systemctl start zkas-miner zkas-pool
 
 # 4. VPS2: start node (follows VPS1 via relay), then walletd + api (see Recover).
 
@@ -124,8 +124,8 @@ systemctl start firecash-node && sleep 15 && systemctl start zkas-miner firecash
 #    walletd loads old-chain scan state (50 MB+ files), all wallets thrash
 #    re-scanning, the CPU pegs and the HTTP runtime starves (even /health times
 #    out). Move them aside BEFORE (re)starting walletd:
-mkdir -p /root/firecash/wallets_scan_bak
-mv /root/firecash/wallets/*.scan /root/firecash/wallets_scan_bak/   # keep the .json seeds
+mkdir -p /root/zkas/wallets_scan_bak
+mv /root/zkas/wallets/*.scan /root/zkas/wallets_scan_bak/   # keep the .json seeds
 ```
 
 Verify the wallet after: `curl https://wallet.zkas.info/daemon/api/status` must
@@ -141,11 +141,11 @@ VPS2 log shows `Accepted block … via relay` (following, not IBD of an old chai
 `zkas-walletd` is hardened: CORS is locked to `--allow-origin`
 (default same-origin only), `X-Wallet-Token` is required (`--allow-default-token`
 restores the old single-user fallback), and seeds encrypt at rest when
-`--wallet-secret` / `FIRECASH_WALLET_SECRET` is set. Always launch it with
+`--wallet-secret` / `ZKAS_WALLET_SECRET` is set. Always launch it with
 `--allow-origin https://wallet.zkas.info` so the web wallet keeps working.
 
 ## Repos
 
-- Node/consensus/wallet: `github.com/firecash/firecash-rusty`
-- Mining pool: `github.com/firecash/firecash-pool` (see its `help.txt` for pool
+- Node/consensus/wallet: `github.com/zkas/zkas-rusty`
+- Mining pool: `github.com/zkas/zkas-pool` (see its `help.txt` for pool
   operators + AuxPoW merged-mining details)

@@ -159,7 +159,7 @@ impl TryFrom<&NetworkTypeT> for Prefix {
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum NetworkIdError {
-    #[error("Invalid network name prefix: {0}. The expected prefix is 'zkas' (or the legacy 'firecash').")]
+    #[error("Invalid network name prefix: {0}. The expected prefix is 'zkas' (or the legacy 'zkas').")]
     InvalidPrefix(String),
 
     #[error(transparent)]
@@ -265,22 +265,19 @@ impl NetworkId {
         NETWORK_IDS.iter().copied()
     }
 
-    /// Returns a textual description of the network prefixed with `firecash-`.
+    /// Returns a textual description of the network prefixed with `zkas-`.
     ///
-    /// ZKas rebrand note: this string is the network's *wire and disk*
-    /// identity, not a display name. It is compared byte-for-byte in the p2p
-    /// handshake (so released pre-rebrand binaries would refuse to peer with a
-    /// node emitting anything else) and names the datadir/logdir folder
-    /// (`<appdir>/firecash-mainnet/...`) of every existing node. It therefore
-    /// deliberately stays `firecash-` — like the `kaspa-*` crate names, it is
-    /// invisible infrastructure. `from_prefixed` accepts the `zkas-` spelling
-    /// as input.
+    /// This string is the network's *wire and disk* identity, not a display
+    /// name: it is compared byte-for-byte in the p2p handshake and names the
+    /// datadir/logdir folder (`<appdir>/zkas-mainnet/...`). The reset genesis
+    /// adopts the `zkas-` spelling everywhere; `from_prefixed` still accepts the
+    /// pre-rebrand `firecash-` spelling so a legacy string decodes.
     pub fn to_prefixed(&self) -> String {
-        format!("firecash-{}", self)
+        format!("zkas-{}", self)
     }
 
     pub fn from_prefixed(prefixed: &str) -> Result<Self, NetworkIdError> {
-        if let Some(stripped) = prefixed.strip_prefix("firecash-").or_else(|| prefixed.strip_prefix("zkas-")) {
+        if let Some(stripped) = prefixed.strip_prefix("zkas-").or_else(|| prefixed.strip_prefix("firecash-")) {
             Self::from_str(stripped)
         } else {
             Err(NetworkIdError::InvalidPrefix(prefixed.to_string()))

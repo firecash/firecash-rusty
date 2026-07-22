@@ -20,8 +20,8 @@ Tauri application become consumers of this engine.
 | `kaspa-shielded-core` | Orchard keys and addresses, note encryption/scanning, bundles, wallet state, payment preparation/finalization, anti-blind checks, message signing | Keep as the protocol/cryptography foundation; split wallet-state concerns from pure protocol types over time |
 | `kaspa-shielded-wallet` | Canonical version-2 Kaspa transaction construction, shielded payload wrapping, sighash context, accepted-block effects | Evolve into the transaction/chain adapter; remove unnecessary consensus-service coupling |
 | `zkas-walletd` | Node sync, reorg/checkpoint handling, persistence, fees, coin selection, proving, prepare/submit, REST and gRPC integration | Extract the state machine into `zkas-wallet-engine`; leave walletd as a thin host and HTTP adapter |
-| `firecash-signer` | Seed/FVK/address functions and local anti-blind verification/signing in WASM | Make this the first binding of a canonical `zkas-signer` crate; stop maintaining signing policy in app-specific code |
-| `firecash-wallet` | Working watch-only registration, prepare -> local verify/sign -> submit flow, browser integration | Replace `api.ts`, signer glue, local pending-history heuristics, and direct seed handling with `@zkas/sdk` |
+| `zkas-signer` | Seed/FVK/address functions and local anti-blind verification/signing in WASM | Make this the first binding of a canonical `zkas-signer` crate; stop maintaining signing policy in app-specific code |
+| `zkas-wallet` | Working watch-only registration, prepare -> local verify/sign -> submit flow, browser integration | Replace `api.ts`, signer glue, local pending-history heuristics, and direct seed handling with `@zkas/sdk` |
 | Tauri wallet | Embeds `zkas_walletd::serve` and selects local or remote nodes | Migrate to an in-process SDK engine; optionally retain embedded walletd for compatibility |
 
 The current hosted flow is genuinely non-custodial for spending: the browser holds the seed and
@@ -171,7 +171,7 @@ porting cryptography.
 ### Phase 1: signer and interfaces
 
 - Move the production anti-blind signer into `zkas-signer`.
-- Keep `firecash-signer` as a compatibility wrapper around it.
+- Keep `zkas-signer` as a compatibility wrapper around it.
 - Introduce `ChainSource`, `WalletStore`, `Prover`, `Signer`, and clock/randomness abstractions.
 - Add mock sources/stores and cross-target conformance tests.
 

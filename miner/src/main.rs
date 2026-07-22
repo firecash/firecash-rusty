@@ -1,4 +1,4 @@
-//! `firecash-miner` — a standalone CPU miner for the firecash network
+//! `zkas-miner` — a standalone CPU miner for the zkas network
 //! (blocker #4). It talks the standard `get_block_template` / `submit_block` RPC to
 //! a `kaspad` node, searches the nonce space with the shared kHeavyHash PoW
 //! ([`kaspa_pow::State`], the very code the node verifies with), and submits solved

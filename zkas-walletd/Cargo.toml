@@ -1,6 +1,6 @@
 [package]
 name = "zkas-walletd"
-description = "FireCash local wallet daemon: a non-custodial, localhost-only REST wallet over the shielded (Orchard) pool. Wraps kaspa-shielded-core (keygen, note-scan, real Halo 2 shielded spend, message sign/verify) and drives a kaspad (FireCash) node over gRPC. Keys never leave the machine."
+description = "ZKas local wallet daemon: a non-custodial, localhost-only REST wallet over the shielded (Orchard) pool. Wraps kaspa-shielded-core (keygen, note-scan, real Halo 2 shielded spend, message sign/verify) and drives a kaspad (ZKas) node over gRPC. Keys never leave the machine."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -21,7 +21,7 @@ kaspa-addresses.workspace = true
 kaspa-consensus-core.workspace = true
 # Shared logger init.
 kaspa-core.workspace = true
-# gRPC transport to a running kaspad (FireCash) node.
+# gRPC transport to a running kaspad (ZKas) node.
 kaspa-grpc-client.workspace = true
 kaspa-rpc-core.workspace = true
 # The shielded engine: WalletDb (scan/witness/balance), the real Halo 2 payment

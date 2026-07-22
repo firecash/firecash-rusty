@@ -1,4 +1,4 @@
-//! `firecash-api` — the ZKas explorer backend.
+//! `zkas-api` — the ZKas explorer backend.
 //!
 //! Translates a running ZKas node's gRPC interface into the small REST +
 //! shielded-pool API the explorer frontend (a fork of kaspa-explorer-ng) consumes,
@@ -62,7 +62,7 @@ struct Cli {
     listen: String,
     /// Append-only transaction index (txid → block). Persisted so a restart keeps
     /// every transaction linkable instead of losing everything but the last ~3 min.
-    #[arg(long, default_value = "/root/firecash/txindex.tsv")]
+    #[arg(long, default_value = "/root/zkas/txindex.tsv")]
     tx_index: String,
 }
 

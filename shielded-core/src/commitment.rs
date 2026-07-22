@@ -18,7 +18,7 @@
 use blake2b_simd::Params;
 
 /// Personalization for the shielded state root hash (blake2b personal is ≤16 bytes).
-const STATE_ROOT_PERSONAL: &[u8; 16] = b"firecash_shldrt0";
+const STATE_ROOT_PERSONAL: &[u8; 16] = b"zkas_state_root0";
 
 /// The canonical 32-byte shielded state root (see module docs). Deterministic in
 /// its four inputs and independent of evaluation order — the accumulator inputs

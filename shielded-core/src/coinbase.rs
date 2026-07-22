@@ -63,7 +63,7 @@ pub fn is_canonical_orchard_payout(script: &[u8]) -> bool {
 /// for that `rho` (the first candidate succeeds with overwhelming probability).
 pub fn derive_coinbase_note_desc(recipient: [u8; 43], seed: &[u8]) -> CoinbaseNoteDesc {
     // rho: hash to 64 bytes and reduce into the field for a guaranteed-canonical value.
-    let mut h = blake2b_simd::Params::new().hash_length(64).personal(b"firecash_cb_rho0").to_state();
+    let mut h = blake2b_simd::Params::new().hash_length(64).personal(b"zkas_cb_rho_0000").to_state();
     h.update(seed);
     let rho_field = pallas::Base::from_uniform_bytes(h.finalize().as_array());
     let rho_bytes = rho_field.to_repr();
@@ -72,7 +72,7 @@ pub fn derive_coinbase_note_desc(recipient: [u8; 43], seed: &[u8]) -> CoinbaseNo
     // rseed: derive with a counter until it is a valid ZIP-212 seed for this rho.
     let mut ctr: u32 = 0;
     let rseed = loop {
-        let mut hr = blake2b_simd::Params::new().hash_length(32).personal(b"firecash_cb_seed").to_state();
+        let mut hr = blake2b_simd::Params::new().hash_length(32).personal(b"zkas_cb_seed0000").to_state();
         hr.update(seed);
         hr.update(&ctr.to_le_bytes());
         let cand: [u8; 32] = hr.finalize().as_bytes().try_into().expect("32-byte digest");

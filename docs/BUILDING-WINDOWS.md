@@ -114,7 +114,7 @@ zkas-windows-x86_64-<tag>/
 
 ```bash
 zip -r zkas-windows-x86_64-<tag>.zip zkas-windows-x86_64-<tag>
-gh release upload <tag> zkas-windows-x86_64-<tag>.zip --clobber -R firecash/firecash-rusty
+gh release upload <tag> zkas-windows-x86_64-<tag>.zip --clobber -R zkas/zkas-rusty
 ```
 
 ## Note on the pool bridge

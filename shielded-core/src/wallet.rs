@@ -775,7 +775,7 @@ pub mod build {
         fn wallet_spend_bundle_verifies() {
             let pk = ProvingKey::build();
             let keys = ShieldedKeys::from_seed([5u8; 32]).expect("valid seed");
-            let ctx = b"firecash-spend";
+            let ctx = b"zkas-spend";
 
             // A note worth 10_000 owned by the wallet.
             let rho = Option::<Rho>::from(Rho::from_bytes(&canon(1))).unwrap();
@@ -814,7 +814,7 @@ pub mod build {
 
             let pk = ProvingKey::build();
             let keys = ShieldedKeys::from_seed([5u8; 32]).expect("valid seed");
-            let ctx = b"firecash-noncustodial";
+            let ctx = b"zkas-noncustodial";
             let net = [0x44u8; 32];
 
             // A note worth 10_000 owned by the wallet, alone at tree position 0.
@@ -883,7 +883,7 @@ pub mod build {
         fn device_refuses_a_payment_it_did_not_ask_for() {
             let keys = ShieldedKeys::from_seed([12u8; 32]).unwrap();
             let net = [0x66u8; 32];
-            let ctx = b"firecash-blind-sign";
+            let ctx = b"zkas-blind-sign";
 
             let rho = Option::<Rho>::from(Rho::from_bytes(&canon(5))).unwrap();
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(6), &rho)).unwrap();
@@ -956,7 +956,7 @@ pub mod build {
         fn non_custodial_payment_api_roundtrip() {
             let keys = ShieldedKeys::from_seed([7u8; 32]).unwrap();
             let net = [0x55u8; 32];
-            let ctx = b"firecash-nc-api";
+            let ctx = b"zkas-nc-api";
 
             let rho = Option::<Rho>::from(Rho::from_bytes(&canon(3))).unwrap();
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(4), &rho)).unwrap();
@@ -995,7 +995,7 @@ pub mod build {
         fn wallet_built_bundle_verifies() {
             let pk = ProvingKey::build();
             let keys = ShieldedKeys::from_seed([3u8; 32]).expect("valid seed");
-            let ctx = b"firecash-wallet-roundtrip";
+            let ctx = b"zkas-wallet-roundtrip";
             let net = [0x22u8; 32];
 
             let wire = build_output_only_bundle(&pk, keys.address(), 1_000, &net, ctx, rand::rngs::OsRng).expect("build");

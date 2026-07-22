@@ -1,6 +1,6 @@
 [package]
 name = "kaspa-shielded-core"
-description = "firecash shielded pool core: Orchard note-commitment tree, nullifier set, turnstile invariant"
+description = "zkas shielded pool core: Orchard note-commitment tree, nullifier set, turnstile invariant"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -49,6 +49,6 @@ rand = { workspace = true }
 # Orchard links so the OrchardDomain types agree.
 zcash_note_encryption = "0.4"
 # Human-facing shielded (Orchard) address encoding for the wallet facade
-# (Version::ShieldedOrchard, firecash: HRP). kaspa-addresses is a leaf crate, so
+# (Version::ShieldedOrchard, zkas: HRP). kaspa-addresses is a leaf crate, so
 # no dependency cycle with the consensus layer that depends on shielded-core.
 kaspa-addresses.workspace = true

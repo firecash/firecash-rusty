@@ -4229,11 +4229,11 @@ async fn verify(Json(req): Json<VerifyReq>) -> Result<Json<VerifyResp>, (StatusC
 // main
 // ---------------------------------------------------------------------------
 
-/// Default wallet directory (`~/.firecash/wallets` — the pre-rebrand path is kept
+/// Default wallet directory (`~/.zkas/wallets` — the pre-rebrand path is kept
 /// so existing wallet files keep working).
 pub fn default_wallet_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    format!("{home}/.firecash/wallets")
+    format!("{home}/.zkas/wallets")
 }
 
 /// Run the daemon until `shutdown` resolves (hold the sender forever to run

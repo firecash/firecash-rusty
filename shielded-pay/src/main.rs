@@ -213,7 +213,7 @@ fn prefix_from(network: &str) -> Prefix {
 ///
 /// `--seed-byte` spans only 256 seeds — anyone can enumerate all of them and sweep
 /// the wallet — so it is refused unless `ZKAS_TEST_SEED=1` (or the legacy
-/// `FIRECASH_TEST_SEED=1`) is set in the
+/// `ZKAS_TEST_SEED=1`) is set in the
 /// environment. That gate covers every subcommand at once, including the ones that
 /// take an RPC endpoint rather than a network name, so a throwaway test key can
 /// never be used against real funds by accident.
@@ -222,7 +222,7 @@ fn resolve_seed(seed_hex: Option<String>, seed_byte: Option<u8>) -> [u8; 32] {
         (Some(_), Some(_)) => fatal("give either --seed-hex or --seed-byte, not both".into()),
         (None, None) => fatal("a seed is required: pass --seed-hex <64 hex chars> (or --seed-byte <0-255> for a test wallet)".into()),
         (None, Some(b)) => {
-            if std::env::var("ZKAS_TEST_SEED").as_deref() != Ok("1") && std::env::var("FIRECASH_TEST_SEED").as_deref() != Ok("1") {
+            if std::env::var("ZKAS_TEST_SEED").as_deref() != Ok("1") && std::env::var("ZKAS_TEST_SEED").as_deref() != Ok("1") {
                 fatal(
                     "--seed-byte derives the seed [byte; 32]: only 256 wallets exist, all trivially sweepable. \
                      Use --seed-hex <64 hex chars> for any wallet holding value. \

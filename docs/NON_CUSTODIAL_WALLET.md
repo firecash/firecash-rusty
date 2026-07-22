@@ -1,7 +1,7 @@
-# Non-custodial FireCash web wallet — design
+# Non-custodial ZKas web wallet — design
 
-**Goal:** a web wallet at `wallet.firecash.info` where **the server cannot spend user
-coins.** Today's hosted `firecash-walletd` is *custodial* — it generates and stores each
+**Goal:** a web wallet at `wallet.zkas.info` where **the server cannot spend user
+coins.** Today's hosted `zkas-walletd` is *custodial* — it generates and stores each
 user's seed (plaintext), so a server compromise drains everyone. This document is the
 plan to remove that.
 
@@ -26,7 +26,7 @@ wherever is convenient.
 Non-custodial against theft; lightweight client (no Halo 2 in the browser).
 
 ```
-Browser (holds seed)                     Server (firecash-walletd, key-less)
+Browser (holds seed)                     Server (zkas-walletd, key-less)
 --------------------                     -----------------------------------
 generate seed -> sk, FVK, ask
 send FVK (once) ------------------------> scan chain with FVK, track notes+witnesses

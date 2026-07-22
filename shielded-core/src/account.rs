@@ -222,7 +222,7 @@ mod circuit_tests {
     #[test]
     fn full_private_payment_between_two_wallets() {
         let net = [0x9au8; 32];
-        let ctx: &[u8] = b"firecash-payment-context";
+        let ctx: &[u8] = b"zkas-payment-context";
 
         let mut alice = ShieldedAccount::from_seed([1u8; 32]).unwrap();
         let mut bob = ShieldedAccount::from_seed([2u8; 32]).unwrap();

@@ -1,6 +1,6 @@
 [package]
 name = "zkas-api"
-description = "FireCash explorer backend: translates the node's gRPC into the REST + shielded-pool API the FireCash explorer frontend consumes"
+description = "ZKas explorer backend: translates the node's gRPC into the REST + shielded-pool API the ZKas explorer frontend consumes"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -17,7 +17,7 @@ workspace = true
 [dependencies]
 # Shielded (Orchard) address formatting for transaction output addresses.
 kaspa-addresses.workspace = true
-# gRPC transport to a running kaspad (FireCash) node.
+# gRPC transport to a running kaspad (ZKas) node.
 kaspa-grpc-client.workspace = true
 kaspa-rpc-core.workspace = true
 kaspa-consensus-core.workspace = true

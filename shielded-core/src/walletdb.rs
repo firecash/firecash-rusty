@@ -1212,7 +1212,7 @@ impl WalletDb {
 
     /// Serialize the wallet's **scanned state** — the fast-sync base frontier, the
     /// post-checkpoint commitment stream, and the owned notes — into a compact,
-    /// versioned blob. This is a checkpoint a caller (e.g. `firecash-walletd`)
+    /// versioned blob. This is a checkpoint a caller (e.g. `zkas-walletd`)
     /// persists so a restart resumes from here instead of re-scanning. No secrets are
     /// written: the viewing keys and address are re-derived from the seed on load, so
     /// only public chain-derived state lives in the blob. The mirror `tree` is omitted
@@ -2422,7 +2422,7 @@ mod tests {
     /// A checkpoint round-trips: reloading a wallet from `to_checkpoint` reproduces
     /// balance, owned-note positions, the tip anchor, and — the strongest check —
     /// the exact spend witness, all without re-scanning the chain. This is what lets
-    /// `firecash-walletd` resume after a restart instead of rescanning from birthday.
+    /// `zkas-walletd` resume after a restart instead of rescanning from birthday.
     #[test]
     fn checkpoint_roundtrips_state_and_witness() {
         let mine = [5u8; 32];
@@ -2673,7 +2673,7 @@ mod circuit_tests {
         let pk = ProvingKey::build();
         let miner = [21u8; 32];
         let net = [0x5au8; 32];
-        let ctx = b"firecash-walletdb-e2e";
+        let ctx = b"zkas-walletdb-e2e";
 
         let mut state = ShieldedState::new();
         let mut db = WalletDb::from_seed(miner).unwrap();
@@ -2735,7 +2735,7 @@ mod circuit_tests {
     fn wallet_multi_note_spend_drops_inputs_and_keeps_change() {
         let miner = [31u8; 32];
         let net = [0x5au8; 32];
-        let ctx = b"firecash-walletdb-multi";
+        let ctx = b"zkas-walletdb-multi";
 
         let mut db = WalletDb::from_seed(miner).unwrap();
         let mut state = ShieldedState::new();
@@ -2785,7 +2785,7 @@ mod circuit_tests {
         let miner = [33u8; 32];
         let friend = [44u8; 32];
         let net = [0x5au8; 32];
-        let ctx = b"firecash-walletdb-history";
+        let ctx = b"zkas-walletdb-history";
 
         let mut a = WalletDb::from_seed(miner).unwrap();
         let mut b = WalletDb::from_seed(friend).unwrap();
