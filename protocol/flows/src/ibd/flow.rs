@@ -67,7 +67,13 @@ impl Flow for IbdFlow {
 }
 
 pub enum IbdType {
-    Sync { highest_known_syncer_chain_hash: Hash, is_utxo_stable: bool, is_smt_stable: bool, is_pp_anticone_synced: bool },
+    Sync {
+        highest_known_syncer_chain_hash: Hash,
+        is_utxo_stable: bool,
+        is_smt_stable: bool,
+        is_shielded_stable: bool,
+        is_pp_anticone_synced: bool,
+    },
     DownloadHeadersProof,
     PruningCatchUp { highest_known_syncer_chain_hash: Hash },
 }
@@ -122,7 +128,7 @@ impl IbdFlow {
             )
             .await?;
         match ibd_type {
-            IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_pp_anticone_synced } => {
+            IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced } => {
                 let pruning_point = session.async_pruning_point().await;
 
                 info!("syncing ahead from current pruning point");
@@ -152,6 +158,16 @@ impl IbdFlow {
                     // TODO(post-toccata): In pre-Toccata nodes there are some edge cases where the SMT stable flag is wrongly set to false at this point.
                     // Therefore, the below line can be removed post-Toccata.
                     session.async_set_pruning_smt_stable().await;
+                }
+
+                if !is_shielded_stable {
+                    info!(
+                        "shielded state corresponding to the current pruning point {} is incomplete, attempting to download it from {}",
+                        pruning_point, self.router
+                    );
+                    self.sync_new_shielded_state(&session, pruning_point).await?;
+                } else {
+                    session.async_set_pruning_shielded_stable().await;
                 }
 
                 if !is_utxo_stable
@@ -191,6 +207,7 @@ impl IbdFlow {
                         // Note that the new pruning point's anticone need not be downloaded separately as in other IBD types
                         // as it was just downloaded as part of the headers proof.
                         self.sync_new_smt_state(&session, negotiation_output.syncer_pruning_point).await?;
+                        self.sync_new_shielded_state(&session, negotiation_output.syncer_pruning_point).await?;
                         self.sync_new_utxo_set(&session, negotiation_output.syncer_pruning_point).await?;
                     }
                     Err(e) => {
@@ -207,6 +224,7 @@ impl IbdFlow {
                         info!("header stage of pruning catchup from peer {} completed", self.router);
                         self.sync_missing_trusted_bodies(&session).await?;
                         self.sync_new_smt_state(&session, negotiation_output.syncer_pruning_point).await?;
+                        self.sync_new_shielded_state(&session, negotiation_output.syncer_pruning_point).await?;
                         self.sync_new_utxo_set(&session, negotiation_output.syncer_pruning_point).await?;
                         // Note that pruning of old data will only occur once virtual has caught up sufficiently far
                     }
@@ -290,13 +308,17 @@ impl IbdFlow {
                 } else {
                     true
                 };
+                // Shielded-pool state (ZKas). The flag defaults to true (no shielded state / upgrading
+                // nodes), and the sender replies with empty metadata when the pruning point has no
+                // shielded state, so reading it unconditionally is safe.
+                let is_shielded_stable = consensus.async_is_pruning_shielded_stable().await;
 
-                return match (syncer_skew, is_utxo_stable && is_smt_stable && is_pp_anticone_synced) {
+                return match (syncer_skew, is_utxo_stable && is_smt_stable && is_shielded_stable && is_pp_anticone_synced) {
                     (SyncerSkew::Aligned, _) => {
-                        Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_pp_anticone_synced })
+                        Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced })
                     }
                     (SyncerSkew::Lagging, true) => {
-                        Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_pp_anticone_synced })
+                        Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced })
                     }
                     (SyncerSkew::Lagging, false) => Err(ProtocolError::Other(
                         "Local node is in a transitional state requiring external data to stabilize, but the syncer lags behind and is unable to provide said data",
@@ -305,7 +327,7 @@ impl IbdFlow {
                         if consensus.async_get_block_status(syncer_pruning_point).await.is_some_and(|b| b.has_block_body()) {
                             // While a leading syncer skew often indicates the need for catchup, in this case
                             // the node is just missing a segment in the future of its current pruning point, that is available to the syncer
-                            Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_pp_anticone_synced })
+                            Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced })
                         } else {
                             Ok(IbdType::PruningCatchUp { highest_known_syncer_chain_hash })
                         }
@@ -768,6 +790,55 @@ impl IbdFlow {
         consensus.async_set_pruning_smt_stable().await;
 
         info!("SMT state synced: {} lanes", stream.lane_count());
+        Ok(())
+    }
+
+    /// Download and import the shielded-pool state at the pruning point (ZKas IBD,
+    /// PLAN §2.8/§2.9): the metadata frame (frontier, supply totals, nullifier
+    /// accumulator, state root) plus the whole spent-nullifier set, streamed in
+    /// flow-controlled chunks and seeded into consensus so the pruning point's
+    /// descendants can be validated. Mirrors `sync_new_smt_state`.
+    async fn sync_new_shielded_state(&mut self, consensus: &ConsensusProxy, pruning_point: Hash) -> Result<(), ProtocolError> {
+        use super::streams::ShieldedStream;
+        use kaspa_p2p_lib::pb::RequestPruningPointShieldedStateMessage;
+
+        consensus.async_clear_pruning_shielded_stores().await;
+
+        info!("downloading the pruning point shielded state from {}", self.router);
+
+        self.router
+            .enqueue(make_message!(
+                Payload::RequestPruningPointShieldedState,
+                RequestPruningPointShieldedStateMessage { pruning_point_hash: Some(pruning_point.into()) }
+            ))
+            .await?;
+
+        let mut stream = ShieldedStream::new(&self.router, &mut self.incoming_route);
+
+        // Metadata frame. Empty `data` => the pruning point has no shielded state.
+        let md = stream.recv_metadata().await?;
+        if md.data.is_empty() {
+            consensus.async_set_pruning_shielded_stable().await;
+            info!("pruning point {} has no shielded state to import", pruning_point);
+            return Ok(());
+        }
+
+        // One chunk in flight + one being processed by the importer is enough headroom.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<[u8; 32]>>(2);
+
+        let consensus_for_import = consensus.clone();
+        let builder_handle =
+            tokio::task::spawn_blocking(move || consensus_for_import.import_pruning_point_shielded(pruning_point, md, rx));
+
+        while let Some(chunk) = stream.next_chunk().await? {
+            tx.send(chunk).await.map_err(|_| ProtocolError::Other("streaming shielded importer stopped unexpectedly"))?;
+        }
+        drop(tx);
+
+        builder_handle.await.map_err(|e| ProtocolError::OtherOwned(format!("shielded importer task panicked: {e}")))??;
+        consensus.async_set_pruning_shielded_stable().await;
+
+        info!("shielded state synced: {} nullifiers", stream.count());
         Ok(())
     }
 

@@ -83,6 +83,27 @@ impl DbNullifierSetStore {
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
         Self::new(Arc::clone(&self.db), cache_policy)
     }
+
+    /// Iterate every spent nullifier in the global set. Used to export the
+    /// shielded state at the pruning point for IBD state transfer (the global
+    /// nullifier set is append-only and unprunable — PLAN §2.9 — so a fast-synced
+    /// node must receive the full membership to reject future double-spends of
+    /// notes that were already spent before the pruning point).
+    pub fn iter_all(&self) -> impl Iterator<Item = StoreResult<[u8; 32]>> + '_ {
+        self.access.iterator().map(|res| match res {
+            Ok((key, _marker)) => {
+                let mut nf = [0u8; 32];
+                nf.copy_from_slice(&key);
+                Ok(nf)
+            }
+            Err(e) => Err(StoreError::DataInconsistency(format!("nullifier-set iteration failed: {e}"))),
+        })
+    }
+
+    /// Number of spent nullifiers in the global set (for export progress / sizing).
+    pub fn count(&self) -> usize {
+        self.access.iterator().count()
+    }
 }
 
 impl NullifierSetStoreReader for DbNullifierSetStore {

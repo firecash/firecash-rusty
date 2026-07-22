@@ -335,6 +335,55 @@ impl VirtualStateProcessor {
         self.shielded_state_manager.supply_totals_at(block)
     }
 
+    // ------------------ Pruning-point shielded-state IBD transfer ------------------
+
+    /// Server side: export the shielded state metadata at a pruning point for IBD
+    /// transfer. `Ok(None)` means the pruning point has no shielded state (empty
+    /// pool — nothing to transfer). The nullifier set is streamed separately via
+    /// [`Self::collect_pruning_point_nullifiers`].
+    pub fn export_pruning_point_shielded(
+        &self,
+        pp: kaspa_hashes::Hash,
+    ) -> Result<Option<kaspa_consensus_core::api::ShieldedExportMetadata>, kaspa_database::prelude::StoreError> {
+        let Some(md) = self.shielded_state_manager.export_pruning_point_shielded(pp)? else {
+            return Ok(None);
+        };
+        let nullifier_count = self.shielded_state_manager.nullifiers().count() as u64;
+        Ok(Some(kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count }))
+    }
+
+    /// Server side: the whole spent-nullifier set (for shielded IBD streaming).
+    pub fn collect_pruning_point_nullifiers(
+        &self,
+    ) -> Result<Vec<[u8; 32]>, kaspa_database::prelude::StoreError> {
+        self.shielded_state_manager.nullifiers().iter_all().collect()
+    }
+
+    /// Receiver side: verify + seed the shielded state at a pruning point from
+    /// transferred metadata + the full streamed nullifier set. See
+    /// [`crate::processes::shielded::PruningPointShieldedMetadata`] for how the
+    /// consensus binding (the #24 coinbase commitment) is enforced afterward.
+    pub fn seed_pruning_point_shielded(
+        &self,
+        pp: kaspa_hashes::Hash,
+        metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        nullifiers: Vec<[u8; 32]>,
+    ) -> Result<(), String> {
+        use crate::processes::shielded::{PruningPointShieldedMetadata, ShieldedStateManager};
+        let md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data)?;
+        let n = ShieldedStateManager::verify_pruning_point_shielded(&md, nullifiers.iter())?;
+        if n as u64 != metadata.nullifier_count {
+            return Err(format!("nullifier count mismatch: metadata says {}, streamed {}", metadata.nullifier_count, n));
+        }
+        let mut batch = WriteBatch::default();
+        self.shielded_state_manager
+            .seed_pruning_point_shielded(&mut batch, pp, &md, nullifiers.iter())
+            .map_err(|e| format!("seeding shielded stores failed: {e:?}"))?;
+        self.db.write(batch).unwrap();
+        info!("Imported shielded state for pruning point {}: {} nullifiers imported", pp, n);
+        Ok(())
+    }
+
     /// Reconstruct the shielded effects one **chain block** applied (PLAN §2.4),
     /// for wallet sync (`GetShieldedBlocks` RPC): the block's own coinbase mint
     /// plus its accepted shielded bundles in consensus accepted order, re-running

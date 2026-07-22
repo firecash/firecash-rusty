@@ -566,6 +566,47 @@ impl ConsensusSessionOwned {
     ) -> ConsensusResult<Box<dyn Iterator<Item = ConsensusResult<ImportLane>> + Send + 'static>> {
         self.consensus.open_pruning_point_smt_lane_stream(expected_pp)
     }
+
+    // -------------------- Shielded-pool pruning-point state (IBD) --------------------
+
+    pub async fn async_clear_pruning_shielded_stores(&self) {
+        self.clone().spawn_blocking(move |c| c.clear_pruning_shielded_stores()).await
+    }
+    pub async fn async_set_pruning_shielded_stable(&self) {
+        self.clone().spawn_blocking(move |c| c.set_pruning_shielded_stable_flag(true)).await
+    }
+    pub async fn async_is_pruning_shielded_stable(&self) -> bool {
+        self.clone().spawn_blocking(move |c| c.is_pruning_shielded_stable()).await
+    }
+    pub async fn async_get_pruning_point_shielded_metadata(
+        &self,
+        expected_pp: Hash,
+    ) -> ConsensusResult<Option<kaspa_consensus_core::api::ShieldedExportMetadata>> {
+        self.clone().spawn_blocking(move |c| c.get_pruning_point_shielded_metadata(expected_pp)).await
+    }
+    /// Synchronous passthrough to [`ConsensusApi::import_pruning_point_shielded`],
+    /// driven from `tokio::task::spawn_blocking` so the caller can interleave it
+    /// with the async work feeding `rx` — see
+    /// `protocol/flows/src/ibd/flow.rs::sync_new_shielded_state`.
+    pub fn import_pruning_point_shielded(
+        &self,
+        new_pruning_point: Hash,
+        metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        mut rx: tokio::sync::mpsc::Receiver<Vec<[u8; 32]>>,
+    ) -> PruningImportResult<()> {
+        let nullifier_batches: kaspa_consensus_core::api::ShieldedNullifierBatchIterator =
+            &mut std::iter::from_fn(move || rx.blocking_recv());
+        self.consensus.import_pruning_point_shielded(new_pruning_point, metadata, nullifier_batches)
+    }
+
+    /// Server side: open a streaming iterator over the whole spent-nullifier set at
+    /// the pruning point, driven from `spawn_blocking`.
+    pub fn open_pruning_point_shielded_nullifier_stream(
+        &self,
+        expected_pp: Hash,
+    ) -> ConsensusResult<Box<dyn Iterator<Item = ConsensusResult<[u8; 32]>> + Send + 'static>> {
+        self.consensus.open_pruning_point_shielded_nullifier_stream(expected_pp)
+    }
 }
 
 pub type ConsensusProxy = ConsensusSessionOwned;

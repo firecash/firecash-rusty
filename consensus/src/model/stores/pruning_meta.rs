@@ -17,6 +17,7 @@ pub struct PruningMetaStores {
     utxoset_position_access: CachedDbItem<Hash>,
     utxoset_stable_flag_access: CachedDbItem<bool>,
     smt_stable_flag_access: CachedDbItem<bool>,
+    shielded_stable_flag_access: CachedDbItem<bool>,
     body_missing_anticone_blocks: CachedDbItem<Vec<Hash>>,
 }
 
@@ -27,6 +28,7 @@ impl PruningMetaStores {
             utxoset_position_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::PruningUtxosetPosition.into()),
             utxoset_stable_flag_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::PruningUtxosetSyncFlag.into()),
             smt_stable_flag_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::SmtSyncFlag.into()),
+            shielded_stable_flag_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::ShieldedSyncFlag.into()),
             body_missing_anticone_blocks: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::BodyMissingAnticone.into()),
         }
     }
@@ -80,7 +82,19 @@ impl PruningMetaStores {
         self.smt_stable_flag_access.read().optional().unwrap().unwrap_or(true)
     }
 
+    pub fn set_pruning_shielded_stable_flag(&mut self, batch: &mut WriteBatch, stable: bool) -> StoreResult<()> {
+        self.shielded_stable_flag_access.write(BatchDbWriter::new(batch), &stable)
+    }
+
+    /// Default to true if missing — upgrading nodes had no shielded state to sync.
+    pub fn pruning_shielded_stable_flag(&self) -> bool {
+        self.shielded_stable_flag_access.read().optional().unwrap().unwrap_or(true)
+    }
+
     pub fn is_in_transitional_ibd_state(&self) -> bool {
-        !self.is_anticone_fully_synced() || !self.pruning_utxoset_stable_flag() || !self.pruning_smt_stable_flag()
+        !self.is_anticone_fully_synced()
+            || !self.pruning_utxoset_stable_flag()
+            || !self.pruning_smt_stable_flag()
+            || !self.pruning_shielded_stable_flag()
     }
 }

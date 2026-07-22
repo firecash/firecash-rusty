@@ -15,6 +15,8 @@ use crate::v7::{
 use crate::v8::request_block_bodies::HandleBlockBodyRequests;
 pub(crate) mod request_pruning_point_smt_state;
 use request_pruning_point_smt_state::RequestPruningPointSmtStateFlow;
+pub(crate) mod request_pruning_point_shielded_state;
+use request_pruning_point_shielded_state::RequestPruningPointShieldedStateFlow;
 
 use crate::{flow_context::FlowContext, flow_trait::Flow, ibd::IbdFlow};
 use kaspa_p2p_lib::{KaspadMessagePayloadType, Router, SharedIncomingRoute, convert::header::HeaderFormat};
@@ -47,6 +49,8 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
                 KaspadMessagePayloadType::DonePruningPointUtxoSetChunks,
                 KaspadMessagePayloadType::SmtMetadata,
                 KaspadMessagePayloadType::SmtLaneChunk,
+                KaspadMessagePayloadType::ShieldedMetadata,
+                KaspadMessagePayloadType::ShieldedNullifierChunk,
             ]),
             relay_receiver,
             body_only_ibd_permitted,
@@ -100,6 +104,14 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
             router.subscribe(vec![
                 KaspadMessagePayloadType::RequestPruningPointSmtState,
                 KaspadMessagePayloadType::RequestNextPruningPointSmtChunk,
+            ]),
+        )),
+        Box::new(RequestPruningPointShieldedStateFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![
+                KaspadMessagePayloadType::RequestPruningPointShieldedState,
+                KaspadMessagePayloadType::RequestNextPruningPointShieldedChunk,
             ]),
         )),
         Box::new(HandleIbdBlockRequests::new(

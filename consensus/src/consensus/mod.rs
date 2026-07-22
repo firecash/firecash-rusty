@@ -1685,6 +1685,70 @@ impl ConsensusApi for Consensus {
         self.pruning_meta_stores.read().pruning_smt_stable_flag()
     }
 
+    // -------------------- Shielded-pool pruning-point state (IBD) --------------------
+
+    fn get_pruning_point_shielded_metadata(
+        &self,
+        expected_pruning_point: Hash,
+    ) -> ConsensusResult<Option<kaspa_consensus_core::api::ShieldedExportMetadata>> {
+        let pp = self.pruning_point_store.read().pruning_point().unwrap();
+        if pp != expected_pruning_point {
+            return Err(ConsensusError::UnexpectedPruningPoint);
+        }
+        self.virtual_processor
+            .export_pruning_point_shielded(pp)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("shielded metadata export failed: {e}")))
+    }
+
+    fn open_pruning_point_shielded_nullifier_stream(
+        &self,
+        expected_pruning_point: Hash,
+    ) -> ConsensusResult<Box<dyn Iterator<Item = ConsensusResult<[u8; 32]>> + Send + 'static>> {
+        let pp = self.pruning_point_store.read().pruning_point().unwrap();
+        if pp != expected_pruning_point {
+            return Err(ConsensusError::UnexpectedPruningPoint);
+        }
+        let all = self
+            .virtual_processor
+            .collect_pruning_point_nullifiers()
+            .map_err(|e| ConsensusError::GeneralOwned(format!("nullifier-set collection failed: {e}")))?;
+        Ok(Box::new(all.into_iter().map(Ok)))
+    }
+
+    fn import_pruning_point_shielded(
+        &self,
+        new_pruning_point: Hash,
+        metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        nullifier_batches: kaspa_consensus_core::api::ShieldedNullifierBatchIterator<'_>,
+    ) -> PruningImportResult<()> {
+        let mut nullifiers: Vec<[u8; 32]> = Vec::with_capacity(metadata.nullifier_count as usize);
+        for batch in nullifier_batches {
+            nullifiers.extend(batch);
+        }
+        self.virtual_processor
+            .seed_pruning_point_shielded(new_pruning_point, metadata, nullifiers)
+            .map_err(PruningImportError::ShieldedStateError)?;
+        Ok(())
+    }
+
+    fn clear_pruning_shielded_stores(&self) {
+        let mut pruning_meta_write = self.pruning_meta_stores.write();
+        let mut batch = rocksdb::WriteBatch::default();
+        pruning_meta_write.set_pruning_shielded_stable_flag(&mut batch, false).unwrap();
+        self.db.write(batch).unwrap();
+    }
+
+    fn set_pruning_shielded_stable_flag(&self, val: bool) {
+        let mut pruning_meta_write = self.pruning_meta_stores.write();
+        let mut batch = rocksdb::WriteBatch::default();
+        pruning_meta_write.set_pruning_shielded_stable_flag(&mut batch, val).unwrap();
+        self.db.write(batch).unwrap();
+    }
+
+    fn is_pruning_shielded_stable(&self) -> bool {
+        self.pruning_meta_stores.read().pruning_shielded_stable_flag()
+    }
+
     /// The usual flow consists of the pruning point naturally updating during pruning, and hence maintains consistency by default
     /// During pruning catchup, we need to manually update the pruning point and
     /// make sure that consensus looks "as if" it has just moved to a new pruning point.

@@ -109,6 +109,23 @@ pub struct SmtExportMetadata {
     pub active_lanes_count: u64,
 }
 
+/// Shielded-pool state export metadata for IBD sync (PLAN §2.8/§2.9). Transfers
+/// the shielded state at the pruning point so a fast-syncing node can validate
+/// the pruning point's descendants without replaying pre-pruning shielded history.
+///
+/// `data` is the opaque encoding of `(frontier, supply totals, nullifier MuHash,
+/// state_root)` produced by the consensus layer; the unbounded global nullifier
+/// set is streamed separately in [`ShieldedNullifierBatchIterator`] batches.
+#[derive(Clone, Debug)]
+pub struct ShieldedExportMetadata {
+    pub data: Vec<u8>,
+    pub nullifier_count: u64,
+}
+
+/// Batches of spent nullifiers (each 32 bytes) streamed during pruning-point
+/// shielded-state import, mirroring [`ImportLaneBatchIterator`].
+pub type ShieldedNullifierBatchIterator<'a> = &'a mut (dyn Iterator<Item = Vec<[u8; 32]>> + Send);
+
 #[derive(Clone, Debug)]
 pub struct SeqCommitLaneEntry {
     pub tip: Hash,
@@ -376,6 +393,36 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// Compute the shielded-state export metadata at the pruning point (for P2P
+    /// streaming). `Ok(None)` means the pruning point has no shielded state (empty
+    /// pool — nothing to transfer). PLAN §2.8/§2.9.
+    fn get_pruning_point_shielded_metadata(&self, _expected_pruning_point: Hash) -> ConsensusResult<Option<ShieldedExportMetadata>> {
+        unimplemented!()
+    }
+
+    /// Open a streaming iterator over the whole spent-nullifier set at the pruning
+    /// point (server side of shielded-state IBD sync).
+    fn open_pruning_point_shielded_nullifier_stream(
+        &self,
+        _expected_pruning_point: Hash,
+    ) -> ConsensusResult<Box<dyn Iterator<Item = ConsensusResult<[u8; 32]>> + Send + 'static>> {
+        unimplemented!()
+    }
+
+    /// Import and seed the shielded state at the pruning point from transferred
+    /// metadata + streamed nullifier batches (receiver side of shielded-state IBD
+    /// sync). Verifies internal consistency before seeding; the consensus binding
+    /// is the #24 coinbase commitment enforced when the pruning point's children
+    /// are validated.
+    fn import_pruning_point_shielded(
+        &self,
+        _new_pruning_point: Hash,
+        _metadata: ShieldedExportMetadata,
+        _nullifier_batches: ShieldedNullifierBatchIterator<'_>,
+    ) -> PruningImportResult<()> {
+        unimplemented!()
+    }
+
     /// Resolve the `inactivity_shortcut_block` (the block hash anchoring the
     /// `activity_root` shortcut) from the POV of `pov_block`. Uses headers +
     /// reachability only; safe to call at the IBD PP boundary before the SMT
@@ -588,6 +635,18 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     fn is_pruning_smt_stable(&self) -> bool {
+        unimplemented!()
+    }
+
+    fn clear_pruning_shielded_stores(&self) {
+        unimplemented!()
+    }
+
+    fn set_pruning_shielded_stable_flag(&self, _val: bool) {
+        unimplemented!()
+    }
+
+    fn is_pruning_shielded_stable(&self) -> bool {
         unimplemented!()
     }
 

@@ -104,6 +104,9 @@ pub enum PruningImportError {
 
     #[error("SMT store error: {0}")]
     SmtStoreError(String),
+
+    #[error("shielded pruning-point state import error: {0}")]
+    ShieldedStateError(String),
 }
 
 #[derive(Error, Debug, Clone)]

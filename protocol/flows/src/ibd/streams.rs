@@ -15,7 +15,8 @@ use kaspa_p2p_lib::{
     convert::{header::HeaderFormat, header::Versioned, model::trusted::TrustedDataEntry},
     make_message,
     pb::{
-        RequestNextHeadersMessage, RequestNextPruningPointAndItsAnticoneBlocksMessage, RequestNextPruningPointSmtChunkMessage,
+        RequestNextHeadersMessage, RequestNextPruningPointAndItsAnticoneBlocksMessage,
+        RequestNextPruningPointShieldedChunkMessage, RequestNextPruningPointSmtChunkMessage,
         RequestNextPruningPointUtxoSetChunkMessage, kaspad_message::Payload,
     },
 };
@@ -38,6 +39,12 @@ pub const SMT_CHUNK_SIZE: usize = 4;
 pub const SMT_FLOW_CONTROL_WINDOW: usize = 10;
 #[cfg(feature = "test-smt-small-chunks")]
 pub const SMT_FLOW_CONTROL_WINDOW: usize = 2;
+
+/// Maximum number of 32-byte nullifiers carried by a single `ShieldedNullifierChunkMessage`.
+#[cfg(not(feature = "test-smt-small-chunks"))]
+pub const SHIELDED_CHUNK_SIZE: usize = 4096;
+#[cfg(feature = "test-smt-small-chunks")]
+pub const SHIELDED_CHUNK_SIZE: usize = 4;
 
 pub struct TrustedEntryStream<'a, 'b> {
     router: &'a Router,
@@ -350,5 +357,104 @@ impl<'a, 'b> SmtStream<'a, 'b> {
 
     pub fn lane_count(&self) -> u64 {
         self.lane_count
+    }
+}
+
+/// Stream of shielded-pool nullifier chunks for pruning-point IBD (PLAN §2.8/§2.9).
+/// Flow-controlled: after every [`SMT_FLOW_CONTROL_WINDOW`]-th chunk the receiver
+/// asks the sender for the next window.
+pub struct ShieldedStream<'a, 'b> {
+    router: &'a Router,
+    incoming_route: &'b mut IncomingRoute,
+    expected_count: u64,
+    nullifier_count: u64,
+    chunks_received: usize,
+}
+
+impl<'a, 'b> ShieldedStream<'a, 'b> {
+    pub fn new(router: &'a Router, incoming_route: &'b mut IncomingRoute) -> Self {
+        Self { router, incoming_route, expected_count: 0, nullifier_count: 0, chunks_received: 0 }
+    }
+
+    /// Receive the metadata frame: the opaque shielded-state encoding plus the
+    /// number of nullifiers that will follow in chunks. Empty `data` signals the
+    /// pruning point has no shielded state (nothing to import).
+    pub async fn recv_metadata(&mut self) -> Result<kaspa_consensus_core::api::ShieldedExportMetadata, ProtocolError> {
+        match timeout(DEFAULT_TIMEOUT, self.incoming_route.recv()).await {
+            Ok(Some(msg)) => match msg.payload {
+                Some(Payload::ShieldedMetadata(payload)) => {
+                    self.expected_count = payload.nullifier_count;
+                    Ok(kaspa_consensus_core::api::ShieldedExportMetadata {
+                        data: payload.data,
+                        nullifier_count: payload.nullifier_count,
+                    })
+                }
+                Some(Payload::UnexpectedPruningPoint(_)) => Err(ProtocolError::ConsensusError(ConsensusError::UnexpectedPruningPoint)),
+                _ => Err(ProtocolError::UnexpectedMessage(stringify!(Payload::ShieldedMetadata), msg.payload.as_ref().map(|v| v.into()))),
+            },
+            Ok(None) => Err(ProtocolError::ConnectionClosed),
+            Err(_) => Err(ProtocolError::Timeout(DEFAULT_TIMEOUT)),
+        }
+    }
+
+    /// Receive the next chunk of nullifiers. Returns `Ok(None)` once
+    /// `nullifier_count` nullifiers have been consumed.
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<[u8; 32]>>, ProtocolError> {
+        if self.nullifier_count >= self.expected_count {
+            return Ok(None);
+        }
+
+        let payload = match timeout(DEFAULT_TIMEOUT, self.incoming_route.recv()).await {
+            Ok(Some(msg)) => match msg.payload {
+                Some(Payload::ShieldedNullifierChunk(payload)) => payload,
+                Some(Payload::UnexpectedPruningPoint(_)) => {
+                    return Err(ProtocolError::ConsensusError(ConsensusError::UnexpectedPruningPoint));
+                }
+                _ => {
+                    return Err(ProtocolError::UnexpectedMessage(
+                        stringify!(Payload::ShieldedNullifierChunk),
+                        msg.payload.as_ref().map(|v| v.into()),
+                    ));
+                }
+            },
+            Ok(None) => return Err(ProtocolError::ConnectionClosed),
+            Err(_) => return Err(ProtocolError::Timeout(DEFAULT_TIMEOUT)),
+        };
+
+        if payload.nullifiers.is_empty() {
+            return Err(ProtocolError::Other("received an empty ShieldedNullifierChunk"));
+        }
+        if payload.nullifiers.len() > SHIELDED_CHUNK_SIZE {
+            return Err(ProtocolError::Other("ShieldedNullifierChunk exceeds SHIELDED_CHUNK_SIZE"));
+        }
+        let remaining = self.expected_count - self.nullifier_count;
+        if payload.nullifiers.len() as u64 > remaining {
+            return Err(ProtocolError::Other("received more nullifiers than nullifier_count"));
+        }
+
+        let mut out = Vec::with_capacity(payload.nullifiers.len());
+        for nf in payload.nullifiers {
+            let bytes: [u8; 32] =
+                nf.as_slice().try_into().map_err(|_| ProtocolError::Other("nullifier must be exactly 32 bytes"))?;
+            out.push(bytes);
+            self.nullifier_count += 1;
+        }
+
+        self.chunks_received += 1;
+
+        if self.nullifier_count < self.expected_count && self.chunks_received.is_multiple_of(SMT_FLOW_CONTROL_WINDOW) {
+            self.router
+                .enqueue(make_message!(
+                    Payload::RequestNextPruningPointShieldedChunk,
+                    RequestNextPruningPointShieldedChunkMessage {}
+                ))
+                .await?;
+        }
+
+        Ok(Some(out))
+    }
+
+    pub fn count(&self) -> u64 {
+        self.nullifier_count
     }
 }

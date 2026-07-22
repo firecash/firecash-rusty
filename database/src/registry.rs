@@ -97,6 +97,10 @@ pub enum DatabaseStorePrefixes {
     /// shielded state root can commit to double-spend prevention for fast/pruned
     /// sync without replaying from genesis (PLAN §2.2, §2.10).
     ShieldedNullifierMuHash = 85,
+    /// IBD sync-stability flag for the shielded pool state at the pruning point
+    /// (mirrors `SmtSyncFlag`): false while a fast-sync node is importing shielded
+    /// state, true once complete or when there is no shielded state to import.
+    ShieldedSyncFlag = 86,
 
     // ---- Separator ----
     /// Reserved as a separator

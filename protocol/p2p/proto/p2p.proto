@@ -337,3 +337,23 @@ message SmtLaneChunkMessage {
 
 message RequestNextPruningPointSmtChunkMessage {
 }
+
+// Shielded-pool state sync (ZKas IBD, PLAN §2.8/§2.9). Transfers the shielded
+// state at the pruning point so a fast-syncing node can validate the pruning
+// point's descendants without replaying pre-pruning shielded history.
+
+message RequestPruningPointShieldedStateMessage {
+  Hash pruningPointHash = 1;
+}
+
+message ShieldedMetadataMessage {
+  bytes data = 1;                  // bincode(frontier, supply totals, nullifier MuHash, state_root)
+  uint64 nullifierCount = 2;       // number of spent nullifiers that follow in chunks
+}
+
+message ShieldedNullifierChunkMessage {
+  repeated bytes nullifiers = 1;   // each 32 bytes; up to SHIELDED_CHUNK_SIZE per chunk
+}
+
+message RequestNextPruningPointShieldedChunkMessage {
+}
