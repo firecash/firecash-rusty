@@ -363,6 +363,10 @@ async fn follow(state: Arc<AppState>) {
     let mut seen_order: VecDeque<RpcHash> = backfill.iter().map(|b| b.header.hash).collect();
     const SEEN_CAP: usize = 8 * RECENT_CAP;
     let mut low = sink;
+    // Count consecutive polls where the cursor could not move forward. A healthy
+    // tip-follow sits at 0–1 (waiting for the next block); a sustained non-zero
+    // value means the cursor is pinned behind a live tip — the freeze we self-heal.
+    let mut stalled_polls: u32 = 0;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         let resp = match state.client.get_blocks(Some(low), true, true).await {
@@ -372,7 +376,6 @@ async fn follow(state: Arc<AppState>) {
                 continue;
             }
         };
-        let mut advanced = false;
         for (hash, block) in resp.block_hashes.iter().zip(resp.blocks.iter()) {
             if *hash == low || !seen.insert(*hash) {
                 continue; // page anchor or an already-ingested block
@@ -396,11 +399,33 @@ async fn follow(state: Arc<AppState>) {
             // Permanently index this block's transactions — this is what keeps a tx
             // findable after it falls out of the live ring.
             index_block(&state, block).await;
-            advanced = true;
         }
-        if let Some(last) = resp.block_hashes.last().copied() {
-            if last != low && advanced {
+        // Advance the cursor whenever the page moved forward — NOT only when we
+        // ingested something new. `get_blocks` pages overlap heavily, so a page can
+        // be entirely already-`seen` (nothing to ingest) yet still sit between us and
+        // the tip; gating the cursor on "did we ingest?" pinned `low` there forever
+        // while the real tip raced ahead (observed: indexer stuck ~19k blocks back).
+        // `seen` still dedups ingestion, so walking through seen regions is safe.
+        match resp.block_hashes.last().copied() {
+            Some(last) if last != low => {
                 low = last;
+                stalled_polls = 0;
+            }
+            _ => {
+                // Cursor could not advance. If we're genuinely at the tip this is
+                // normal (wait for the next block); if we're pinned behind a live
+                // sink, re-anchor to it so a single wedged cursor can't freeze the
+                // whole feed. A few polls of grace first to avoid needless jumps.
+                stalled_polls = stalled_polls.saturating_add(1);
+                if stalled_polls >= 5 {
+                    if let Ok(dag) = state.client.get_block_dag_info().await {
+                        if dag.sink != low {
+                            log::warn!("follow cursor pinned; re-anchoring to sink {}", dag.sink);
+                            low = dag.sink;
+                        }
+                    }
+                    stalled_polls = 0;
+                }
             }
         }
     }
