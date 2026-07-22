@@ -248,7 +248,7 @@ from!(item: &kaspa_rpc_core::RpcShieldedChainBlock, protowire::RpcShieldedChainB
             .iter()
             .map(|o| protowire::RpcShieldedCoinbaseOutput { script_public_key: o.script_public_key.to_rpc_hex(), value: o.value })
             .collect(),
-        accepted_bundles: item.accepted_bundles.iter().map(|b| b.to_rpc_hex()).collect(),
+        accepted_actions: item.accepted_actions.iter().map(|b| b.to_rpc_hex()).collect(),
         accepted_txids: item.accepted_txids.iter().map(|t| t.to_string()).collect(),
         timestamp: item.timestamp,
     }
@@ -798,7 +798,7 @@ try_from!(item: &protowire::RpcShieldedChainBlock, kaspa_rpc_core::RpcShieldedCh
                 Ok(kaspa_rpc_core::RpcShieldedCoinbaseOutput { script_public_key: Vec::from_rpc_hex(&o.script_public_key)?, value: o.value })
             })
             .collect::<Result<Vec<_>, Self::Error>>()?,
-        accepted_bundles: item.accepted_bundles.iter().map(|b| Vec::from_rpc_hex(b)).collect::<Result<Vec<_>, _>>()?,
+        accepted_actions: item.accepted_actions.iter().map(|b| Vec::from_rpc_hex(b)).collect::<Result<Vec<_>, _>>()?,
         accepted_txids: item.accepted_txids.iter().map(|t| RpcHash::from_str(t)).collect::<Result<Vec<_>, _>>()?,
         timestamp: item.timestamp,
     }

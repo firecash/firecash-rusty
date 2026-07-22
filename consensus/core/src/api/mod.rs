@@ -51,10 +51,14 @@ pub struct ShieldedChainBlockData {
     /// The coinbase outputs in order: `(script_public_key bytes, value)`. A
     /// 43-byte script is a raw Orchard recipient minting a coinbase note.
     pub coinbase_outputs: Vec<(Vec<u8>, u64)>,
-    /// Accepted shielded bundle payloads in consensus accepted order, after the
-    /// anchor-finality retain (i.e. exactly the bundles that appended leaves).
-    pub accepted_bundles: Vec<Vec<u8>>,
-    /// Transaction id of each accepted bundle, parallel to `accepted_bundles` —
+    /// Accepted shielded actions in consensus applied order, one entry per accepted
+    /// tx (parallel to `accepted_txids`): each entry is that tx's actions in **compact**
+    /// form — concatenated 148-byte `CompactActionRecord`s (nullifier ‖ cmx ‖ epk ‖
+    /// enc[52]). Served from the persisted block-time scan archive (not re-derived), so
+    /// it is the exact applied set and survives body pruning. A wallet chunks each entry
+    /// by 148, trial-decrypts with `scan_compact`, and appends every `cmx` to its tree.
+    pub accepted_actions: Vec<Vec<u8>>,
+    /// Transaction id of each accepted tx, parallel to `accepted_actions` —
     /// lets a wallet date/link its history rows to real transactions.
     pub accepted_txids: Vec<Hash>,
     /// The chain block's header timestamp (ms since epoch) — the display time of

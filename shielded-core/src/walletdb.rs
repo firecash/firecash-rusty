@@ -48,7 +48,7 @@ use zcash_note_encryption::try_output_recovery_with_ovk;
 use crate::bundle::ShieldedBundle;
 use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};
 use crate::tree::{FrontierState, GlobalTree, TREE_DEPTH};
-use crate::wallet::scan::{ReceivedNote, reconstruct_action, scan_bundle_prepared, trim_memo};
+use crate::wallet::scan::{CompactActionRecord, ReceivedNote, reconstruct_action, scan_bundle_prepared, scan_compact_prepared, trim_memo};
 
 /// A note the wallet owns and can spend. The membership witness is **not** held
 /// live per note (that made scanning O(N²) — every leaf advanced every owned
@@ -566,6 +566,116 @@ impl WalletDb {
         }
     }
 
+    // ---- Compact ingest (ZKas compact block / pruning-survivable scan archive) ----
+
+    /// Ingest a chain block from its **compact** scan record (see
+    /// [`CompactActionRecord`]): the same leaf/nullifier/tree effects as
+    /// [`Self::ingest_block_with_meta`], but each accepted tx is given as its actions
+    /// in compact form rather than a full bundle. This is what a wallet ingests from
+    /// `GetShieldedBlocks` on a compact-archive node: value, spend-detection, and the
+    /// commitment tree are fully recovered; only outgoing-spend detail (recipient /
+    /// memo / fee — carried in the full bundle's out_ciphertext / value_balance) is not
+    /// reconstructable here and comes from the wallet's own send-time record instead.
+    pub fn ingest_block_compact_with_meta(
+        &mut self,
+        coinbase: &[(CoinbaseNoteDesc, u64)],
+        txs: &[Vec<CompactActionRecord>],
+        meta: Option<&BlockMeta>,
+    ) {
+        if let Some(m) = meta {
+            self.last_daa = self.last_daa.max(m.daa_score);
+        }
+        for (desc, value) in coinbase {
+            let Ok(cmx) = coinbase_note_commitment(desc, *value) else { continue };
+            let owned = self.recover_coinbase_note(desc, *value);
+            if owned.is_some() {
+                if let Some(m) = meta {
+                    self.record_coinbase_history(*value, m);
+                }
+            }
+            self.append_leaf(cmx, owned);
+        }
+        self.ingest_bundles_compact(txs, meta);
+    }
+
+    /// [`Self::ingest_block_compact_with_meta`] with **precomputed** coinbase leaf
+    /// commitments (see [`Self::ingest_block_precomputed_with_meta`]) — the shared
+    /// leaf-cache path a hosted daemon uses so the coinbase Sinsemilla work is done
+    /// once per block, not once per wallet.
+    pub fn ingest_block_compact_precomputed_with_meta(
+        &mut self,
+        coinbase: &[(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)],
+        txs: &[Vec<CompactActionRecord>],
+        meta: Option<&BlockMeta>,
+    ) {
+        if let Some(m) = meta {
+            self.last_daa = self.last_daa.max(m.daa_score);
+        }
+        for (desc, value, cmx) in coinbase {
+            let owned = self.recover_coinbase_note(desc, *value);
+            if owned.is_some() {
+                if let Some(m) = meta {
+                    self.record_coinbase_history(*value, m);
+                }
+            }
+            self.append_leaf(*cmx, owned);
+        }
+        self.ingest_bundles_compact(txs, meta);
+    }
+
+    /// Compact counterpart of [`Self::ingest_bundles`] — identical drop rule and
+    /// tree-append order, over compact action records.
+    fn ingest_bundles_compact(&mut self, txs: &[Vec<CompactActionRecord>], meta: Option<&BlockMeta>) {
+        for (bi, records) in txs.iter().enumerate() {
+            if records.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+                continue;
+            }
+            let spent: u64 = records.iter().filter_map(|a| self.owned_note_value(&a.nullifier)).sum();
+            let received = scan_compact_prepared(&self.prepared_ivk, records);
+            for (i, rec) in records.iter().enumerate() {
+                self.notes.retain(|n| n.nullifier != rec.nullifier);
+                self.pending_spends.retain(|p| p.note.nullifier != rec.nullifier);
+                self.spent_nullifiers.insert(rec.nullifier);
+
+                let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&rec.cmx)) else {
+                    continue;
+                };
+                let owned = received.iter().find(|r| r.action_index == i).map(|r| r.note.clone());
+                self.append_leaf(cmx, owned);
+            }
+            if let Some(m) = meta {
+                if let Some(txid) = m.txids.get(bi).copied() {
+                    self.record_income_history_compact(spent, &received, txid, m);
+                }
+            }
+        }
+    }
+
+    /// Record income history for a compact-ingested tx. Compact records carry no
+    /// out_ciphertext / value_balance, so an outgoing spend's recipient/memo/fee are
+    /// not reconstructable from the chain (that detail is recorded at send time);
+    /// here we record only income we received (memo is empty in compact form).
+    fn record_income_history_compact(&mut self, spent: u64, received: &[ReceivedNote], txid: [u8; 32], meta: &BlockMeta) {
+        if !self.history_enabled {
+            return;
+        }
+        let received_value: u64 = received.iter().map(|r| r.value()).sum();
+        if spent > 0 || received_value == 0 {
+            return; // our own spend (recorded at send time) or not our tx
+        }
+        let entry = HistoryEntry {
+            kind: HistoryKind::Received,
+            txid,
+            daa_score: meta.daa_score,
+            timestamp_ms: meta.timestamp_ms,
+            amount: received_value,
+            fee: 0,
+            recipient: received.first().map(|note| note.note.recipient().to_raw_address_bytes()),
+            memo: Vec::new(),
+        };
+        self.history.push(entry);
+    }
+
     /// Value of the owned note (unspent or pending-spend) this nullifier would
     /// reveal, if it is one of ours.
     fn owned_note_value(&self, nullifier: &[u8; 32]) -> Option<u64> {
@@ -777,6 +887,35 @@ impl WalletDb {
                 p.outgoing += spent.saturating_sub(received);
             } else {
                 // Nothing of ours was spent, so this is money genuinely arriving.
+                p.incoming += received;
+            }
+        }
+        p
+    }
+
+    /// Compact counterpart of [`Self::preview_block`] — same in/out accounting over
+    /// compact action records (used for blocks inside the reorg margin).
+    pub fn preview_block_compact(&self, coinbase: &[(CoinbaseNoteDesc, u64)], txs: &[Vec<CompactActionRecord>]) -> Preview {
+        let mut p = Preview::default();
+        for (desc, value) in coinbase {
+            if self.recover_coinbase_note(desc, *value).is_some() {
+                p.incoming += *value as u128;
+            }
+        }
+        for records in txs {
+            if records.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+                continue;
+            }
+            let spent: u128 = records
+                .iter()
+                .filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier))
+                .map(|n| n.value() as u128)
+                .sum();
+            let received: u128 =
+                scan_compact_prepared(&self.prepared_ivk, records).iter().map(|r| r.note.value().inner() as u128).sum();
+            if spent > 0 {
+                p.outgoing += spent.saturating_sub(received);
+            } else {
                 p.incoming += received;
             }
         }

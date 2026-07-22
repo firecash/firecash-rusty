@@ -32,8 +32,9 @@ use kaspa_muhash::MuHash;
 
 use crate::model::stores::shielded::{
     AnchorBlockStoreReader, DbAnchorBlockStore, DbNullifierDiffStore, DbNullifierSetStore, DbShieldedNullifierMuHashStore,
-    DbShieldedSupplyStore, DbShieldedTreeStore, NullifierDiffStoreReader, NullifierSetStore, NullifierSetStoreReader,
-    ShieldedNullifierMuHashStoreReader, ShieldedSupplyStoreReader, ShieldedTreeStoreReader, SupplyTotals,
+    DbShieldedScanBlockStore, DbShieldedSupplyStore, DbShieldedTreeStore, NullifierDiffStoreReader, NullifierSetStore,
+    NullifierSetStoreReader, ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData, ShieldedScanBlockStoreReader,
+    ShieldedSupplyStoreReader, ShieldedTreeStoreReader, SupplyTotals,
 };
 
 /// A computed (not-yet-persisted) shielded transition for one chain block.
@@ -50,6 +51,11 @@ pub struct ComputedBlockShielded {
     pub nullifier_muhash: MuHash,
     /// Conflict-resolution outcome: surviving txs, new nullifiers, new anchor.
     pub outcome: BlockShieldedOutcome,
+    /// Compact scan record of this block's applied effects (PLAN §2.9), attached by
+    /// the virtual processor from the block-time applied set. `None` on the template
+    /// path (nothing to persist) or a shielded-inactive block; `persist` writes it in
+    /// the commit batch when present.
+    pub scan_block: Option<ShieldedScanBlockData>,
 }
 
 impl ComputedBlockShielded {
@@ -209,6 +215,7 @@ pub struct ShieldedStateManager {
     supply_store: DbShieldedSupplyStore,
     nullifier_muhash: DbShieldedNullifierMuHashStore,
     anchor_block: DbAnchorBlockStore,
+    scan_block: DbShieldedScanBlockStore,
 }
 
 impl ShieldedStateManager {
@@ -222,8 +229,14 @@ impl ShieldedStateManager {
             tree_store: DbShieldedTreeStore::new(Arc::clone(&db), cache_policy),
             supply_store: DbShieldedSupplyStore::new(Arc::clone(&db), cache_policy),
             nullifier_muhash: DbShieldedNullifierMuHashStore::new(Arc::clone(&db), cache_policy),
-            anchor_block: DbAnchorBlockStore::new(db, cache_policy),
+            anchor_block: DbAnchorBlockStore::new(Arc::clone(&db), cache_policy),
+            scan_block: DbShieldedScanBlockStore::new(db, cache_policy),
         }
+    }
+
+    /// Read-only access to the compact scan archive (for `GetShieldedBlocks`).
+    pub fn scan_block(&self, block: Hash) -> StoreResult<Option<ShieldedScanBlockData>> {
+        self.scan_block.get(block)
     }
 
     /// Read-only access to the nullifier store (for validation / queries).
@@ -346,6 +359,10 @@ impl ShieldedStateManager {
             },
             nullifier_muhash,
             outcome,
+            // Attached by the virtual processor from the block-time applied set
+            // (it has the original bundle ciphertexts + coinbase); `compute` sees
+            // only the distilled `ShieldedTx`, so it cannot build the scan record.
+            scan_block: None,
         })
     }
 
@@ -377,6 +394,16 @@ impl ShieldedStateManager {
         // accumulator is add-only along a chain, so once non-empty it stays so.
         if computed.nullifier_muhash.clone().finalize() != kaspa_muhash::EMPTY_MUHASH {
             self.nullifier_muhash.set_batch(batch, block, computed.nullifier_muhash.clone())?;
+        }
+        // Compact scan archive (PLAN §2.9): persist the block-time applied effects in
+        // the same commit batch, so `GetShieldedBlocks` serves this exact record —
+        // fixing the divergent-anchor drift (no RPC re-derivation) — and history stays
+        // scannable after the body prunes. Written whenever the block had shielded
+        // effects (coinbase notes or accepted actions).
+        if let Some(scan) = &computed.scan_block {
+            if !scan.coinbase_outputs.is_empty() || !scan.accepted.is_empty() {
+                self.scan_block.set_batch(batch, block, scan.clone())?;
+            }
         }
         Ok(())
     }

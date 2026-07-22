@@ -42,6 +42,7 @@ use kaspa_hashes::Hash;
 use kaspa_muhash::MuHash;
 use kaspa_shielded_core::bundle::ShieldedBundle;
 use kaspa_shielded_core::state::ShieldedTx;
+use kaspa_shielded_core::wallet::CompactActionRecord;
 use kaspa_utils::refs::Refs;
 
 use crate::model::services::seq_commit_accessor::SeqCommitAccessor;
@@ -91,6 +92,13 @@ pub(super) struct UtxoProcessingContext<'a> {
     /// (PLAN §2.4). Collected during UTXO processing; consumed by the shielded
     /// state transition in verification/commit.
     pub shielded_txs: Vec<ShieldedTx>,
+    /// Compact scan records (txid + compact action bytes) for each collected shielded
+    /// tx, kept **parallel** to `shielded_txs` through the partition/retain so the
+    /// block-time applied set can be archived for wallet sync (`GetShieldedBlocks`)
+    /// and pruning (PLAN §2.9). Distilled from the original bundle wire at collection
+    /// (the only point the ciphertexts are in hand); `ShieldedTx` itself carries only
+    /// commitments, not the ciphertexts a receiver needs.
+    pub shielded_scan: Vec<crate::model::stores::shielded::ShieldedScanTx>,
     /// The validated shielded transition for this block, computed during
     /// verification and persisted at commit.
     pub shielded_computed: Option<ComputedBlockShielded>,
@@ -110,6 +118,7 @@ impl<'a> UtxoProcessingContext<'a> {
             mergeset_acceptance_data: Vec::with_capacity(mergeset_size),
             pruning_sample_from_pov: Default::default(),
             shielded_txs: Vec::new(),
+            shielded_scan: Vec::new(),
             shielded_computed: None,
         }
     }
@@ -196,9 +205,20 @@ impl VirtualStateProcessor {
                     // it somehow does not, we DROP that transaction rather than disqualify
                     // the merging block: a single unusable merged tx must never be able to
                     // halt the chain (see the accepted-order drop principle, PLAN §2.4).
-                    if let Some(stx) =
-                        ShieldedBundle::from_bytes(&validated_tx.tx().payload).ok().and_then(|b| ShieldedTx::from_bundle(&b).ok())
+                    if let Some((stx, bundle)) = ShieldedBundle::from_bytes(&validated_tx.tx().payload)
+                        .ok()
+                        .and_then(|b| ShieldedTx::from_bundle(&b).ok().map(|stx| (stx, b)))
                     {
+                        // Distill the bundle's actions to compact scan records now, while
+                        // the ciphertexts are in hand (kept parallel to shielded_txs).
+                        let mut action_bytes = Vec::with_capacity(bundle.actions.len() * CompactActionRecord::SERIALIZED_LEN);
+                        for a in &bundle.actions {
+                            action_bytes.extend_from_slice(&CompactActionRecord::from_wire(a).to_bytes());
+                        }
+                        ctx.shielded_scan.push(crate::model::stores::shielded::ShieldedScanTx {
+                            txid: validated_tx.id(),
+                            action_bytes,
+                        });
                         ctx.shielded_txs.push(stx);
                         shielded_tx_sources.push(merged_block);
                     } else {
@@ -246,7 +266,7 @@ impl VirtualStateProcessor {
             let keep = self.shielded_state_manager.partition_applied(&ctx.shielded_txs, |stx| {
                 self.is_shielded_anchor_final(&stx.anchor, selected_parent, block_blue_score)
             });
-            let UtxoProcessingContext { shielded_txs, mergeset_rewards, .. } = ctx;
+            let UtxoProcessingContext { shielded_txs, shielded_scan, mergeset_rewards, .. } = ctx;
             let mut idx = 0usize;
             let mut dropped = 0usize;
             shielded_txs.retain(|stx| {
@@ -260,6 +280,14 @@ impl VirtualStateProcessor {
                         stx.fee;
                     dropped += 1;
                 }
+                keep_it
+            });
+            // Keep the parallel scan records aligned with the retained shielded_txs
+            // (same keep mask), so `outcome.accepted` indexes both identically.
+            let mut sidx = 0usize;
+            shielded_scan.retain(|_| {
+                let keep_it = keep[sidx];
+                sidx += 1;
                 keep_it
             });
             if dropped > 0 {
@@ -389,7 +417,36 @@ impl VirtualStateProcessor {
         // `compute`'s own conflict resolution re-runs on this set as defense in
         // depth (it is a no-op for a correctly partitioned set).
         match self.shielded_state_manager.compute(ctx.selected_parent(), coinbase_mint.as_ref(), &ctx.shielded_txs) {
-            Ok(computed) => ctx.shielded_computed = Some(computed),
+            Ok(mut computed) => {
+                // Build the compact scan archive from the block-time applied set:
+                // `outcome.accepted` indexes the retained `shielded_txs`, which is kept
+                // parallel to `shielded_scan`. Persisting this (in `persist`, commit
+                // batch) lets `GetShieldedBlocks` serve the exact applied truth instead
+                // of re-deriving it — killing the divergent-anchor drift — and keeps
+                // history scannable after the body prunes (PLAN §2.9).
+                let accepted = computed
+                    .outcome
+                    .accepted
+                    .iter()
+                    .map(|&i| ctx.shielded_scan[i].clone())
+                    .collect::<Vec<_>>();
+                // Coinbase notes exist only on a shielded-coinbase network; on a
+                // transparent-coinbase network txs[0]'s outputs are UTXOs, not notes.
+                let coinbase_outputs = if self.shielded_coinbase {
+                    txs[0].outputs.iter().map(|o| (o.script_public_key.script().to_vec(), o.value)).collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                computed.scan_block = Some(crate::model::stores::shielded::ShieldedScanBlockData {
+                    blue_score: ctx.ghostdag_data.blue_score,
+                    daa_score: header.daa_score,
+                    timestamp: header.timestamp,
+                    coinbase_txid: txs[0].id(),
+                    coinbase_outputs,
+                    accepted,
+                });
+                ctx.shielded_computed = Some(computed);
+            }
             Err(crate::processes::shielded::ShieldedManagerError::State(e)) => {
                 return Err(InvalidShieldedState(header.hash, format!("{e:?}")));
             }

@@ -101,6 +101,13 @@ pub enum DatabaseStorePrefixes {
     /// (mirrors `SmtSyncFlag`): false while a fast-sync node is importing shielded
     /// state, true once complete or when there is no shielded state to import.
     ShieldedSyncFlag = 86,
+    /// Per-chain-block **compact scan archive** (ZKas compact block): the exact
+    /// applied-set effects (coinbase note descriptors + accepted shielded actions
+    /// in compact 148-byte form) recorded at validation time so wallet sync
+    /// (`GetShieldedBlocks`) serves the persisted block-time truth instead of
+    /// re-deriving it — and so history stays scannable after the full block body
+    /// is pruned (PLAN §2.9 pruning). Written in the block-commit batch.
+    ShieldedScanBlock = 87,
 
     // ---- Separator ----
     /// Reserved as a separator

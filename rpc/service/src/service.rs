@@ -763,7 +763,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                         .into_iter()
                         .map(|(script_public_key, value)| RpcShieldedCoinbaseOutput { script_public_key, value })
                         .collect(),
-                    accepted_bundles: d.accepted_bundles,
+                    accepted_actions: d.accepted_actions,
                     accepted_txids: d.accepted_txids,
                     timestamp: d.timestamp,
                 });

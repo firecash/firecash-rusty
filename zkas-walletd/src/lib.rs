@@ -47,6 +47,7 @@ use kaspa_shielded_core::message::{FVK_LEN, SIG_LEN, sign_message, verify_messag
 use kaspa_shielded_core::orchard_recipient_bytes;
 use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
+use kaspa_shielded_core::wallet::CompactActionRecord;
 use kaspa_shielded_core::wallet::build::{PreparedPayment, build_wallet_payment, finalize_payment, prepare_payment, proving_key};
 use kaspa_shielded_core::walletdb::{BlockMeta, HistoryKind, OwnedNote, Preview, WalletDb};
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
@@ -1117,8 +1118,10 @@ struct DecodedBlock {
     blue_score: u64,
     daa_score: u64,
     coinbase: Vec<(kaspa_shielded_core::coinbase::CoinbaseNoteDesc, u64, kaspa_shielded_core::ExtractedNoteCommitment)>,
-    bundles: Vec<ShieldedBundle>,
-    /// Txid per decoded bundle (parallel to `bundles`), from the v2 RPC fields.
+    /// Accepted txs' actions in compact form (parallel to `txids`), from the
+    /// node's compact scan archive (`accepted_actions`).
+    compact: Vec<Vec<CompactActionRecord>>,
+    /// Txid per accepted tx (parallel to `compact`), from the v2 RPC fields.
     /// Empty when the node predates them — history simply isn't recorded then.
     txids: Vec<[u8; 32]>,
     coinbase_txid: [u8; 32],
@@ -1161,13 +1164,13 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
             }
         }
     }
-    // Keep the txid pairing aligned through the decode filter: a payload that fails
-    // to parse drops its txid with it.
-    let mut bundles = Vec::with_capacity(b.accepted_bundles.len());
-    let mut txids = Vec::with_capacity(b.accepted_bundles.len());
-    for (i, p) in b.accepted_bundles.iter().enumerate() {
-        if let Ok(bun) = ShieldedBundle::from_bytes(p) {
-            bundles.push(bun);
+    // Chunk each accepted tx's compact bytes into 148-byte records; keep the txid
+    // pairing aligned (a malformed length drops its txid with it).
+    let mut compact = Vec::with_capacity(b.accepted_actions.len());
+    let mut txids = Vec::with_capacity(b.accepted_actions.len());
+    for (i, bytes) in b.accepted_actions.iter().enumerate() {
+        if let Some(records) = decode_compact_actions(bytes) {
+            compact.push(records);
             txids.push(b.accepted_txids.get(i).map(|h| h.as_bytes()).unwrap_or([0u8; 32]));
         }
     }
@@ -1176,11 +1179,20 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
         blue_score: b.blue_score,
         daa_score: b.daa_score,
         coinbase,
-        bundles,
+        compact,
         txids,
         coinbase_txid: b.coinbase_txid.as_bytes(),
         timestamp: b.timestamp,
     }
+}
+
+/// Chunk a node's concatenated compact-action bytes into [`CompactActionRecord`]s.
+/// `None` if the length is not a whole number of 148-byte records.
+fn decode_compact_actions(bytes: &[u8]) -> Option<Vec<CompactActionRecord>> {
+    if bytes.len() % CompactActionRecord::SERIALIZED_LEN != 0 {
+        return None;
+    }
+    bytes.chunks_exact(CompactActionRecord::SERIALIZED_LEN).map(CompactActionRecord::from_bytes).collect()
 }
 
 struct PageCache {
@@ -1491,13 +1503,12 @@ impl WalletEntry {
                         let mut preview = Preview::default();
                         let mut nulls = HashSet::new();
                         for u in &resp.blocks[i..] {
-                            let bundle_refs: Vec<&ShieldedBundle> = u.bundles.iter().collect();
                             let cb: Vec<(CoinbaseNoteDesc, u64)> = u.coinbase.iter().map(|(d, v, _)| (d.clone(), *v)).collect();
-                            preview.add(self.db.preview_block(&cb, &bundle_refs));
+                            preview.add(self.db.preview_block_compact(&cb, &u.compact));
                             // Remember what these blocks spend, so the same tx still sitting in
                             // the mempool is not counted a second time (see `mempool`).
-                            for b in &bundle_refs {
-                                for a in &b.actions {
+                            for records in &u.compact {
+                                for a in records {
                                     nulls.insert(a.nullifier);
                                 }
                             }
@@ -1510,16 +1521,15 @@ impl WalletEntry {
                     // Ingest with the coinbase commitments the shared cache already
                     // computed for this block — the Sinsemilla work is not repeated per
                     // wallet.
-                    let bundle_refs: Vec<&ShieldedBundle> = b.bundles.iter().collect();
                     // History dating needs the v2 RPC fields; a pre-v2 node serves
                     // timestamp 0 and no txids — sync still works, history is skipped.
-                    let meta = (b.timestamp > 0 && b.txids.len() == b.bundles.len()).then(|| BlockMeta {
+                    let meta = (b.timestamp > 0 && b.txids.len() == b.compact.len()).then(|| BlockMeta {
                         coinbase_txid: b.coinbase_txid,
                         txids: b.txids.clone(),
                         timestamp_ms: b.timestamp,
                         daa_score: b.daa_score,
                     });
-                    self.db.ingest_block_precomputed_with_meta(&b.coinbase, &bundle_refs, meta.as_ref());
+                    self.db.ingest_block_compact_precomputed_with_meta(&b.coinbase, &b.compact, meta.as_ref());
                     self.low = b.hash;
                     self.scanned = b.daa_score as usize;
                     self.boundaries.push_back((b.blue_score, self.db.size()));
@@ -1761,9 +1771,8 @@ fn ingest_shielded_chain_block(db: &mut WalletDb, blk: &RpcShieldedChainBlock) {
             coinbase_notes.push((derive_coinbase_note_desc(recipient, &note_seed), out.value));
         }
     }
-    let bundles: Vec<ShieldedBundle> = blk.accepted_bundles.iter().filter_map(|p| ShieldedBundle::from_bytes(p).ok()).collect();
-    let bundle_refs: Vec<&ShieldedBundle> = bundles.iter().collect();
-    db.ingest_block(&coinbase_notes, &bundle_refs);
+    let compact: Vec<Vec<CompactActionRecord>> = blk.accepted_actions.iter().filter_map(|b| decode_compact_actions(b)).collect();
+    db.ingest_block_compact_with_meta(&coinbase_notes, &compact, None);
 }
 
 /// One-off replay of the settled **matured** chain prefix into a fresh wallet

@@ -578,9 +578,9 @@ pub struct RpcShieldedChainBlock {
     pub daa_score: u64,
     pub coinbase_txid: RpcHash,
     pub coinbase_outputs: Vec<RpcShieldedCoinbaseOutput>,
-    /// Accepted shielded bundle payloads, consensus accepted order, post-retain.
-    pub accepted_bundles: Vec<Vec<u8>>,
-    /// Transaction id of each accepted bundle, parallel to `accepted_bundles`
+    /// Accepted shielded actions in compact form (concatenated 148-byte records) per accepted tx, applied order.
+    pub accepted_actions: Vec<Vec<u8>>,
+    /// Transaction id of each accepted tx, parallel to `accepted_actions`
     /// (empty from a pre-v2 node) — dates/links wallet history rows.
     pub accepted_txids: Vec<RpcHash>,
     /// Chain block header timestamp, ms since epoch (0 from a pre-v2 node).
@@ -595,7 +595,7 @@ impl Serializer for RpcShieldedChainBlock {
         store!(u64, &self.daa_score, writer)?;
         store!(RpcHash, &self.coinbase_txid, writer)?;
         serialize!(Vec<RpcShieldedCoinbaseOutput>, &self.coinbase_outputs, writer)?;
-        store!(Vec<Vec<u8>>, &self.accepted_bundles, writer)?;
+        store!(Vec<Vec<u8>>, &self.accepted_actions, writer)?;
         store!(Vec<RpcHash>, &self.accepted_txids, writer)?;
         store!(u64, &self.timestamp, writer)?;
         Ok(())
@@ -610,11 +610,11 @@ impl Deserializer for RpcShieldedChainBlock {
         let daa_score = load!(u64, reader)?;
         let coinbase_txid = load!(RpcHash, reader)?;
         let coinbase_outputs = deserialize!(Vec<RpcShieldedCoinbaseOutput>, reader)?;
-        let accepted_bundles = load!(Vec<Vec<u8>>, reader)?;
+        let accepted_actions = load!(Vec<Vec<u8>>, reader)?;
         // v2 appended the history-dating fields; a v1 blob simply lacks them.
         let (accepted_txids, timestamp) =
             if version >= 2 { (load!(Vec<RpcHash>, reader)?, load!(u64, reader)?) } else { (Vec::new(), 0) };
-        Ok(Self { hash, blue_score, daa_score, coinbase_txid, coinbase_outputs, accepted_bundles, accepted_txids, timestamp })
+        Ok(Self { hash, blue_score, daa_score, coinbase_txid, coinbase_outputs, accepted_actions, accepted_txids, timestamp })
     }
 }
 

@@ -395,11 +395,118 @@ impl AnchorBlockStoreReader for DbAnchorBlockStore {
     }
 }
 
+// ---------------------- Compact scan archive (ZKas compact block) ----------------------
+
+/// The exact shielded effects one accepted chain block applied, in **compact**
+/// pruning-survivable form (PLAN §2.9). Recorded at validation time (from the
+/// block-time applied set — `BlockShieldedOutcome.accepted`), so wallet sync
+/// (`GetShieldedBlocks`) serves this persisted truth rather than re-deriving it
+/// from block bodies that (a) drift once source blocks prune — the divergent-anchor
+/// receive bug — and (b) may be pruned entirely.
+///
+/// It is self-contained (does not read any store that pruning may delete): the
+/// header-derived fields are snapshotted here too, so a single store read serves a
+/// block even after its body, ghostdag and acceptance data are gone.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ShieldedScanBlockData {
+    pub blue_score: u64,
+    pub daa_score: u64,
+    pub timestamp: u64,
+    /// Coinbase tx id — the wallet derives this block's coinbase notes
+    /// deterministically from `(coinbase_txid, output index, recipient)`.
+    pub coinbase_txid: Hash,
+    /// Each coinbase output's `(script_public_key script bytes, value)`. The script
+    /// carries the recipient's 43-byte Orchard address; the value is public.
+    pub coinbase_outputs: Vec<(Vec<u8>, u64)>,
+    /// Accepted shielded txs in consensus applied order, each with its actions in
+    /// compact form (`CompactActionRecord::to_bytes()`, 148 bytes each, concatenated).
+    pub accepted: Vec<ShieldedScanTx>,
+}
+
+/// One accepted shielded tx's compact effects within a [`ShieldedScanBlockData`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShieldedScanTx {
+    pub txid: Hash,
+    /// Concatenated 148-byte compact action records (nullifier ‖ cmx ‖ epk ‖ enc[52]).
+    pub action_bytes: Vec<u8>,
+}
+
+impl MemSizeEstimator for ShieldedScanBlockData {}
+
+pub trait ShieldedScanBlockStoreReader {
+    /// The compact scan record for a chain block, or `None` if it recorded no
+    /// shielded effects (or was written by a pre-archive node).
+    fn get(&self, block: Hash) -> StoreResult<Option<ShieldedScanBlockData>>;
+}
+
+/// Per-chain-block compact scan archive. Written in the block-commit `WriteBatch`
+/// (so it is crash-consistent with the block), and intentionally NOT reorg-reverted:
+/// like the anchor index it is keyed by chain-block hash, and an abandoned branch's
+/// record is simply never served (its block is off the selected chain). Retained
+/// across pruning by the pruning processor for scan-retention nodes.
+#[derive(Clone)]
+pub struct DbShieldedScanBlockStore {
+    db: Arc<DB>,
+    access: CachedDbAccess<Hash, ShieldedScanBlockData, BlockHasher>,
+}
+
+impl DbShieldedScanBlockStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedScanBlock.into()) }
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash, data: ShieldedScanBlockData) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), block, data)
+    }
+
+    pub fn delete_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), block)
+    }
+}
+
+impl ShieldedScanBlockStoreReader for DbShieldedScanBlockStore {
+    fn get(&self, block: Hash) -> StoreResult<Option<ShieldedScanBlockData>> {
+        match self.access.read(block) {
+            Ok(d) => Ok(Some(d)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kaspa_database::create_temp_db;
     use kaspa_database::prelude::ConnBuilder;
+
+    #[test]
+    fn scan_block_store_roundtrip() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbShieldedScanBlockStore::new(db.clone(), CachePolicy::Count(16));
+        let block = Hash::from_bytes([4u8; 32]);
+        assert!(store.get(block).unwrap().is_none());
+        let data = ShieldedScanBlockData {
+            blue_score: 42,
+            daa_score: 40,
+            timestamp: 1234,
+            coinbase_txid: Hash::from_bytes([7u8; 32]),
+            coinbase_outputs: vec![(vec![9u8; 43], 60_00000000)],
+            accepted: vec![ShieldedScanTx { txid: Hash::from_bytes([5u8; 32]), action_bytes: vec![1u8; 148 * 2] }],
+        };
+        let mut b = WriteBatch::default();
+        store.set_batch(&mut b, block, data.clone()).unwrap();
+        db.write(b).unwrap();
+        let got = store.get(block).unwrap().expect("present");
+        assert_eq!(got.blue_score, 42);
+        assert_eq!(got.coinbase_outputs, data.coinbase_outputs);
+        assert_eq!(got.accepted.len(), 1);
+        assert_eq!(got.accepted[0].action_bytes.len(), 296);
+    }
 
     #[test]
     fn anchor_block_index_roundtrip() {
