@@ -161,6 +161,28 @@ EXIT 0. Note: this is mempool/relay policy (not block validity), but it must shi
 chain's live production model from genesis (it already merge-mines Kaspa, ~20-25 KAS
 blocks/h), not a future fork. This also exercises the aux-PoW path from block 0.
 
+### #9a — Emission: lower the perpetual tail floor 3 → 0.6 FC/s ✅ DONE + tested (this session, `7316758`)
+
+**Decision (user).** The final (forever) tail floor is lowered from **3 → 0.6 coins/block**
+(at 1 BPS), keeping the existing two-step logic unchanged. Code:
+`TAIL_SUBSIDY_FINAL_PER_SEC_SOMPI: 300_000_000 → 60_000_000` (`processes/coinbase.rs`). The
+initial tail (6 FC/s until real month 24) and the deflationary curve (60 FC/s start, halving
+every 3 months) are untouched.
+
+**Effect.** Perpetual issuance drops from ~95M → **~18.9M coins/year**. As a rate it is
+**~2.2% at tail onset (~yr 2)** and disinflationary thereafter — ~1.9% (yr 10), ~1.6% (yr 20),
+~1.1% (yr 50) — because absolute issuance is fixed while supply grows. (Was ~10% at onset.)
+~836M of supply is minted in the first ~2 years by the aggressive 3-month halving, so the
+tail sets the perpetual floor, not the bulk.
+
+**Tests (VPS3, green):** all 10 `kaspa-consensus coinbase` tests pass (incl. `subsidy_test`,
+`calc_high_bps_total_rewards_delta`) — they derive expected values from the live constant, so
+no test edits were needed.
+
+**Still open under emission (#9):** the pre-existing `WrongSubsidy` failure in
+`body_validation_in_context` — the *genesis-block* subsidy value, separate from the tail —
+must be finalized + its test updated before genesis lock.
+
 ---
 
 ## OUT of the reset bundle
@@ -176,12 +198,20 @@ blocks/h), not a future fork. This also exercises the aux-PoW path from block 0.
 
 ## Remaining before cutting the reset binary
 
-1. **#6 — Genesis difficulty retune** (the only consensus item left). Needs the target
-   starting difficulty / block time for the new genesis (or "same as current mainnet" →
-   pull live numbers off the node). See `mainnet-mining-difficulty` memory.
-2. **Reset execution.** Regenerate genesis with the full bundle; cut the binary; coordinate
-   the relaunch in order: **node → wallets/walletd → pool/bridge**. (Genesis regeneration
-   also resets the merged-mining activation timeline; `always()` needs no DAA pick.)
+1. **#9 — Finalize the genesis-block subsidy** (tail floor now done, see #9a). The pre-existing
+   `WrongSubsidy` failure in `body_validation_in_context` is the genesis subsidy value; finalize
+   it + update the test.
+2. **#6 — Genesis difficulty retune.** Live difficulty has self-adjusted to ~7.5e13 at the real
+   merged-mining hashrate; genesis is `0x1e7fffff` (difficulty 65,536 — ~1.1e9× too easy), and
+   the CPU low-difficulty ramp (`low_difficulty_start_blocks = 5000`) is wrong for a
+   merge-mined-from-genesis launch. Recommendation: set genesis `bits` to the live equilibrium
+   and set `low_difficulty_start_blocks = 0`. See `mainnet-mining-difficulty` memory.
+3. **Compact shielded scan-archive** (subsumes item #7 + smart pruning + the receive-bug fix).
+   Foundation done + Halo2-tested (`3ef75a9`, `shielded-pruning-compact-archive` memory);
+   remaining = consensus store + persist-at-commit + serve from `GetShieldedBlocks` + wallet
+   compact-ingest + pruning-processor retention modes.
+4. **Reset execution.** Regenerate genesis with the full bundle; cut the binary; coordinate the
+   relaunch in order: **node → wallets/walletd → pool/bridge**.
 
 ---
 
