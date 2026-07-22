@@ -798,9 +798,13 @@ pub const MAINNET_PARAMS: Params = Params {
 
     // Roughly 2026-06-30 1615 UTC
     toccata_activation: ForkActivation::new(474_165_565),
-    // TEST VALUE: merged mining active from genesis (DAA 0) so an aux block can be
-    // produced and accepted immediately in a live demo. Was 432_000 (12h test);
-    // REVERT to 12_096_000 = day 14 for a real launch.
+    // LAUNCH VALUE (decided 2026-07-22, reset bundle): merged mining active from
+    // genesis. This is ZKas's production model — the chain merge-mines Kaspa from
+    // block 0 (~20-25 KAS blocks/h in production), so aux-PoW acceptance is a launch
+    // feature, not a future fork. Keeping it `always()` also exercises the aux path
+    // from genesis and needs no activation DAA. (Earlier revisions carried a
+    // "REVERT to day-14" note from when this was a demo value — that no longer
+    // applies; the fresh-genesis reset makes always() the intended, correct value.)
     merged_mining_activation: ForkActivation::always(),
 
     // ZKas launch difficulty schedule (blue-score units, 1 BPS — block counts scaled ÷10 vs
