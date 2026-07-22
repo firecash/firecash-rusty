@@ -23,11 +23,11 @@ pub mod scan {
         Action,
         keys::{FullViewingKey, IncomingViewingKey, PreparedIncomingViewingKey, Scope, SpendingKey},
         note::{ExtractedNoteCommitment, Note, Nullifier, TransmittedNoteCiphertext},
-        note_encryption::OrchardDomain,
+        note_encryption::{CompactAction, OrchardDomain},
         primitives::redpallas::{Signature, SpendAuth, VerificationKey},
         value::ValueCommitment,
     };
-    use zcash_note_encryption::batch;
+    use zcash_note_encryption::{EphemeralKeyBytes, batch};
 
     /// A note recovered from a bundle: which action carried it (its position
     /// offset within the block's outputs, needed to build a witness later) and
@@ -139,9 +139,113 @@ pub mod scan {
         }
         received
     }
+
+    // ---- Compact scan records (ZKas compact block; ZIP-307 / lightwalletd style) ----
+
+    /// One shielded action in **compact** form — the 148 bytes a receiver needs to
+    /// trial-decrypt and, on a hit, reconstruct a *spendable* note: the nullifier
+    /// (which is also the output note's `rho`), the note commitment (its tree leaf),
+    /// the ephemeral key, and the 52-byte compact note-ciphertext prefix. It carries
+    /// no proof, spend-auth signature, or value commitment — none of which a receiver
+    /// needs — so it is ~4.7% of a full action (148 B vs ~3,156 B). This is the unit
+    /// of the node's pruning-survivable shielded scan archive, mirroring a Zcash
+    /// light-client `CompactOutput`. What is NOT recoverable from it is the memo
+    /// (that lives in the full 580-byte ciphertext); value and spendability are.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct CompactActionRecord {
+        pub nullifier: [u8; 32],
+        pub cmx: [u8; 32],
+        pub ephemeral_key: [u8; 32],
+        pub enc_ciphertext: [u8; 52],
+    }
+
+    impl CompactActionRecord {
+        /// Serialized size: nullifier + cmx + epk + compact ciphertext = 148 bytes.
+        pub const SERIALIZED_LEN: usize = 32 + 32 + 32 + 52;
+
+        /// Distill a full action wire down to its compact record — what the node
+        /// keeps in the scan archive once the full block body (proof, sigs) can be
+        /// pruned. Reads only fields a receiver uses, so it can never drift from the
+        /// bundle it came from.
+        pub fn from_wire(a: &ActionWire) -> Self {
+            let mut enc_ciphertext = [0u8; 52];
+            enc_ciphertext.copy_from_slice(&a.enc_ciphertext[..52]);
+            Self { nullifier: a.nullifier, cmx: a.cmx, ephemeral_key: a.ephemeral_key, enc_ciphertext }
+        }
+
+        /// Fixed-layout encoding for the consensus scan-archive store.
+        pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_LEN] {
+            let mut out = [0u8; Self::SERIALIZED_LEN];
+            out[0..32].copy_from_slice(&self.nullifier);
+            out[32..64].copy_from_slice(&self.cmx);
+            out[64..96].copy_from_slice(&self.ephemeral_key);
+            out[96..148].copy_from_slice(&self.enc_ciphertext);
+            out
+        }
+
+        /// Decode a 148-byte record; `None` on a wrong-length slice.
+        pub fn from_bytes(b: &[u8]) -> Option<Self> {
+            if b.len() != Self::SERIALIZED_LEN {
+                return None;
+            }
+            let mut nullifier = [0u8; 32];
+            let mut cmx = [0u8; 32];
+            let mut ephemeral_key = [0u8; 32];
+            let mut enc_ciphertext = [0u8; 52];
+            nullifier.copy_from_slice(&b[0..32]);
+            cmx.copy_from_slice(&b[32..64]);
+            ephemeral_key.copy_from_slice(&b[64..96]);
+            enc_ciphertext.copy_from_slice(&b[96..148]);
+            Some(Self { nullifier, cmx, ephemeral_key, enc_ciphertext })
+        }
+
+        /// Reconstruct the orchard [`CompactAction`] for trial decryption. `None`
+        /// if the nullifier or commitment is not a canonical encoding.
+        fn to_compact_action(&self) -> Option<CompactAction> {
+            let nf = Option::from(Nullifier::from_bytes(&self.nullifier))?;
+            let cmx = Option::from(ExtractedNoteCommitment::from_bytes(&self.cmx))?;
+            Some(CompactAction::from_parts(nf, cmx, EphemeralKeyBytes(self.ephemeral_key), self.enc_ciphertext))
+        }
+    }
+
+    /// Trial-decrypt a sequence of compact action records with an already-prepared
+    /// ivk, recovering exactly the receiver's notes — identical to
+    /// [`scan_bundle_prepared`] but from 148-byte records carrying no proof or
+    /// signatures. Memos are not carried in compact form, so [`ReceivedNote::memo`]
+    /// is empty here; value and spendability are fully recovered. This is the scan
+    /// path over the node's compact shielded archive.
+    pub fn scan_compact_prepared(prepared: &PreparedIncomingViewingKey, actions: &[CompactActionRecord]) -> Vec<ReceivedNote> {
+        let mut idx_map: Vec<usize> = Vec::with_capacity(actions.len());
+        let mut outputs: Vec<(OrchardDomain, CompactAction)> = Vec::with_capacity(actions.len());
+        for (i, rec) in actions.iter().enumerate() {
+            let Some(ca) = rec.to_compact_action() else { continue };
+            let domain = OrchardDomain::for_compact_action(&ca);
+            idx_map.push(i);
+            outputs.push((domain, ca));
+        }
+        if outputs.is_empty() {
+            return Vec::new();
+        }
+        let results = batch::try_compact_note_decryption(std::slice::from_ref(prepared), &outputs);
+        let mut received = Vec::new();
+        for (pos, r) in results.into_iter().enumerate() {
+            if let Some(((note, _addr), _ivk_index)) = r {
+                received.push(ReceivedNote { action_index: idx_map[pos], note, memo: Vec::new() });
+            }
+        }
+        received
+    }
+
+    /// Convenience wrapper that prepares the ivk once (see [`scan_compact_prepared`]).
+    pub fn scan_compact(ivk: &IncomingViewingKey, actions: &[CompactActionRecord]) -> Vec<ReceivedNote> {
+        scan_compact_prepared(&ivk.prepare(), actions)
+    }
 }
 
-pub use scan::{ReceivedNote, address_bytes_from_seed, ivk_from_seed, scan_bundle, scan_bundle_prepared, trim_memo};
+pub use scan::{
+    CompactActionRecord, ReceivedNote, address_bytes_from_seed, ivk_from_seed, scan_bundle, scan_bundle_prepared,
+    scan_compact, scan_compact_prepared, trim_memo,
+};
 
 #[cfg(feature = "circuit")]
 pub mod build {
@@ -926,6 +1030,48 @@ pub mod build {
             // A stranger's viewing key recovers nothing.
             let stranger = crate::wallet::ivk_from_seed([9u8; 32]).unwrap();
             assert!(crate::wallet::scan_bundle(&stranger, &wire).is_empty());
+        }
+
+        /// The crux of the compact-archive design: scanning the 148-byte compact
+        /// records (no proof, no signatures) recovers the *identical* note as
+        /// scanning the full bundle. If this holds, the node can prune the 76%
+        /// verify-only bulk and still serve wallets a complete, scannable history.
+        #[test]
+        fn compact_scan_matches_full_scan() {
+            use crate::wallet::CompactActionRecord;
+            let pk = ProvingKey::build();
+            let recipient = ShieldedKeys::from_seed([2u8; 32]).expect("valid seed");
+            let wire =
+                build_output_only_bundle(&pk, recipient.address(), 4242, &[0x33u8; 32], b"ctx", rand::rngs::OsRng).expect("build");
+
+            let ivk = crate::wallet::ivk_from_seed([2u8; 32]).unwrap();
+
+            // Baseline: full-bundle scan recovers the note.
+            let full = crate::wallet::scan_bundle(&ivk, &wire);
+            assert_eq!(full.len(), 1, "full scan recovers the note");
+
+            // Distill every action to its 148-byte compact record; serialization roundtrips.
+            let compact: Vec<CompactActionRecord> = wire.actions.iter().map(CompactActionRecord::from_wire).collect();
+            for rec in &compact {
+                assert_eq!(rec.to_bytes().len(), CompactActionRecord::SERIALIZED_LEN);
+                assert_eq!(CompactActionRecord::from_bytes(&rec.to_bytes()), Some(*rec));
+            }
+
+            // Compact scan recovers the SAME note: same position, same value.
+            let via_compact = crate::wallet::scan_compact(&ivk, &compact);
+            assert_eq!(via_compact.len(), 1, "compact scan recovers exactly the note");
+            assert_eq!(via_compact[0].action_index, full[0].action_index, "same action position");
+            assert_eq!(via_compact[0].value(), full[0].value(), "compact recovers the same value");
+            assert_eq!(via_compact[0].value(), 4242);
+
+            // And the compact-recovered note is spendable-consistent: its commitment
+            // equals the on-chain cmx carried in the compact record.
+            let cmx = orchard::note::ExtractedNoteCommitment::from(via_compact[0].note.commitment());
+            assert_eq!(cmx.to_bytes(), compact[via_compact[0].action_index].cmx, "recovered note commits to the archived cmx");
+
+            // A stranger recovers nothing from the compact records either.
+            let stranger = crate::wallet::ivk_from_seed([9u8; 32]).unwrap();
+            assert!(crate::wallet::scan_compact(&stranger, &compact).is_empty());
         }
     }
 }
