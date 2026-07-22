@@ -1253,6 +1253,182 @@ async fn daemon_ibd_smt_state_sync_test() {
     kaspad2.shutdown();
 }
 
+/// End-to-end proof of the shielded-state IBD import (consensus-reset blocker #1).
+///
+/// A fast-syncing node imports the UTXO set at the pruning point but, before this
+/// fix, imported NO shielded state (frontier / anchor index / supply totals /
+/// nullifier set). On a `shielded_coinbase` network every block mints a coinbase
+/// note, so the shielded commitment tree is non-trivial at the pruning point; a
+/// syncee that fails to seed it cannot recompute `shielded_state_root` and the
+/// virtual processor wedges ("N disqualified vs 0 valid") the moment it tries to
+/// validate the first post-pruning-point block's #24 coinbase commitment.
+///
+/// The base simnet params are transparent-coinbase, so this test overrides
+/// `shielded_coinbase = true` (small-pruning simnet base, see
+/// `shielded_ibd_sync_test_params.json`). It asserts three things:
+///   1. the syncee completes IBD and reaches the syncer's pruning point + DAA
+///      score (the shielded stream did not stall),
+///   2. the syncee's shielded frontier AT the pruning point byte-matches the
+///      syncer's (`get_shielded_tree_state`) — the seed is correct, not merely
+///      non-empty,
+///   3. the syncee accepts finality_depth+ blocks mined after IBD — i.e. it
+///      revalidates live #24 shielded commitments against the seeded state, which
+///      is exactly the wedge the fix removes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn daemon_ibd_shielded_state_sync_test() {
+    init_allocator_with_default_settings();
+    kaspa_core::log::try_init_logger("INFO,kaspa_testing_integration=trace,kaspa_rpc_core=debug");
+
+    let override_params_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/params/shielded_ibd_sync_test_params.json");
+    let params = load_override_params(&override_params_path);
+    assert!(params.shielded_coinbase, "test params must enable the shielded coinbase or nothing populates shielded state");
+
+    let args = Args {
+        simnet: true,
+        unsafe_rpc: true,
+        enable_unsynced_mining: true,
+        disable_upnp: true,
+        utxoindex: true,
+        override_params_file: Some(override_params_path.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+
+    let total_fd_limit = 10;
+    let mut kaspad1 = Daemon::new_random_with_args(args.clone(), total_fd_limit);
+    let rpc_client1 = kaspad1.start().await;
+
+    // A shielded_coinbase network pays the block reward as a coinbase note to the
+    // miner's Orchard address, carried as the 43 raw address bytes in the coinbase
+    // reward's script_public_key (Version::ShieldedOrchard). A transparent PubKey
+    // address here would fail the shielded mint (build_coinbase_mint parses
+    // script[..43] as a canonical Orchard address).
+    let miner_recipient = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("valid orchard address");
+    let miner_address = Address::new(kaspad1.network.into(), kaspa_addresses::Version::ShieldedOrchard, &miner_recipient);
+
+    // Phase 1: mine past the pruning depth so the pruning point advances off
+    // genesis and past finality_depth (same guard as the SMT sync test: the IBD
+    // metadata path only takes the backward chain-walk when pp_blue_score >
+    // finality_depth). Every block mints a shielded coinbase note along the way,
+    // so the frontier at the pruning point is deep and non-trivial.
+    let finality_depth = params.finality_depth();
+    let pruning_depth = params.pruning_depth();
+    let coinbase_maturity = params.coinbase_maturity();
+    let initial_blocks = (coinbase_maturity as usize) + pruning_depth as usize + 80;
+    for _ in 0..initial_blocks {
+        let template = rpc_client1.get_block_template(miner_address.clone(), vec![]).await.unwrap();
+        rpc_client1.submit_block(template.block, false).await.unwrap();
+    }
+
+    let mut dag_info = rpc_client1.get_block_dag_info().await.unwrap();
+    let mut pruning_point_blue_score = rpc_client1.get_block(dag_info.pruning_point_hash, false).await.unwrap().header.blue_score;
+    let mut extra_blocks = 0usize;
+    let extra_blocks_limit = finality_depth as usize + 200;
+    while (dag_info.pruning_point_hash == SIMNET_GENESIS.hash || pruning_point_blue_score <= finality_depth)
+        && extra_blocks < extra_blocks_limit
+    {
+        let template = rpc_client1.get_block_template(miner_address.clone(), vec![]).await.unwrap();
+        rpc_client1.submit_block(template.block, false).await.unwrap();
+        extra_blocks += 1;
+        dag_info = rpc_client1.get_block_dag_info().await.unwrap();
+        pruning_point_blue_score = rpc_client1.get_block(dag_info.pruning_point_hash, false).await.unwrap().header.blue_score;
+    }
+    assert_ne!(dag_info.pruning_point_hash, SIMNET_GENESIS.hash, "syncer pruning point did not advance off genesis");
+    assert!(
+        pruning_point_blue_score > finality_depth,
+        "syncer pruning point did not advance past finality depth: pp_bs={pruning_point_blue_score}, finality_depth={finality_depth}"
+    );
+
+    let target_daa_score = rpc_client1.get_server_info().await.unwrap().virtual_daa_score;
+    let target_pruning_point = dag_info.pruning_point_hash;
+
+    // The syncer's shielded frontier at the pruning point: this is exactly what the
+    // syncee must reproduce from the streamed metadata. Assert it is non-trivial so
+    // the test can't pass vacuously against an empty tree.
+    let syncer_tree = rpc_client1.get_shielded_tree_state(Some(target_pruning_point)).await.unwrap();
+    assert!(
+        syncer_tree.size > 0,
+        "syncer shielded tree at pruning point is empty (size=0) — shielded coinbase did not populate the pool"
+    );
+
+    // Phase 2: bring up the syncee and connect it to the syncer.
+    let mut kaspad2 = Daemon::new_random_with_args(args, total_fd_limit);
+    let rpc_client2 = kaspad2.start().await;
+
+    rpc_client2.add_peer(format!("127.0.0.1:{}", kaspad1.p2p_port).try_into().unwrap(), true).await.unwrap();
+    let check_client = rpc_client2.clone();
+    wait_for(
+        50,
+        40,
+        move || {
+            let client = check_client.clone();
+            Box::pin(async move { client.get_connected_peer_info().await.unwrap().peer_info.len() == 1 })
+        },
+        "the nodes did not connect to each other",
+    )
+    .await;
+
+    // Phase 3: wait for IBD (including the shielded-state stream) to complete.
+    let sync_check = rpc_client2.clone();
+    wait_for(
+        100,
+        600,
+        move || {
+            let client = sync_check.clone();
+            Box::pin(async move {
+                let server_info = client.get_server_info().await.unwrap();
+                if server_info.virtual_daa_score < target_daa_score {
+                    return false;
+                }
+                client.get_block_dag_info().await.unwrap().pruning_point_hash == target_pruning_point
+            })
+        },
+        "syncee did not complete shielded-era IBD within timeout (suspected sync_new_shielded_state stall or shielded wedge)",
+    )
+    .await;
+
+    // Assertion 2: the seeded frontier byte-matches the syncer's at the pruning point.
+    let syncee_tree = rpc_client2.get_shielded_tree_state(Some(target_pruning_point)).await.unwrap();
+    assert_eq!(syncee_tree.size, syncer_tree.size, "syncee shielded frontier size differs from syncer's at the pruning point");
+    assert_eq!(syncee_tree.leaf, syncer_tree.leaf, "syncee shielded frontier leaf differs from syncer's at the pruning point");
+    assert_eq!(syncee_tree.ommers, syncer_tree.ommers, "syncee shielded frontier ommers differ from syncer's at the pruning point");
+
+    // Phase 4 / assertion 3: mine finality_depth + buffer blocks on the syncer and
+    // assert the syncee accepts them. Each carries a #24 coinbase commitment to its
+    // parent's shielded_state_root; the syncee can only validate them by recomputing
+    // shielded state forward from the *seeded* pruning-point frontier. If the seed
+    // were missing or wrong, virtual would wedge here and the score never advances.
+    let post_ibd_blocks = finality_depth as usize + 30;
+    for _ in 0..post_ibd_blocks {
+        let template = rpc_client1.get_block_template(miner_address.clone(), vec![]).await.unwrap();
+        rpc_client1.submit_block(template.block, false).await.unwrap();
+    }
+
+    let post_ibd_target_score = rpc_client1.get_server_info().await.unwrap().virtual_daa_score;
+    let post_ibd_target_pp = rpc_client1.get_block_dag_info().await.unwrap().pruning_point_hash;
+    let post_ibd_check = rpc_client2.clone();
+    wait_for(
+        100,
+        600,
+        move || {
+            let client = post_ibd_check.clone();
+            Box::pin(async move {
+                let server_info = client.get_server_info().await.unwrap();
+                if server_info.virtual_daa_score < post_ibd_target_score {
+                    return false;
+                }
+                client.get_block_dag_info().await.unwrap().pruning_point_hash == post_ibd_target_pp
+            })
+        },
+        "syncee did not accept post-IBD blocks (suspected shielded wedge: seeded state cannot revalidate #24 commitments)",
+    )
+    .await;
+
+    rpc_client1.disconnect().await.unwrap();
+    rpc_client2.disconnect().await.unwrap();
+    kaspad1.shutdown();
+    kaspad2.shutdown();
+}
+
 // The following test runtime parameters are required for a graceful shutdown of the gRPC server
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn daemon_cleaning_test() {

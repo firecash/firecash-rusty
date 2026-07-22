@@ -289,6 +289,12 @@ pub struct OverrideParams {
     /// kHeavyHash PoW is accepted; at/after it a block may satisfy PoW via a valid
     /// AuxPoW proof (Option-2 dual acceptance).
     pub merged_mining_activation: Option<ForkActivation>,
+
+    /// Whether the coinbase mints its reward into the shielded pool (private-by-default
+    /// networks) rather than as a transparent output. Overridable so tests can exercise
+    /// the shielded pipeline on a small-pruning simnet base (which is otherwise
+    /// transparent-coinbase).
+    pub shielded_coinbase: Option<bool>,
 }
 
 impl From<Params> for OverrideParams {
@@ -322,6 +328,7 @@ impl From<Params> for OverrideParams {
             crescendo_activation: Some(p.crescendo_activation),
             toccata_activation: Some(p.toccata_activation),
             merged_mining_activation: Some(p.merged_mining_activation),
+            shielded_coinbase: Some(p.shielded_coinbase),
         }
     }
 }
@@ -641,7 +648,7 @@ impl Params {
                 .unwrap_or(self.coinbase_payload_script_public_key_max_len),
 
             max_coinbase_payload_len: overrides.max_coinbase_payload_len.unwrap_or(self.max_coinbase_payload_len),
-            shielded_coinbase: self.shielded_coinbase,
+            shielded_coinbase: overrides.shielded_coinbase.unwrap_or(self.shielded_coinbase),
 
             max_tx_inputs: overrides.max_tx_inputs.unwrap_or(self.max_tx_inputs),
             max_tx_outputs: overrides.max_tx_outputs.unwrap_or(self.max_tx_outputs),
