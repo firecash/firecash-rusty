@@ -120,6 +120,40 @@ reset (it's a plain const in a new binary).
 core); existing consensus-core mass tests unchanged & green; full `kaspa-consensus` build
 green on VPS3.
 
+### #4b — Shielded per-tx spend cap: 6 → 38 (block-fit only) ✅ DONE + tested (this session, `d8d8574`)
+
+**Problem (the "couldn't send a few thousand zkas" pain).** Live chain is DAA ~950K;
+`toccata_activation = 474_165_565` (~15 years out at 1 BPS) → we are permanently
+pre-Toccata, so the `MAXIMUM_STANDARD_TRANSACTION_MASS_PRE_TOCCATA = 100_000` per-dimension
+standard cap is live forever. transient mass = bytes×4 → 100K = 25 KB = **6 shielded
+notes/tx**. Each mining note ≈ one block subsidy (~60 zkas, one note per mergeset output),
+so value-per-tx ≈ **6 × 60 = 360 zkas — a hard ceiling.** `plan_payment` doesn't fail; it
+shatters a payment into many sequential 360-zkas txs (3000 zkas = 50 notes = 9 txs ≈ 63 s
+of proving; recipient gets 9 fragments).
+
+**Fix.** The 100K cap exists only to stop updated nodes relaying txs un-updated peers
+reject. On a fresh-genesis reset all nodes ship one binary → rationale gone. Shielded txs
+are now **exempt from the artificial cap and bounded only by the block mass limit (500K)**
+= **~38 notes/tx**. Transparent txs keep the 100K cap, so the entire upstream Toccata
+standardness/relaxation mechanic and its tests are untouched.
+- node `mining/src/mempool/check_transaction_standard.rs`: `standard_transaction_mass_cap`
+  returns `mempool_block_mass_limits` for `tx.is_shielded()`, else the unchanged 100K path.
+- wallet-engine `sdk/wallet-engine/src/payment.rs`: `STANDARD_TX_MASS_CAP` 100K→500K so
+  `plan_payment` packs up to 38 spends; walletd + all frontends read `max_spends_per_tx()`
+  dynamically (no hardcoded 6 anywhere).
+
+**Effect.** 3000 zkas: 9 txs → **2**; 1000 zkas: 3 → **1**; 10000 zkas: 28 → **5**. Also
+makes consolidation 6× faster (38→1/tx), which builds bigger notes and cures fragmentation
+at the source. Per-spend fee unchanged (byte-proportional). **Honest limit:** notes are
+~60 zkas, so moving *many* thousand in ONE tx still needs bigger notes — the permanent cure
+is **opportunistic auto-consolidation** (fold spare small notes into every send's change),
+which is wallet-engine-only, ships anytime, NOT reset-gated (follow-up, not done yet).
+
+**Tests (VPS3, green):** `block_limit_allows_thirty_eight_spends` (engine), mining
+standardness + the untouched `toccata_transient_mass_activation_tests`, mining build — all
+EXIT 0. Note: this is mempool/relay policy (not block validity), but it must ship uniformly
+→ belongs in the reset binary. Consensus-adjacent, reset-bundle.
+
 ### #3 — Merged-mining activation (decided, no code change)
 
 `merged_mining_activation: ForkActivation::always()` on all four param sets
