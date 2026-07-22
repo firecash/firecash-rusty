@@ -14,6 +14,17 @@ use crate::{
 };
 use kaspa_hashes::HASH_SIZE;
 
+/// Extra compute mass charged per shielded action to price its permanent state
+/// footprint (PLAN §2.1). Each Orchard action adds one nullifier to the global
+/// **unprunable** nullifier set and one note commitment to the append-only tree —
+/// permanent state that outlives the transaction's transient payload bytes (which
+/// compute mass already prices via `transaction_estimated_serialized_size`). This
+/// is a modest flat premium so a shielded spend also pays for the state it leaves
+/// behind, not only the bytes it relays. It is recomputed by consensus and the
+/// mempool (never committed by the sender like storage mass), so tuning it needs
+/// no wallet-side change beyond ordinary fee estimation.
+pub const SHIELDED_MASS_PER_ACTION: u64 = 1_000;
+
 // transaction_estimated_serialized_size is the estimated size of a transaction in some
 // serialization. This has to be deterministic, but not necessarily accurate, since
 // it's only used as the size component in the transaction and block mass limit
@@ -363,7 +374,20 @@ impl MassCalculator {
             total_sigops * GRAMS_PER_SIGOP_COUNT_UNIT
         };
 
-        let compute_mass = compute_mass_for_size + total_script_public_key_mass + script_mass;
+        let base_compute_mass = compute_mass_for_size + total_script_public_key_mass + script_mass;
+        // PLAN §2.1: a shielded transaction leaves permanent state behind — one
+        // nullifier (in the unprunable global set) and one note commitment per
+        // action — beyond the transient payload bytes compute mass already prices.
+        // Charge a modest flat premium per action (see SHIELDED_MASS_PER_ACTION).
+        // The action count is read cheaply from the bundle header; a malformed or
+        // short payload yields 0 here and is rejected later by full bundle
+        // validation, so a valid tx is never over- or under-charged.
+        let compute_mass = if tx.is_shielded() {
+            let actions = kaspa_shielded_core::bundle::action_count_from_bytes(&tx.payload).unwrap_or(0) as u64;
+            base_compute_mass.saturating_add(actions.saturating_mul(SHIELDED_MASS_PER_ACTION))
+        } else {
+            base_compute_mass
+        };
         let transient_mass = size * TRANSIENT_BYTE_TO_MASS_FACTOR;
 
         NonContextualMasses::new(compute_mass, transient_mass)

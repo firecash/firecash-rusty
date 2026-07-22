@@ -106,6 +106,29 @@ pub const fn expected_wire_len(n_actions: usize) -> usize {
     117 + n_actions * ActionWire::SERIALIZED_LEN + expected_proof_len(n_actions)
 }
 
+/// Cheaply read just the action count from a serialized bundle, without parsing
+/// (or allocating) the actions or the proof. The header reads mirror
+/// [`ShieldedBundle::from_bytes`] exactly, so the two can never disagree.
+///
+/// The mass calculator uses this to price a shielded transaction's permanent
+/// nullifier/commitment footprint (one nullifier + one note commitment per
+/// action, both retained indefinitely — the nullifier in the unprunable global
+/// set) without a full bundle decode on every mempool/consensus mass check.
+/// Returns `None` on a malformed/too-short header or an action count exceeding
+/// [`MAX_ACTIONS_PER_BUNDLE`] (such a bundle is rejected in full decode anyway).
+pub fn action_count_from_bytes(bytes: &[u8]) -> Option<usize> {
+    let mut r = Reader::new(bytes);
+    let _flags = r.u8().ok()?;
+    let _value_balance = r.i64().ok()?;
+    let _anchor = r.array::<{ sizes::FIELD }>().ok()?;
+    let _binding_sig = r.var().ok()?;
+    let n_actions = r.u32().ok()? as usize;
+    if n_actions > MAX_ACTIONS_PER_BUNDLE {
+        return None;
+    }
+    Some(n_actions)
+}
+
 /// An Orchard bundle as carried in a shielded transaction's payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShieldedBundle {
@@ -312,6 +335,31 @@ mod tests {
             // Canonical: re-encoding the decoded value is identical.
             assert_eq!(bytes, decoded.to_bytes());
         }
+    }
+
+    #[test]
+    fn action_count_matches_full_decode() {
+        // The cheap header-only count the mass calculator relies on must never
+        // disagree with a full decode, or shielded txs would be mispriced.
+        for n in [0u8, 1, 2, 5, 200] {
+            let bytes = sample_bundle(n).to_bytes();
+            assert_eq!(action_count_from_bytes(&bytes), Some(n as usize));
+        }
+    }
+
+    #[test]
+    fn action_count_rejects_malformed() {
+        // Too short to hold even the header → None (mass calc treats as 0 actions;
+        // full validation rejects the tx later).
+        assert_eq!(action_count_from_bytes(&[]), None);
+        assert_eq!(action_count_from_bytes(&[0u8; 10]), None);
+        // A hostile oversized count is rejected up front, same bound as from_bytes.
+        let mut bytes = sample_bundle(1).to_bytes();
+        // action count u32 sits at offset 109 (flags 1 + value_balance 8 + anchor 32
+        // + binding_sig [len 4 + 64]); overwrite it with MAX+1.
+        let over = (MAX_ACTIONS_PER_BUNDLE as u32 + 1).to_be_bytes();
+        bytes[109..113].copy_from_slice(&over);
+        assert_eq!(action_count_from_bytes(&bytes), None);
     }
 
     #[test]

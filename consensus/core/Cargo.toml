@@ -32,6 +32,7 @@ kaspa-math.workspace = true
 kaspa-smt.workspace = true
 kaspa-merkle.workspace = true
 kaspa-muhash.workspace = true
+kaspa-shielded-core.workspace = true
 kaspa-txscript-errors.workspace = true
 kaspa-utils.workspace = true
 rand.workspace = true
